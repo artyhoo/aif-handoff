@@ -6,7 +6,7 @@
 
 > This project was built using [AI Factory](https://github.com/lee-to/ai-factory) — an open-source framework for AI-driven development.
 
-Built on top of [AI Factory](https://github.com/lee-to/ai-factory) workflow and powered by runtime profiles through `@aif/runtime` (Claude and Codex adapters included). Tasks flow through stages automatically: **Backlog → Planning → Plan Ready → Implementing → Review → Done** — each stage orchestrated by specialized AI subagents following the AIF methodology. In auto mode, review feedback can also trigger an automatic rework loop: **Review → request_changes → Implementing**. When that loop stops converging, the task is handed off explicitly as **Done + manual review required** instead of silently passing.
+Built on top of [AI Factory](https://github.com/lee-to/ai-factory) workflow and powered by runtime profiles through `@aif/runtime` (Claude and Codex adapters included). Tasks flow through stages automatically: **Backlog → Planning → Plan Ready → Implementing → Review → Done** — each stage orchestrated by specialized AI subagents following the AIF methodology. Skills-mode tasks can optionally add **Improve** after planning and **Verify** before done. In auto mode, review feedback can also trigger an automatic rework loop: **Review → request_changes → Implementing**. When that loop stops converging, the task is handed off explicitly as **Done + manual review required** instead of silently passing.
 
 Auto-review is now convergence-aware. You can keep the default `full_re_review` loop or switch to `closure_first` via `AGENT_AUTO_REVIEW_STRATEGY`. When auto-review no longer converges, the task moves to `done` with `manualReviewRequired=true`, and the UI surfaces that explicit human handoff instead of silently treating the review as passed.
 
@@ -86,16 +86,25 @@ docker compose exec agent claude login
 docker compose restart agent
 ```
 
+Docker resolves the Codex SDK and CLI during the image build. `CODEX_VERSION`
+defaults to the reviewed `0.145.0` baseline and also accepts an npm dist-tag,
+exact version, or semver range as an explicit override. When using a moving
+selector, rebuild with `docker compose build --no-cache` to force a fresh
+registry lookup. Verify the result with `docker compose exec agent codex
+--version`.
+
 Development starts three services by default. If `MCP_PORT` is set to a valid integer port, it starts a fourth service for MCP over HTTP. Docker starts all four services.
 
 #### Project paths (host ↔ container)
 
-When you create a project in the UI, the **Root Path** field expects a host
-path (for example `/Users/you/projects/my-app`). The dev compose mounts
-the host directory `PROJECTS_DIR` onto `PROJECTS_MOUNT` (default
-`/home/www`) inside every container. The API/agent containers see your
-project as `/home/www/my-app` and the API transparently translates the
-host path you typed to the matching container path when persisting it.
+When you create a project in the UI, the **Root Path** field accepts an absolute
+path such as `/Users/me/projects/my-project`. The dev compose mounts the host
+directory `PROJECTS_DIR` at `PROJECTS_MOUNT` (default `/home/www`) in every
+container. With `PROJECTS_DIR=/Users/me/projects`, the example path is persisted
+as `/home/www/my-project`.
+
+Other POSIX absolute paths are resolved below `PROJECTS_MOUNT` instead of the
+container filesystem root.
 
 The default `PROJECTS_DIR` is `${PWD}/projects` (relative to the compose
 file). To use a different host directory:
@@ -219,7 +228,9 @@ The coordinator polls every 30 seconds and delegates to `.claude/agents/` defini
 | Stage                                                                                            | Agent                                                                     | What it does                                                                                                                                 |
 | ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
 | Backlog → Planning → Plan Ready                                                                  | `plan-coordinator`                                                        | Iterative plan refinement via `plan-polisher`                                                                                                |
+| Planning → Improve → Plan Ready                                                                  | `/aif-improve`                                                            | Optional for skills-mode tasks (`useSubagents=false`) when `runPlanImprove=true`                                                             |
 | Plan Ready → Implementing → Review                                                               | `implement-coordinator`                                                   | Parallel task execution with worktrees + quality sidecars                                                                                    |
+| Implementing → Verify → Review / Done                                                            | `/aif-verify`                                                             | Optional for skills-mode tasks (`useSubagents=false`) when `runPostVerify=true`; moves to Done when `skipReview=true`                        |
 | Review → Done / Review → request_changes → Implementing / Review → Done + manual review required | `review-sidecar` + `security-sidecar` (+ auto review gate in coordinator) | Code review and security audit in parallel; in auto mode, structured blocking findings drive rework until success or explicit manual handoff |
 
 ### Auto-Review Convergence
@@ -243,7 +254,7 @@ AIF Handoff supports two execution modes, configurable globally via `AGENT_USE_S
 | Mode          | `AGENT_USE_SUBAGENTS` | How it works                                                                                                                                                                                                  | Trade-off                                                                                                                                                            |
 | ------------- | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Subagents** | `true`                | Each stage runs through specialized coordinator agents (`plan-coordinator`, `implement-coordinator`, `review-sidecar` + `security-sidecar`) that iteratively refine the result until quality criteria are met | Higher quality — plans are polished in multiple rounds, implementation gets parallel workers with quality sidecars, reviews are thorough. Takes more time and tokens |
-| **Skills**    | `false` (default)     | Each stage runs as a single-pass AIF skill (`/aif-plan`, `/aif-implement`, `/aif-review`, `/aif-security-checklist`)                                                                                          | Faster execution with lower token usage, but no iterative refinement — good enough for simpler tasks or quick prototyping                                            |
+| **Skills**    | `false` (default)     | Each stage runs as AIF skills (`/aif-plan`, optional `/aif-improve`, `/aif-implement`, `/aif-review`, `/aif-security-checklist`, optional `/aif-verify`)                                                      | Faster execution with lower token usage; optional improve/verify flags add extra plan and implementation checks when needed                                          |
 
 ## Tech Stack
 
@@ -296,16 +307,16 @@ Only ports 80/443 are exposed. API is bound to localhost only. Includes security
 | `PROJECTS_MOUNT`     | `/home/www`  | Project files path inside containers                         |
 | `PROJECTS_HOST_ROOT` | `${PWD}`     | Compose-internal repo root for relative `PROJECTS_DIR` (dev) |
 
-In the dev Compose setup, project roots are used by processes inside the
-containers. Host paths under `PROJECTS_DIR` are accepted in the UI and
-automatically saved as the matching `PROJECTS_MOUNT` path, so
-`/Users/me/projects/app` becomes `/home/www/app` with the default mount. If
-`PROJECTS_DIR` is relative, Compose resolves it from `PROJECTS_HOST_ROOT`; leave
-`PROJECTS_HOST_ROOT` unset unless you are replacing the compose wiring.
+In Docker, paths outside `PROJECTS_MOUNT` are resolved below that mount instead
+of the container filesystem root. In the dev Compose setup, host paths under
+`PROJECTS_DIR` are automatically saved as the matching `PROJECTS_MOUNT` path,
+so `/Users/me/projects/my-project` becomes `/home/www/my-project` when
+`PROJECTS_DIR=/Users/me/projects`. If `PROJECTS_DIR` is relative, Compose
+resolves it from `PROJECTS_HOST_ROOT`; leave `PROJECTS_HOST_ROOT` unset unless
+you are replacing the compose wiring.
 
 Production Compose uses a named Docker volume at `PROJECTS_MOUNT` instead of
-the dev bind mount. Create and select projects by their in-container path in
-production, for example `/home/www/app`.
+the dev bind mount. Portable paths use the same resolution in production.
 
 A `.devcontainer/` config is also included for JetBrains / VS Code.
 

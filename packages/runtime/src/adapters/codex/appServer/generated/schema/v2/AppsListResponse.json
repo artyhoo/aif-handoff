@@ -73,6 +73,18 @@
         "distributionChannel": {
           "type": ["string", "null"]
         },
+        "iconAssets": {
+          "type": ["object", "null"],
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "iconDarkAssets": {
+          "type": ["object", "null"],
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
         "id": {
           "type": "string"
         },

@@ -78,6 +78,8 @@ export const UsageSource = {
   ROADMAP_EXTRACT: "roadmap-extract",
   /** Fast Fix on a task (services/fastFix.ts). */
   FAST_FIX: "fast-fix",
+  /** Fire-and-forget /aif-qa runner (services/qaRunner.ts). */
+  QA: "qa",
   /** Reusable seed session creation for project warmup flows. */
   WARMUP: "warmup",
   /** Subagent execution from the agent coordinator (agent/subagentQuery.ts). */

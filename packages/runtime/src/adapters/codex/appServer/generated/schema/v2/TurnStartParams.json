@@ -4,6 +4,9 @@
   "type": "object",
   "required": ["input", "threadId"],
   "properties": {
+    "threadId": {
+      "type": "string"
+    },
     "approvalPolicy": {
       "description": "Override the approval policy for this turn and subsequent turns.",
       "anyOf": [
@@ -26,8 +29,12 @@
         }
       ]
     },
-    "threadId": {
-      "type": "string"
+    "clientUserMessageId": {
+      "type": ["string", "null"]
+    },
+    "serviceTier": {
+      "description": "Override the service tier for this turn and subsequent turns.",
+      "type": ["string", "null"]
     },
     "cwd": {
       "description": "Override the working directory for this turn and subsequent turns.",
@@ -38,30 +45,6 @@
       "anyOf": [
         {
           "$ref": "#/definitions/ReasoningEffort"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
-    "input": {
-      "type": "array",
-      "items": {
-        "$ref": "#/definitions/UserInput"
-      }
-    },
-    "model": {
-      "description": "Override the model for this turn and subsequent turns.",
-      "type": ["string", "null"]
-    },
-    "outputSchema": {
-      "description": "Optional JSON Schema used to constrain the final assistant message for this turn."
-    },
-    "personality": {
-      "description": "Override the personality for this turn and subsequent turns.",
-      "anyOf": [
-        {
-          "$ref": "#/definitions/Personality"
         },
         {
           "type": "null"
@@ -79,29 +62,35 @@
         }
       ]
     },
-    "serviceTier": {
-      "description": "Override the service tier for this turn and subsequent turns.",
-      "anyOf": [
-        {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/ServiceTier"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        {
-          "type": "null"
-        }
-      ]
+    "input": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/UserInput"
+      }
+    },
+    "model": {
+      "description": "Override the model for this turn and subsequent turns.",
+      "type": ["string", "null"]
     },
     "summary": {
       "description": "Override the reasoning summary for this turn and subsequent turns.",
       "anyOf": [
         {
           "$ref": "#/definitions/ReasoningSummary"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "outputSchema": {
+      "description": "Optional JSON Schema used to constrain the final assistant message for this turn."
+    },
+    "personality": {
+      "description": "Override the personality for this turn and subsequent turns.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/Personality"
         },
         {
           "type": "null"
@@ -114,16 +103,32 @@
       "description": "A path that is guaranteed to be absolute and normalized (though it is not guaranteed to be canonicalized or exist on the filesystem).\n\nIMPORTANT: When deserializing an `AbsolutePathBuf`, a base path must be set using [AbsolutePathBufGuard::new]. If no base path is set, the deserialization will fail unless the path being deserialized is already absolute.",
       "type": "string"
     },
-    "ApprovalsReviewer": {
-      "description": "Configures who approval requests are routed to for review. Examples include sandbox escapes, blocked network access, MCP approval prompts, and ARC escalations. Defaults to `user`. `guardian_subagent` uses a carefully prompted subagent to gather relevant context and apply a risk-based decision framework before approving or denying the request.",
+    "AdditionalContextEntry": {
+      "type": "object",
+      "required": ["kind", "value"],
+      "properties": {
+        "kind": {
+          "$ref": "#/definitions/AdditionalContextKind"
+        },
+        "value": {
+          "type": "string"
+        }
+      }
+    },
+    "AdditionalContextKind": {
       "type": "string",
-      "enum": ["user", "guardian_subagent"]
+      "enum": ["untrusted", "application"]
+    },
+    "ApprovalsReviewer": {
+      "description": "Configures who approval requests are routed to for review. Examples include sandbox escapes, blocked network access, MCP approval prompts, and ARC escalations. Defaults to `user`. `auto_review` uses a carefully prompted subagent to gather relevant context and apply a risk-based decision framework before approving or denying the request. The legacy value `guardian_subagent` is accepted for compatibility.",
+      "type": "string",
+      "enum": ["user", "auto_review", "guardian_subagent"]
     },
     "AskForApproval": {
       "oneOf": [
         {
           "type": "string",
-          "enum": ["untrusted", "on-failure", "on-request", "never"]
+          "enum": ["untrusted", "on-request", "never"]
         },
         {
           "type": "object",
@@ -187,10 +192,37 @@
         }
       }
     },
+    "ImageDetail": {
+      "type": "string",
+      "enum": ["auto", "low", "high", "original"]
+    },
+    "LegacyAppPathString": {
+      "type": "string"
+    },
     "ModeKind": {
       "description": "Initial collaboration mode to use when the TUI starts.",
       "type": "string",
       "enum": ["plan", "default"]
+    },
+    "MultiAgentMode": {
+      "description": "Controls the effective multi-agent delegation instructions for a turn. `custom` means the configured mode hint defines the policy instead of a built-in policy.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": ["explicitRequestOnly", "proactive"]
+        },
+        {
+          "type": "object",
+          "required": ["custom"],
+          "properties": {
+            "custom": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "title": "CustomMultiAgentMode"
+        }
+      ]
     },
     "NetworkAccess": {
       "type": "string",
@@ -200,49 +232,10 @@
       "type": "string",
       "enum": ["none", "friendly", "pragmatic"]
     },
-    "ReadOnlyAccess": {
-      "oneOf": [
-        {
-          "type": "object",
-          "required": ["type"],
-          "properties": {
-            "includePlatformDefaults": {
-              "default": true,
-              "type": "boolean"
-            },
-            "readableRoots": {
-              "default": [],
-              "type": "array",
-              "items": {
-                "$ref": "#/definitions/AbsolutePathBuf"
-              }
-            },
-            "type": {
-              "type": "string",
-              "enum": ["restricted"],
-              "title": "RestrictedReadOnlyAccessType"
-            }
-          },
-          "title": "RestrictedReadOnlyAccess"
-        },
-        {
-          "type": "object",
-          "required": ["type"],
-          "properties": {
-            "type": {
-              "type": "string",
-              "enum": ["fullAccess"],
-              "title": "FullAccessReadOnlyAccessType"
-            }
-          },
-          "title": "FullAccessReadOnlyAccess"
-        }
-      ]
-    },
     "ReasoningEffort": {
-      "description": "See https://platform.openai.com/docs/guides/reasoning?api-mode=responses#get-started-with-reasoning",
+      "description": "A non-empty reasoning effort value advertised by the model.",
       "type": "string",
-      "enum": ["none", "minimal", "low", "medium", "high", "xhigh"]
+      "minLength": 1
     },
     "ReasoningSummary": {
       "description": "A summary of the reasoning performed by the model. This can be useful for debugging and understanding the model's reasoning process. See https://platform.openai.com/docs/guides/reasoning?api-mode=responses#reasoning-summaries",
@@ -276,16 +269,6 @@
           "type": "object",
           "required": ["type"],
           "properties": {
-            "access": {
-              "default": {
-                "type": "fullAccess"
-              },
-              "allOf": [
-                {
-                  "$ref": "#/definitions/ReadOnlyAccess"
-                }
-              ]
-            },
             "networkAccess": {
               "default": false,
               "type": "boolean"
@@ -334,16 +317,6 @@
               "default": false,
               "type": "boolean"
             },
-            "readOnlyAccess": {
-              "default": {
-                "type": "fullAccess"
-              },
-              "allOf": [
-                {
-                  "$ref": "#/definitions/ReadOnlyAccess"
-                }
-              ]
-            },
             "type": {
               "type": "string",
               "enum": ["workspaceWrite"],
@@ -360,10 +333,6 @@
           "title": "WorkspaceWriteSandboxPolicy"
         }
       ]
-    },
-    "ServiceTier": {
-      "type": "string",
-      "enum": ["fast", "flex"]
     },
     "Settings": {
       "description": "Settings for a collaboration mode.",
@@ -406,6 +375,25 @@
         }
       }
     },
+    "TurnEnvironmentParams": {
+      "type": "object",
+      "required": ["cwd", "environmentId"],
+      "properties": {
+        "cwd": {
+          "$ref": "#/definitions/LegacyAppPathString"
+        },
+        "environmentId": {
+          "type": "string"
+        },
+        "runtimeWorkspaceRoots": {
+          "description": "Environment-native runtime workspace roots. Omitted defaults to `cwd`.",
+          "type": ["array", "null"],
+          "items": {
+            "$ref": "#/definitions/LegacyAppPathString"
+          }
+        }
+      }
+    },
     "UserInput": {
       "oneOf": [
         {
@@ -435,6 +423,17 @@
           "type": "object",
           "required": ["type", "url"],
           "properties": {
+            "detail": {
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ImageDetail"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "type": {
               "type": "string",
               "enum": ["image"],
@@ -450,6 +449,17 @@
           "type": "object",
           "required": ["path", "type"],
           "properties": {
+            "detail": {
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ImageDetail"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "path": {
               "type": "string"
             },
@@ -460,6 +470,36 @@
             }
           },
           "title": "LocalImageUserInput"
+        },
+        {
+          "type": "object",
+          "required": ["type", "url"],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": ["audio"],
+              "title": "AudioUserInputType"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "title": "AudioUserInput"
+        },
+        {
+          "type": "object",
+          "required": ["path", "type"],
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": ["localAudio"],
+              "title": "LocalAudioUserInputType"
+            }
+          },
+          "title": "LocalAudioUserInput"
         },
         {
           "type": "object",

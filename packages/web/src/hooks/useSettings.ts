@@ -85,6 +85,66 @@ export function useWarmupEnabled(): boolean {
   return data?.warmupEnabled ?? false;
 }
 
+// Module-level cache for the QA-pipeline feature flag. Mirrors the usage-limits
+// cache so QA-gated components (TaskDetailHeader, TaskSettings, TaskDetail) can
+// read the flag without a QueryClientProvider — those components are rendered
+// in isolation in tests. Unlike usage-limits, the default is pessimistic
+// (`false`): a disabled feature should stay hidden rather than flash visible.
+let cachedQaPipelineEnabled: boolean | null = null;
+let inFlightQaPipelineFetch: Promise<void> | null = null;
+const qaPipelineListeners = new Set<(value: boolean) => void>();
+
+async function loadQaPipelineFlag(): Promise<void> {
+  if (cachedQaPipelineEnabled !== null) return;
+  if (inFlightQaPipelineFetch) return inFlightQaPipelineFetch;
+  inFlightQaPipelineFetch = (async () => {
+    try {
+      const settings = await api.getSettings();
+      cachedQaPipelineEnabled = settings.qaPipelineEnabled ?? false;
+    } catch {
+      // Network/API failure: stay hidden. A 403-backed feature flashing visible
+      // is worse than briefly hiding it; the UI auto-corrects once the real
+      // `/settings` response resolves on retry.
+      cachedQaPipelineEnabled = false;
+    }
+    const value = cachedQaPipelineEnabled ?? false;
+    qaPipelineListeners.forEach((listener) => listener(value));
+  })();
+  return inFlightQaPipelineFetch;
+}
+
+/**
+ * True when the backend has the QA pipeline feature enabled
+ * (`AIF_QA_PIPELINE_ENABLED`). Returns `false` until `/settings` resolves so a
+ * disabled deployment never briefly shows QA surfaces, then flips to the real
+ * value. See the `useUsageLimitsEnabled` note for why this uses a module-level
+ * store instead of `useSyncExternalStore`.
+ */
+export function useQaPipelineEnabled(): boolean {
+  const [value, setValue] = useState<boolean>(() => cachedQaPipelineEnabled ?? false);
+  useEffect(() => {
+    if (cachedQaPipelineEnabled !== null) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setValue(cachedQaPipelineEnabled);
+      return;
+    }
+    const listener = (next: boolean) => setValue(next);
+    qaPipelineListeners.add(listener);
+    void loadQaPipelineFlag();
+    return () => {
+      qaPipelineListeners.delete(listener);
+    };
+  }, []);
+  return value;
+}
+
+/** Test-only: reset the module-level QA-pipeline cache between cases. */
+export function __resetQaPipelineFlagCacheForTests(): void {
+  cachedQaPipelineEnabled = null;
+  inFlightQaPipelineFetch = null;
+  qaPipelineListeners.clear();
+}
+
 /** Test-only: reset the module-level usage-limits cache between cases. */
 export function __resetUsageLimitsFlagCacheForTests(): void {
   cachedUsageLimitsEnabled = null;

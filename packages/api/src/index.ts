@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { getEnv, logger } from "@aif/shared";
-import { listProjects, listStaleInProgressTasks } from "@aif/data";
+import { listProjects, listStaleInProgressTasks, resetStaleQaRuns } from "@aif/data";
 import { projectsRouter } from "./routes/projects.js";
 import { tasksRouter } from "./routes/tasks.js";
 import { chatRouter } from "./routes/chat.js";
@@ -17,11 +17,12 @@ import { createGracefulShutdownHandler } from "./shutdown.js";
 
 const log = logger("server");
 const startTime = Date.now();
+const nodeServerV2WebSocketEnabled = getEnv().AIF_API_NODE_SERVER_V2_WEBSOCKET_ENABLED;
 
 const app = new Hono();
 
 // WebSocket must be set up before routes
-const { injectWebSocket } = setupWebSocket(app);
+const { injectWebSocket, webSocketServer } = setupWebSocket(app, nodeServerV2WebSocketEnabled);
 
 // Middleware
 app.use(
@@ -100,11 +101,19 @@ const port = Number(process.env.PORT) || 3009;
 
 // Ensure data layer / DB is ready
 listProjects();
+
+// Recover tasks orphaned in qaStatus:"running" by a crash/restart mid-run —
+// the atomic QA claim (tryStartQaRun) would otherwise block QA for them forever.
+const recoveredQaRuns = resetStaleQaRuns();
+if (recoveredQaRuns > 0) {
+  log.warn({ recoveredQaRuns }, "Reset stale running QA runs to error after restart");
+}
 const codexIndexService = createCodexIndexService();
 
 const server = startServer({
   fetch: app.fetch,
   port,
+  webSocketServer,
   injectWebSocket,
   onStarted() {
     void codexIndexService.start();

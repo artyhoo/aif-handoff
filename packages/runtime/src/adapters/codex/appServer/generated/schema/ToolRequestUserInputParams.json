@@ -5,6 +5,12 @@
   "type": "object",
   "required": ["itemId", "questions", "threadId", "turnId"],
   "properties": {
+    "autoResolutionMs": {
+      "default": null,
+      "type": ["integer", "null"],
+      "format": "uint64",
+      "minimum": 0.0
+    },
     "itemId": {
       "type": "string"
     },

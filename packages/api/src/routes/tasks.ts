@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { jsonValidator } from "../middleware/zodValidator.js";
 import { internalBroadcastAuth } from "../middleware/internalBroadcastAuth.js";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
-import { logger, parseAttachments, getProjectConfig, defaultsForMode } from "@aif/shared";
+import { logger, parseAttachments, getProjectConfig, defaultsForMode, getEnv } from "@aif/shared";
 import {
   createTaskSchema,
   updateTaskSchema,
@@ -20,6 +20,7 @@ import {
 import { readAttachment } from "../services/attachmentStorage.js";
 import {
   findTaskById,
+  listTaskListItems,
   listTasks,
   createTask,
   updateTask,
@@ -40,6 +41,7 @@ import {
   resolveEffectiveRuntimeProfile,
   resolveEffectiveRuntimeProfilesForTasks,
   updateTaskPositionOnly,
+  tryStartQaRun,
   type TaskRow,
 } from "@aif/data";
 import { validateProjectScopedRuntimeProfileSelections } from "../services/runtimeProfileScope.js";
@@ -47,6 +49,83 @@ import { validateProjectScopedRuntimeProfileSelections } from "../services/runti
 const log = logger("tasks-route");
 
 export const tasksRouter = new Hono();
+
+/**
+ * Fire-and-forget QA dispatch shared by the manual `run-qa` endpoint and the
+ * auto-trigger on `approve_done`. The caller broadcasts `task:qa_started`
+ * first; this helper GUARANTEES a terminating `task:qa_done` / `task:qa_failed`
+ * even when the dynamic import or an unexpected throw escapes `runQaQuery`.
+ * `runQaQuery` is contracted never to throw, but `import()` and `broadcast`
+ * still can — without this outer guard a started run could hang the UI in
+ * "running" forever (no terminal event, possible unhandled rejection).
+ */
+function dispatchQaRun(projectId: string, taskId: string, executionRoot: string): void {
+  void (async () => {
+    try {
+      const { runQaQuery } = await import("../services/qaRunner.js");
+      const result = await runQaQuery({ projectId, taskId, executionRoot });
+      broadcast(
+        result.ok
+          ? { type: "task:qa_done", payload: { taskId, projectId, status: "done" } }
+          : {
+              type: "task:qa_failed",
+              payload: { taskId, projectId, status: "failed", error: result.error },
+            },
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      log.error({ taskId, projectId, error }, "QA dispatch failed before runner completed");
+      // Release the claimed "running" slot with a terminal status: tryStartQaRun
+      // only wins when qa_status != 'running', so without this a dispatch failure
+      // would block every future QA start for the task. Defensive wrap — a DB
+      // failure here must not prevent the task:qa_failed broadcast below.
+      try {
+        updateTask(taskId, { qaStatus: "error" });
+        const failedTask = findTaskById(taskId);
+        if (failedTask) {
+          broadcast({ type: "task:updated", payload: toTaskBroadcastPayload(failedTask) });
+        }
+      } catch (persistErr) {
+        log.error(
+          { persistErr, taskId },
+          "Failed to persist QA error status after dispatch failure",
+        );
+      }
+      broadcast({
+        type: "task:qa_failed",
+        payload: { taskId, projectId, status: "failed", error: message },
+      });
+    }
+  })();
+}
+
+/**
+ * Atomic QA start shared by the manual `run-qa` endpoint and the `approve_done`
+ * auto-trigger. Claims the qaStatus:"running" slot via the DB-level
+ * compare-and-set (`tryStartQaRun`), so concurrent manual + auto / double-POST
+ * starts are mutually exclusive and never spawn two runtime runs. ONLY on a win
+ * does it broadcast task:updated (running) + task:qa_started and dispatch the
+ * fire-and-forget runner. Returns { started:false } when QA was already running
+ * so the caller can respond 409 / skip. The status transition + the
+ * task:qa_started broadcast happen here (synchronously), not deep inside the
+ * async runner — that is what closes the check-then-set race.
+ */
+function startQaRun(
+  projectId: string,
+  taskId: string,
+  executionRoot: string,
+): { started: boolean } {
+  if (!tryStartQaRun(taskId)) {
+    return { started: false };
+  }
+  const runningTask = findTaskById(taskId);
+  if (runningTask) {
+    broadcast({ type: "task:updated", payload: toTaskBroadcastPayload(runningTask) });
+  }
+  broadcast({ type: "task:qa_started", payload: { taskId, projectId, status: "started" } });
+  dispatchQaRun(projectId, taskId, executionRoot);
+  return { started: true };
+}
 
 function toTaskRouteResponse(
   task: TaskRow,
@@ -89,29 +168,49 @@ tasksRouter.post(
   },
 );
 
-// GET /tasks?projectId=xxx — list by project, sorted by status order + position
+// GET /tasks — list tasks.
+//   • With projectId: lightweight TaskListItem[] (board/list rendering).
+//   • Without projectId: full Task[] for ALL projects (legacy dashboard path,
+//     retained until consumers migrate to GET /projects/overview — see cleanup PR).
+//     The bare path maps rows through toTaskRouteResponse (same as GET /tasks/:id)
+//     so the legacy response shape — parsed attachments/tags/runtimeOptions,
+//     effectiveRuntime, normalized runtimeLimitSnapshot — is preserved exactly.
+//     TODO(remove-bare-task-list): drop this branch once #141 lands.
 tasksRouter.get("/", (c) => {
   const projectId = c.req.query("projectId") || undefined;
-  if (projectId && !/^[0-9a-f-]{36}$/i.test(projectId)) {
+
+  // Legacy bare path: no projectId → return full Task[] across all projects.
+  // Kept alive for merge-safety until dashboard consumers migrate to /overview.
+  if (!projectId) {
+    const allTasks = listTasks();
+    const systemDefaultRuntimeProfileId = getAppDefaultRuntimeProfileId("task");
+    const effectiveRuntimeByTaskId = resolveEffectiveRuntimeProfilesForTasks(allTasks, {
+      mode: "task",
+      systemDefaultRuntimeProfileId,
+    });
+    log.debug({ count: allTasks.length, scope: "all" }, "Listed tasks (bare, legacy)");
+    return c.json(
+      allTasks.map((task) =>
+        toTaskRouteResponse(
+          task,
+          systemDefaultRuntimeProfileId,
+          effectiveRuntimeByTaskId.get(task.id),
+        ),
+      ),
+    );
+  }
+
+  if (!/^[0-9a-f-]{36}$/i.test(projectId)) {
+    log.warn(
+      { route: "GET /tasks", projectId },
+      "Rejected task list request with invalid projectId",
+    );
     return c.json({ error: "Invalid projectId format" }, 400);
   }
 
-  const allTasks = listTasks(projectId);
-  const systemDefaultRuntimeProfileId = getAppDefaultRuntimeProfileId("task");
-  const effectiveRuntimeByTaskId = resolveEffectiveRuntimeProfilesForTasks(allTasks, {
-    mode: "task",
-    systemDefaultRuntimeProfileId,
-  });
-  log.debug({ count: allTasks.length, projectId }, "Listed tasks");
-  return c.json(
-    allTasks.map((task) =>
-      toTaskRouteResponse(
-        task,
-        systemDefaultRuntimeProfileId,
-        effectiveRuntimeByTaskId.get(task.id),
-      ),
-    ),
-  );
+  const taskList = listTaskListItems(projectId);
+  log.debug({ count: taskList.length, projectId, responseType: "TaskListItem" }, "Listed tasks");
+  return c.json(taskList);
 });
 
 // POST /tasks — create
@@ -145,6 +244,8 @@ tasksRouter.post("/", jsonValidator(createTaskSchema), async (c) => {
   const resolvedSkipReview = body.skipReview ?? modeDefaults.skipReview;
   const resolvedPlanDocs = body.planDocs ?? modeDefaults.planDocs;
   const resolvedPlanTests = body.planTests ?? modeDefaults.planTests;
+  const resolvedRunPlanImprove = body.useSubagents ? false : body.runPlanImprove;
+  const resolvedRunPostVerify = body.useSubagents ? false : body.runPostVerify;
   if (
     body.skipReview === undefined ||
     body.planDocs === undefined ||
@@ -178,6 +279,9 @@ tasksRouter.post("/", jsonValidator(createTaskSchema), async (c) => {
     planTests: resolvedPlanTests,
     skipReview: resolvedSkipReview,
     useSubagents: body.useSubagents,
+    runPlanImprove: resolvedRunPlanImprove,
+    runPostVerify: resolvedRunPostVerify,
+    autoQa: body.autoQa,
     maxReviewIterations: body.maxReviewIterations,
     paused: body.paused,
     runtimeProfileId: body.runtimeProfileId,
@@ -370,6 +474,11 @@ tasksRouter.put("/:id", jsonValidator(updateTaskSchema), async (c) => {
   }
 
   const { plan, attachments: incomingAttachments, ...updatePayload } = body;
+  const effectiveUseSubagents = updatePayload.useSubagents ?? existing.useSubagents;
+  if (effectiveUseSubagents) {
+    updatePayload.runPlanImprove = false;
+    updatePayload.runPostVerify = false;
+  }
 
   // Mirror POST /tasks: when plannerMode changes, fill omitted flags from mode defaults.
   if (updatePayload.plannerMode !== undefined) {
@@ -515,11 +624,66 @@ tasksRouter.post("/:id/events", jsonValidator(taskEventSchema), async (c) => {
       })();
     }
 
+    // Fire-and-forget: run /aif-qa when approved and autoQa is enabled on the task.
+    // approve_done moves the task done -> verified; QA runs asynchronously after.
+    // Gated behind AIF_QA_PIPELINE_ENABLED (off by default).
+    if (event === "approve_done" && handled.task.autoQa && !getEnv().AIF_QA_PIPELINE_ENABLED) {
+      log.debug(
+        { taskId: handled.task.id },
+        "Auto QA skipped — AIF_QA_PIPELINE_ENABLED is disabled",
+      );
+    } else if (event === "approve_done" && handled.task.autoQa) {
+      // Branchless (fast-mode) tasks are allowed: the runner resolves the branch
+      // via `git branch --show-current`, mirroring the aif-qa skill.
+      const { id: taskId, projectId, worktreePath } = handled.task;
+      const project = findProjectById(projectId);
+      if (!project) {
+        log.error({ taskId, projectId }, "Auto QA skipped — project not found");
+      } else {
+        const executionRoot = worktreePath ?? project.rootPath;
+        log.info({ taskId }, "Auto QA triggered (autoQa=true)");
+        const { started } = startQaRun(projectId, taskId, executionRoot);
+        if (!started) {
+          log.warn({ taskId }, "Auto QA skipped — QA already running");
+        }
+      }
+    }
+
     return c.json(toTaskRouteResponse(handled.task));
   } catch (error) {
     log.error({ taskId: id, event, error }, "Task event handling failed");
     return c.json({ error: "Internal server error" }, 500);
   }
+});
+
+// POST /tasks/:id/run-qa — manually trigger the aif-qa pipeline (fire-and-forget)
+tasksRouter.post("/:id/run-qa", (c) => {
+  const { id } = c.req.param();
+  if (!getEnv().AIF_QA_PIPELINE_ENABLED) {
+    log.warn({ taskId: id }, "QA cannot run — AIF_QA_PIPELINE_ENABLED is disabled");
+    return c.json({ error: "QA pipeline is disabled", code: "feature_disabled" }, 403);
+  }
+  const task = findTaskById(id);
+  if (!task) {
+    return c.json({ error: "Task not found" }, 404);
+  }
+  const project = findProjectById(task.projectId);
+  if (!project) {
+    log.error({ taskId: id, projectId: task.projectId }, "QA cannot run — project not found");
+    return c.json({ error: "Project not found" }, 404);
+  }
+
+  const executionRoot = task.worktreePath ?? project.rootPath;
+  log.info({ taskId: id, branchName: task.branchName }, "run-qa requested for task");
+  // Atomic claim of the running slot — a second concurrent POST loses the
+  // compare-and-set and gets 409 instead of starting a duplicate runtime run.
+  const { started } = startQaRun(task.projectId, id, executionRoot);
+  if (!started) {
+    log.warn({ taskId: id }, "QA already running for task, skipping");
+    return c.json({ error: "QA already running" }, 409);
+  }
+
+  return c.json({ status: "accepted" }, 202);
 });
 
 // PATCH /tasks/:id/position — reorder within column

@@ -10,9 +10,9 @@ import { formatTokenCount, formatUsd } from "@/lib/formatters";
 import { Tabs } from "@/components/ui/tabs";
 import { AlertBox } from "@/components/ui/alert-box";
 import { getRuntimeLimitDisplay } from "@/lib/runtimeLimits";
-import { useUsageLimitsEnabled } from "@/hooks/useSettings";
+import { useUsageLimitsEnabled, useQaPipelineEnabled } from "@/hooks/useSettings";
 
-export type TaskDetailTab = "implementation" | "review" | "comments" | "activity";
+export type TaskDetailTab = "implementation" | "review" | "comments" | "activity" | "qa";
 
 const ACTION_BUTTONS_BY_STATUS: Partial<
   Record<
@@ -81,6 +81,14 @@ export function TaskDetailHeader({
     (action) => action.visible?.(task) ?? true,
   );
   const usageLimitsEnabled = useUsageLimitsEnabled();
+  const qaPipelineEnabled = useQaPipelineEnabled();
+  const tabItems = [
+    { value: "implementation", label: "Implementation" },
+    { value: "review", label: "Review" },
+    { value: "comments", label: "Comments" },
+    { value: "activity", label: "Activity" },
+    ...(qaPipelineEnabled ? [{ value: "qa", label: "QA" }] : []),
+  ];
   const runtimeLimitDisplay = usageLimitsEnabled
     ? getRuntimeLimitDisplay(task.runtimeLimitSnapshot, {
         taskRetryAfter: task.retryAfter ?? null,
@@ -211,12 +219,7 @@ export function TaskDetailHeader({
 
       <Tabs
         className="mt-3 border border-border bg-background/55 p-2"
-        items={[
-          { value: "implementation", label: "Implementation" },
-          { value: "review", label: "Review" },
-          { value: "comments", label: "Comments" },
-          { value: "activity", label: "Activity" },
-        ]}
+        items={tabItems}
         value={activeTab}
         onValueChange={(v) => onTabChange(v as TaskDetailTab)}
       />

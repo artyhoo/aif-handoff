@@ -43,12 +43,21 @@
           "default": false,
           "type": "boolean"
         },
+        "mcpServerOpenaiFormElicitation": {
+          "description": "Allow downstream MCP servers to request OpenAI extended form elicitations.",
+          "type": "boolean"
+        },
         "optOutNotificationMethods": {
           "description": "Exact notification method names that should be suppressed for this connection (for example `thread/started`).",
           "type": ["array", "null"],
           "items": {
             "type": "string"
           }
+        },
+        "requestAttestation": {
+          "description": "Opt into `attestation/generate` requests for upstream `x-oai-attestation`.",
+          "default": false,
+          "type": "boolean"
         }
       }
     }

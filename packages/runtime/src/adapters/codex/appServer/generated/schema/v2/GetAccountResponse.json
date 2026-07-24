@@ -38,7 +38,7 @@
           "required": ["email", "planType", "type"],
           "properties": {
             "email": {
-              "type": "string"
+              "type": ["string", "null"]
             },
             "planType": {
               "$ref": "#/definitions/PlanType"
@@ -50,6 +50,22 @@
             }
           },
           "title": "ChatgptAccount"
+        },
+        {
+          "type": "object",
+          "required": ["type"],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": ["amazonBedrock"],
+              "title": "AmazonBedrockAccountType"
+            },
+            "usesCodexManagedCredentials": {
+              "default": false,
+              "type": "boolean"
+            }
+          },
+          "title": "AmazonBedrockAccount"
         }
       ]
     },
@@ -60,6 +76,7 @@
         "go",
         "plus",
         "pro",
+        "prolite",
         "team",
         "self_serve_business_usage_based",
         "business",

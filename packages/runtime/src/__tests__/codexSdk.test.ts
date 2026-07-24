@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { validateRuntimeModelEffort } from "../modelEffort.js";
 import type { RuntimeRunInput } from "../types.js";
 import { TEST_USAGE_CONTEXT } from "./helpers/usageContext.js";
 
@@ -297,6 +298,75 @@ describe("runCodexSdk", () => {
     expect(mockStartThread).toHaveBeenCalledWith(expect.objectContaining({ model: "gpt-5.4" }));
   });
 
+  it("passes a supported reasoning effort to thread options", async () => {
+    mockRunStreamed.mockResolvedValue({
+      events: createMockEvents([
+        { type: "thread.started", thread_id: "thread-effort" },
+        {
+          type: "turn.completed",
+          usage: { input_tokens: 0, output_tokens: 0, cached_input_tokens: 0 },
+        },
+      ]),
+    });
+
+    await runCodexSdk(createRunInput({ options: { modelReasoningEffort: " XHIGH " } }));
+
+    expect(mockStartThread).toHaveBeenCalledWith(
+      expect.objectContaining({ modelReasoningEffort: "xhigh" }),
+    );
+  });
+
+  it("passes a selected-model dynamic reasoning effort after validation", async () => {
+    mockRunStreamed.mockResolvedValue({
+      events: createMockEvents([
+        { type: "thread.started", thread_id: "thread-dynamic-effort" },
+        {
+          type: "turn.completed",
+          usage: { input_tokens: 0, output_tokens: 0, cached_input_tokens: 0 },
+        },
+      ]),
+    });
+    const validation = validateRuntimeModelEffort(
+      createRunInput({
+        model: "gpt-current",
+        options: { modelReasoningEffort: " Ultra " },
+      }),
+      [
+        {
+          id: "gpt-current",
+          metadata: {
+            supportsEffort: true,
+            supportedEffortLevels: ["ultra"],
+          },
+        },
+      ],
+    );
+
+    await runCodexSdk(validation.input);
+
+    expect(mockStartThread).toHaveBeenCalledWith(
+      expect.objectContaining({ modelReasoningEffort: "ultra" }),
+    );
+  });
+
+  it("does not claim an arbitrary reasoning effort is supported by the SDK", async () => {
+    mockRunStreamed.mockResolvedValue({
+      events: createMockEvents([
+        { type: "thread.started", thread_id: "thread-no-effort" },
+        {
+          type: "turn.completed",
+          usage: { input_tokens: 0, output_tokens: 0, cached_input_tokens: 0 },
+        },
+      ]),
+    });
+
+    await runCodexSdk(createRunInput({ options: { modelReasoningEffort: "bogus" } }));
+
+    expect(mockStartThread).toHaveBeenCalledWith(
+      expect.not.objectContaining({ modelReasoningEffort: expect.anything() }),
+    );
+  });
+
   it("passes approval policy and sandbox mode from hooks to thread options (overriding non-bypass defaults)", async () => {
     mockRunStreamed.mockResolvedValue({
       events: createMockEvents([
@@ -515,7 +585,7 @@ describe("runCodexSdk", () => {
   });
 
   it("does not forward npm_ environment keys into Codex SDK env", async () => {
-    vi.stubEnv("OPENAI_API_KEY", "sk-sdk");
+    vi.stubEnv("CODEX_HOME", "/tmp/codex-home");
     vi.stubEnv("npm_config_registry", "https://registry.npmjs.org");
     mockRunStreamed.mockResolvedValue({
       events: createMockEvents([
@@ -532,8 +602,56 @@ describe("runCodexSdk", () => {
     const constructorOptions = mockCodexConstructor.mock.calls[0][0] as {
       env?: Record<string, string>;
     };
-    expect(constructorOptions.env?.OPENAI_API_KEY).toBe("sk-sdk");
+    expect(constructorOptions.env?.CODEX_HOME).toBe("/tmp/codex-home");
     expect(constructorOptions.env?.npm_config_registry).toBeUndefined();
+  });
+
+  it("does not forward OPENAI API env defaults to the SDK child environment", async () => {
+    vi.stubEnv("OPENAI_API_KEY", "sk-placeholder");
+    vi.stubEnv("OPENAI_BASE_URL", "http://host.docker.internal:8317/v1");
+    mockRunStreamed.mockResolvedValue({
+      events: createMockEvents([
+        { type: "thread.started", thread_id: "thread-new" },
+        {
+          type: "turn.completed",
+          usage: { input_tokens: 0, output_tokens: 0, cached_input_tokens: 0 },
+        },
+      ]),
+    });
+
+    await runCodexSdk(createRunInput());
+
+    const options = mockCodexConstructor.mock.calls[0]?.[0] as {
+      apiKey?: string;
+      baseUrl?: string;
+      env?: Record<string, string>;
+    };
+    expect(options.apiKey).toBeUndefined();
+    expect(options.baseUrl).toBeUndefined();
+    expect(options.env?.OPENAI_API_KEY).toBeUndefined();
+    expect(options.env?.OPENAI_BASE_URL).toBeUndefined();
+  });
+
+  it("passes an explicitly configured API key env var to Codex SDK", async () => {
+    vi.stubEnv("OPENAI_API_KEY", "sk-real");
+    mockRunStreamed.mockResolvedValue({
+      events: createMockEvents([
+        { type: "thread.started", thread_id: "thread-new" },
+        {
+          type: "turn.completed",
+          usage: { input_tokens: 0, output_tokens: 0, cached_input_tokens: 0 },
+        },
+      ]),
+    });
+
+    await runCodexSdk(createRunInput({ options: { apiKeyEnvVar: "OPENAI_API_KEY" } }));
+
+    const options = mockCodexConstructor.mock.calls[0]?.[0] as {
+      apiKey?: string;
+      env?: Record<string, string>;
+    };
+    expect(options.apiKey).toBe("sk-real");
+    expect(options.env?.OPENAI_API_KEY).toBe("sk-real");
   });
 
   it("forwards proxy env vars into Codex SDK env", async () => {

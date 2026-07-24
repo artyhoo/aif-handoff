@@ -20,6 +20,32 @@
       "type": "string",
       "enum": ["unsupported", "notLoggedIn", "bearerToken", "oAuth"]
     },
+    "McpServerInfo": {
+      "description": "Presentation metadata advertised by an initialized MCP server.",
+      "type": "object",
+      "required": ["name", "version"],
+      "properties": {
+        "description": {
+          "type": ["string", "null"]
+        },
+        "icons": {
+          "type": ["array", "null"],
+          "items": true
+        },
+        "name": {
+          "type": "string"
+        },
+        "title": {
+          "type": ["string", "null"]
+        },
+        "version": {
+          "type": "string"
+        },
+        "websiteUrl": {
+          "type": ["string", "null"]
+        }
+      }
+    },
     "McpServerStatus": {
       "type": "object",
       "required": ["authStatus", "name", "resourceTemplates", "resources", "tools"],
@@ -41,6 +67,16 @@
           "items": {
             "$ref": "#/definitions/Resource"
           }
+        },
+        "serverInfo": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/McpServerInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "tools": {
           "type": "object",

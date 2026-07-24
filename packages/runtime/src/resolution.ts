@@ -27,6 +27,7 @@ export interface RuntimeResolutionEnv {
   OPENROUTER_API_KEY?: string;
   OPENROUTER_BASE_URL?: string;
   OPENROUTER_MODEL?: string;
+  CODEX_BASE_URL?: string;
   CODEX_CLI_PATH?: string;
   [key: string]: string | undefined;
 }
@@ -106,6 +107,7 @@ function inferDefaultBaseUrl(
   runtimeId: string,
   providerId: string,
   env: RuntimeResolutionEnv,
+  transport: RuntimeTransport,
 ): string | null {
   const runtime = runtimeId.toLowerCase();
   const provider = providerId.toLowerCase();
@@ -116,6 +118,13 @@ function inferDefaultBaseUrl(
 
   if (runtime === "openrouter" || provider === "openrouter") {
     return normalizeString(env.OPENROUTER_BASE_URL) ?? "https://openrouter.ai/api/v1";
+  }
+
+  // Local Codex transports (sdk/cli/app-server) must not silently inherit
+  // OPENAI_BASE_URL: an OAuth-backed `codex login` session should reach
+  // Codex's own backend unless a profile baseUrl or CODEX_BASE_URL opts in.
+  if (runtime === "codex" && transport !== RuntimeTransport.API) {
+    return normalizeString(env.CODEX_BASE_URL);
   }
 
   return normalizeString(env.OPENAI_BASE_URL);
@@ -262,7 +271,13 @@ export function resolveRuntimeProfile(input: ResolveRuntimeProfileInput): Resolv
   });
   const explicitApiKeyEnvVar = normalizeString(profile?.apiKeyEnvVar);
   const defaultApiKeyEnvVar = inferDefaultApiKeyEnvVar(runtimeId, providerId, env);
-  let apiKeyEnvVar = defaultApiKeyEnvVar;
+  // Local Codex transports default to `codex login` / OAuth auth. They must not
+  // implicitly consume an ambient OPENAI_API_KEY — only an explicit profile
+  // apiKeyEnvVar opts a local Codex run into API-key auth.
+  const isCodexLocalTransport =
+    runtimeId.toLowerCase() === "codex" && transport !== RuntimeTransport.API;
+  let apiKeyEnvVar: string | null =
+    isCodexLocalTransport && !explicitApiKeyEnvVar ? null : defaultApiKeyEnvVar;
   if (explicitApiKeyEnvVar) {
     if (isValidEnvVarName(explicitApiKeyEnvVar)) {
       apiKeyEnvVar = explicitApiKeyEnvVar;
@@ -280,8 +295,13 @@ export function resolveRuntimeProfile(input: ResolveRuntimeProfileInput): Resolv
       );
     }
   }
-  let apiKey = resolveApiKey(apiKeyEnvVar, env);
-  if (!apiKey && explicitApiKeyEnvVar && apiKeyEnvVar !== defaultApiKeyEnvVar) {
+  let apiKey = apiKeyEnvVar ? resolveApiKey(apiKeyEnvVar, env) : null;
+  if (
+    !apiKey &&
+    explicitApiKeyEnvVar &&
+    apiKeyEnvVar !== defaultApiKeyEnvVar &&
+    !isCodexLocalTransport
+  ) {
     const fallbackApiKey = resolveApiKey(defaultApiKeyEnvVar, env);
     if (fallbackApiKey) {
       input.logger?.warn?.(
@@ -300,7 +320,7 @@ export function resolveRuntimeProfile(input: ResolveRuntimeProfileInput): Resolv
     }
   }
   const baseUrl =
-    normalizeString(profile?.baseUrl) ?? inferDefaultBaseUrl(runtimeId, providerId, env);
+    normalizeString(profile?.baseUrl) ?? inferDefaultBaseUrl(runtimeId, providerId, env, transport);
   const model =
     input.suppressModelFallback === true
       ? null

@@ -1,8 +1,9 @@
 import { useEffect, useRef, useCallback } from "react";
 import { useQueryClient, type QueryClient } from "@tanstack/react-query";
-import type { WsEvent, Task, TaskStatus } from "@aif/shared/browser";
+import type { WsEvent, Task, TaskListItem, TaskStatus } from "@aif/shared/browser";
 import { useNotificationSettings } from "./useNotificationSettings";
 import { playStatusChangeBeep, showTaskMovedNotification } from "@/lib/notifications";
+import { invalidateProjectTaskOverviews } from "./useProjects";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -80,7 +81,7 @@ export function useWebSocket() {
       const detailed = queryClient.getQueryData<Task>(["task", taskId]);
       if (detailed) return detailed.status;
 
-      const taskLists = queryClient.getQueriesData<Task[]>({ queryKey: ["tasks"] });
+      const taskLists = queryClient.getQueriesData<TaskListItem[]>({ queryKey: ["tasks"] });
       for (const [, tasks] of taskLists) {
         if (!tasks) continue;
         const found = tasks.find((task) => task.id === taskId);
@@ -160,6 +161,21 @@ export function useWebSocket() {
         return;
       }
 
+      // QA lifecycle (manual run-qa + auto-trigger on approve_done): surface to
+      // listeners and invalidate the task query so the QA tab refetches the
+      // updated qaStatus/artifacts (the auto-trigger path has no useRunQa hook).
+      if (
+        raw.type === "task:qa_started" ||
+        raw.type === "task:qa_done" ||
+        raw.type === "task:qa_failed"
+      ) {
+        window.dispatchEvent(new CustomEvent(raw.type, { detail: raw.payload }));
+        if (isRecord(raw.payload) && typeof raw.payload.taskId === "string") {
+          queryClient.invalidateQueries({ queryKey: ["task", raw.payload.taskId] });
+        }
+        return;
+      }
+
       const data = raw as unknown as WsEvent;
 
       if (data.type === "task:moved" && isTaskPayload(data.payload)) {
@@ -205,11 +221,19 @@ export function useWebSocket() {
         return;
       }
 
+      if (data.type === "project:organization_updated") {
+        queryClient.invalidateQueries({ queryKey: ["projects"] });
+        return;
+      }
+
       if (data.type === "project:runtime_limit_updated" && hasRuntimeLimitPayload(data.payload)) {
         invalidateRuntimeLimitQueries(queryClient, data.payload);
         if (typeof data.payload.taskId === "string" && data.payload.taskId.length > 0) {
           pendingTaskIds.current.add(data.payload.taskId);
+          queryClient.invalidateQueries({ queryKey: ["tasks"] });
         }
+        // Overview aggregates token/cost fields, so refresh after usage updates.
+        invalidateProjectTaskOverviews(queryClient);
         return;
       }
 
@@ -227,6 +251,7 @@ export function useWebSocket() {
           queryKey: ["task", data.payload.id],
         });
         queryClient.invalidateQueries({ queryKey: ["tasks"] });
+        invalidateProjectTaskOverviews(queryClient);
         return;
       }
 
@@ -235,6 +260,8 @@ export function useWebSocket() {
         window.dispatchEvent(new CustomEvent(data.type, { detail: data.payload }));
 
         if (data.type === "roadmap:complete" && isRecord(data.payload)) {
+          queryClient.invalidateQueries({ queryKey: ["tasks"] });
+          invalidateProjectTaskOverviews(queryClient);
           const p = data.payload as { roadmapAlias?: string; created?: number };
           if (settingsRef.current.desktop && Notification.permission === "granted") {
             new Notification("Roadmap ready", {
@@ -255,6 +282,7 @@ export function useWebSocket() {
       clearTimeout(invalidateTimer.current);
       invalidateTimer.current = setTimeout(() => {
         queryClient.invalidateQueries({ queryKey: ["tasks"] });
+        invalidateProjectTaskOverviews(queryClient);
         for (const id of pendingTaskIds.current) {
           queryClient.invalidateQueries({ queryKey: ["task", id] });
         }

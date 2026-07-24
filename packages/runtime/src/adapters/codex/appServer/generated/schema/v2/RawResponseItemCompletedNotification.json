@@ -15,6 +15,40 @@
     }
   },
   "definitions": {
+    "AgentMessageInputContent": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["text", "type"],
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": ["input_text"],
+              "title": "InputTextAgentMessageInputContentType"
+            }
+          },
+          "title": "InputTextAgentMessageInputContent"
+        },
+        {
+          "type": "object",
+          "required": ["encrypted_content", "type"],
+          "properties": {
+            "encrypted_content": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": ["encrypted_content"],
+              "title": "EncryptedContentAgentMessageInputContentType"
+            }
+          },
+          "title": "EncryptedContentAgentMessageInputContent"
+        }
+      ]
+    },
     "ContentItem": {
       "oneOf": [
         {
@@ -36,6 +70,16 @@
           "type": "object",
           "required": ["image_url", "type"],
           "properties": {
+            "detail": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ImageDetail"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "image_url": {
               "type": "string"
             },
@@ -46,6 +90,21 @@
             }
           },
           "title": "InputImageContentItem"
+        },
+        {
+          "type": "object",
+          "required": ["audio_url", "type"],
+          "properties": {
+            "audio_url": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": ["input_audio"],
+              "title": "InputAudioContentItemType"
+            }
+          },
+          "title": "InputAudioContentItem"
         },
         {
           "type": "object",
@@ -119,37 +178,51 @@
             }
           },
           "title": "InputImageFunctionCallOutputContentItem"
+        },
+        {
+          "type": "object",
+          "required": ["audio_url", "type"],
+          "properties": {
+            "audio_url": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": ["input_audio"],
+              "title": "InputAudioFunctionCallOutputContentItemType"
+            }
+          },
+          "title": "InputAudioFunctionCallOutputContentItem"
+        },
+        {
+          "type": "object",
+          "required": ["encrypted_content", "type"],
+          "properties": {
+            "encrypted_content": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": ["encrypted_content"],
+              "title": "EncryptedContentFunctionCallOutputContentItemType"
+            }
+          },
+          "title": "EncryptedContentFunctionCallOutputContentItem"
         }
       ]
-    },
-    "GhostCommit": {
-      "description": "Details of a ghost commit created from a repository state.",
-      "type": "object",
-      "required": ["id", "preexisting_untracked_dirs", "preexisting_untracked_files"],
-      "properties": {
-        "id": {
-          "type": "string"
-        },
-        "parent": {
-          "type": ["string", "null"]
-        },
-        "preexisting_untracked_dirs": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        },
-        "preexisting_untracked_files": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        }
-      }
     },
     "ImageDetail": {
       "type": "string",
       "enum": ["auto", "low", "high", "original"]
+    },
+    "InternalChatMessageMetadataPassthrough": {
+      "description": "Internal Responses API passthrough metadata copied into underlying chat messages.\n\nResponses API strongly types this payload. Do not modify it without first getting API approval and making the corresponding Responses API change.",
+      "type": "object",
+      "properties": {
+        "turn_id": {
+          "type": ["string", "null"]
+        }
+      }
     },
     "LocalShellAction": {
       "oneOf": [
@@ -274,12 +347,18 @@
                 "$ref": "#/definitions/ContentItem"
               }
             },
-            "end_turn": {
-              "type": ["boolean", "null"]
-            },
             "id": {
-              "writeOnly": true,
               "type": ["string", "null"]
+            },
+            "internal_chat_message_metadata_passthrough": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/InternalChatMessageMetadataPassthrough"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "phase": {
               "anyOf": [
@@ -304,6 +383,43 @@
         },
         {
           "type": "object",
+          "required": ["author", "content", "recipient", "type"],
+          "properties": {
+            "author": {
+              "type": "string"
+            },
+            "content": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/AgentMessageInputContent"
+              }
+            },
+            "id": {
+              "type": ["string", "null"]
+            },
+            "internal_chat_message_metadata_passthrough": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/InternalChatMessageMetadataPassthrough"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "recipient": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": ["agent_message"],
+              "title": "AgentMessageResponseItemType"
+            }
+          },
+          "title": "AgentMessageResponseItem"
+        },
+        {
+          "type": "object",
           "required": ["summary", "type"],
           "properties": {
             "content": {
@@ -315,6 +431,19 @@
             },
             "encrypted_content": {
               "type": ["string", "null"]
+            },
+            "id": {
+              "type": ["string", "null"]
+            },
+            "internal_chat_message_metadata_passthrough": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/InternalChatMessageMetadataPassthrough"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "summary": {
               "type": "array",
@@ -343,8 +472,17 @@
             },
             "id": {
               "description": "Legacy id field retained for compatibility with older payloads.",
-              "writeOnly": true,
               "type": ["string", "null"]
+            },
+            "internal_chat_message_metadata_passthrough": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/InternalChatMessageMetadataPassthrough"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "status": {
               "$ref": "#/definitions/LocalShellStatus"
@@ -368,8 +506,17 @@
               "type": "string"
             },
             "id": {
-              "writeOnly": true,
               "type": ["string", "null"]
+            },
+            "internal_chat_message_metadata_passthrough": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/InternalChatMessageMetadataPassthrough"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "name": {
               "type": "string"
@@ -397,8 +544,17 @@
               "type": "string"
             },
             "id": {
-              "writeOnly": true,
               "type": ["string", "null"]
+            },
+            "internal_chat_message_metadata_passthrough": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/InternalChatMessageMetadataPassthrough"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "status": {
               "type": ["string", "null"]
@@ -417,6 +573,19 @@
           "properties": {
             "call_id": {
               "type": "string"
+            },
+            "id": {
+              "type": ["string", "null"]
+            },
+            "internal_chat_message_metadata_passthrough": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/InternalChatMessageMetadataPassthrough"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "output": {
               "$ref": "#/definitions/FunctionCallOutputBody"
@@ -437,14 +606,26 @@
               "type": "string"
             },
             "id": {
-              "writeOnly": true,
               "type": ["string", "null"]
             },
             "input": {
               "type": "string"
             },
+            "internal_chat_message_metadata_passthrough": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/InternalChatMessageMetadataPassthrough"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "name": {
               "type": "string"
+            },
+            "namespace": {
+              "type": ["string", "null"]
             },
             "status": {
               "type": ["string", "null"]
@@ -463,6 +644,19 @@
           "properties": {
             "call_id": {
               "type": "string"
+            },
+            "id": {
+              "type": ["string", "null"]
+            },
+            "internal_chat_message_metadata_passthrough": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/InternalChatMessageMetadataPassthrough"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "name": {
               "type": ["string", "null"]
@@ -487,6 +681,19 @@
             },
             "execution": {
               "type": "string"
+            },
+            "id": {
+              "type": ["string", "null"]
+            },
+            "internal_chat_message_metadata_passthrough": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/InternalChatMessageMetadataPassthrough"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "status": {
               "type": "string"
@@ -518,8 +725,17 @@
               ]
             },
             "id": {
-              "writeOnly": true,
               "type": ["string", "null"]
+            },
+            "internal_chat_message_metadata_passthrough": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/InternalChatMessageMetadataPassthrough"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "status": {
               "type": ["string", "null"]
@@ -534,10 +750,20 @@
         },
         {
           "type": "object",
-          "required": ["id", "result", "status", "type"],
+          "required": ["result", "status", "type"],
           "properties": {
             "id": {
-              "type": "string"
+              "type": ["string", "null"]
+            },
+            "internal_chat_message_metadata_passthrough": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/InternalChatMessageMetadataPassthrough"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "result": {
               "type": "string"
@@ -558,25 +784,23 @@
         },
         {
           "type": "object",
-          "required": ["ghost_commit", "type"],
-          "properties": {
-            "ghost_commit": {
-              "$ref": "#/definitions/GhostCommit"
-            },
-            "type": {
-              "type": "string",
-              "enum": ["ghost_snapshot"],
-              "title": "GhostSnapshotResponseItemType"
-            }
-          },
-          "title": "GhostSnapshotResponseItem"
-        },
-        {
-          "type": "object",
           "required": ["encrypted_content", "type"],
           "properties": {
             "encrypted_content": {
               "type": "string"
+            },
+            "id": {
+              "type": ["string", "null"]
+            },
+            "internal_chat_message_metadata_passthrough": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/InternalChatMessageMetadataPassthrough"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "type": {
               "type": "string",
@@ -585,6 +809,46 @@
             }
           },
           "title": "CompactionResponseItem"
+        },
+        {
+          "type": "object",
+          "required": ["type"],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": ["compaction_trigger"],
+              "title": "CompactionTriggerResponseItemType"
+            }
+          },
+          "title": "CompactionTriggerResponseItem"
+        },
+        {
+          "type": "object",
+          "required": ["type"],
+          "properties": {
+            "encrypted_content": {
+              "type": ["string", "null"]
+            },
+            "id": {
+              "type": ["string", "null"]
+            },
+            "internal_chat_message_metadata_passthrough": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/InternalChatMessageMetadataPassthrough"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": ["context_compaction"],
+              "title": "ContextCompactionResponseItemType"
+            }
+          },
+          "title": "ContextCompactionResponseItem"
         },
         {
           "type": "object",

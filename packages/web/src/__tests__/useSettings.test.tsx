@@ -19,7 +19,9 @@ import {
   useProjectDefaults,
   useUsageLimitsEnabled,
   useWarmupEnabled,
+  useQaPipelineEnabled,
   __resetUsageLimitsFlagCacheForTests,
+  __resetQaPipelineFlagCacheForTests,
 } from "../hooks/useSettings.js";
 
 function createWrapper() {
@@ -138,5 +140,54 @@ describe("useWarmupEnabled", () => {
     expect(result.current).toBe(false);
     await waitFor(() => expect(result.current).toBe(true));
     expect(mockGetSettings).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("useQaPipelineEnabled", () => {
+  beforeEach(() => {
+    __resetQaPipelineFlagCacheForTests();
+    mockGetSettings.mockReset();
+  });
+
+  it("returns false until settings load (pessimistic) and then reflects qaPipelineEnabled", async () => {
+    mockGetSettings.mockResolvedValue({
+      useSubagents: false,
+      maxReviewIterations: 3,
+      autoReviewStrategy: "full_re_review",
+      usageLimitsEnabled: true,
+      warmupEnabled: false,
+      qaPipelineEnabled: true,
+    });
+
+    // No QueryClientProvider — the hook uses a module-level store, like usage-limits.
+    const { result } = renderHook(() => useQaPipelineEnabled());
+
+    expect(result.current).toBe(false);
+    await waitFor(() => expect(result.current).toBe(true));
+    expect(mockGetSettings).toHaveBeenCalledTimes(1);
+  });
+
+  it("stays false when the backend omits qaPipelineEnabled", async () => {
+    mockGetSettings.mockResolvedValue({
+      useSubagents: false,
+      maxReviewIterations: 3,
+      autoReviewStrategy: "full_re_review",
+      usageLimitsEnabled: true,
+      warmupEnabled: false,
+    });
+
+    const { result } = renderHook(() => useQaPipelineEnabled());
+
+    await waitFor(() => expect(mockGetSettings).toHaveBeenCalledTimes(1));
+    expect(result.current).toBe(false);
+  });
+
+  it("stays false (hidden) when /settings is unreachable", async () => {
+    mockGetSettings.mockRejectedValue(new Error("network"));
+
+    const { result } = renderHook(() => useQaPipelineEnabled());
+
+    await waitFor(() => expect(mockGetSettings).toHaveBeenCalled());
+    expect(result.current).toBe(false);
   });
 });

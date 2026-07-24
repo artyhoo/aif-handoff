@@ -474,6 +474,9 @@ export function importGeneratedTasks(
       .filter((p): p is string => !!p && p !== cfg.paths.plan),
   );
   const minBacklogPosition = getMinBacklogPosition(projectId);
+  // Roadmap import is the intentional front-of-queue path: imported tasks get
+  // explicit positions ahead of the current backlog minimum so phase/sequence
+  // order wins even though ordinary task creation now appends at the tail.
   const importPositionStart = (minBacklogPosition ?? 1000) - generatedTasks.length * 100;
 
   // Compute a unique plan path per task using the shared slug helper, and

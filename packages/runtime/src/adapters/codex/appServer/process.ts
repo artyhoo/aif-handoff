@@ -27,7 +27,15 @@ const ALLOWED_ENV_KEYS = new Set([
 
 const ALLOWED_ENV_PREFIXES = ["OPENAI_", "CODEX_", "AIF_", "HANDOFF_", "LC_", "XDG_"];
 
-const BLOCKED_ENV_KEYS = new Set(["OPENAI_BASE_URL", "NODE_OPTIONS"]);
+/**
+ * Env vars never forwarded to the Codex app-server child by default.
+ * `OPENAI_API_KEY` / `OPENAI_BASE_URL` are only honored when API-key auth is
+ * explicitly opted into via profile `apiKeyEnvVar`/`apiKey` (handled before
+ * this set is consulted — see `buildCodexAppServerEnvWithStats`). Mirrors the
+ * SDK/CLI transport blocklists so all three local Codex transports isolate
+ * ambient OpenAI auth env identically. `NODE_OPTIONS` is always stripped.
+ */
+const BLOCKED_ENV_KEYS = new Set(["OPENAI_API_KEY", "OPENAI_BASE_URL", "NODE_OPTIONS"]);
 
 const DEFAULT_TERMINATE_TIMEOUT_MS = 1_000;
 const DEFAULT_FORCE_KILL_TIMEOUT_MS = 500;
@@ -93,8 +101,33 @@ export function buildCodexAppServerEnvWithStats(
   let blockedCount = 0;
   const droppedDisallowedPrefixKeys = new Set<string>();
 
+  const options = asRecord(input.options);
+  const explicitApiKeyEnvVar = readString(input.apiKeyEnvVar) ?? readString(options.apiKeyEnvVar);
+  const explicitApiKey = readString(input.apiKey) ?? readString(options.apiKey);
+  // Local app-server runs default to `codex login` / OAuth. API-key auth is
+  // opted into only via an explicit profile apiKeyEnvVar/apiKey — an ambient
+  // OPENAI_API_KEY must not be consumed or forwarded, otherwise a placeholder
+  // key hijacks the OAuth session.
+  const allowApiKey = Boolean(explicitApiKeyEnvVar) || Boolean(explicitApiKey);
+  const apiKeyEnvVar = explicitApiKeyEnvVar ?? "OPENAI_API_KEY";
+
   for (const [key, value] of Object.entries(process.env)) {
     if (value == null) continue;
+    // Explicit API-key opt-in: forward the configured key var (which may be
+    // OPENAI_API_KEY) before the blocklist, so API-key auth still works when a
+    // profile requests it.
+    if (key === apiKeyEnvVar && allowApiKey) {
+      env[key] = value;
+      forwardedCount += 1;
+      continue;
+    }
+    // The configured key var without an opt-in must not leak into the child.
+    if (key === apiKeyEnvVar) {
+      blockedCount += 1;
+      continue;
+    }
+    // Ambient OpenAI auth env (OPENAI_API_KEY / OPENAI_BASE_URL) is blocked by
+    // default so a placeholder key cannot hijack an OAuth-backed `codex login`.
     if (BLOCKED_ENV_KEYS.has(key)) {
       blockedCount += 1;
       continue;
@@ -110,14 +143,7 @@ export function buildCodexAppServerEnvWithStats(
     }
   }
 
-  const options = asRecord(input.options);
-  const apiKeyEnvVar =
-    readString(input.apiKeyEnvVar) ?? readString(options.apiKeyEnvVar) ?? "OPENAI_API_KEY";
-  const apiKey =
-    readString(input.apiKey) ??
-    readString(options.apiKey) ??
-    readString(process.env[apiKeyEnvVar]) ??
-    readString(process.env.OPENAI_API_KEY);
+  const apiKey = explicitApiKey ?? (allowApiKey ? readString(process.env[apiKeyEnvVar]) : null);
   if (apiKey) {
     env[apiKeyEnvVar] = apiKey;
     env.OPENAI_API_KEY = apiKey;

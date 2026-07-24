@@ -19,6 +19,7 @@ export interface AifProjectPaths {
   evolution: string;
   specs: string;
   rules: string;
+  qa: string;
 }
 
 export interface AifProjectWorkflow {
@@ -93,6 +94,7 @@ const DEFAULT_PATHS: AifProjectPaths = {
   evolution: ".ai-factory/evolution/",
   specs: ".ai-factory/specs/",
   rules: ".ai-factory/rules/",
+  qa: ".ai-factory/qa/",
 };
 
 const DEFAULT_WORKFLOW: AifProjectWorkflow = {

@@ -1,5 +1,7 @@
 import { EventEmitter } from "node:events";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { validateRuntimeModelEffort } from "../modelEffort.js";
+import type { RuntimeRunInput } from "../types.js";
 import { getCliSpawnInvocation } from "./helpers/cliSpawn.js";
 import { TEST_USAGE_CONTEXT } from "./helpers/usageContext.js";
 
@@ -100,6 +102,48 @@ describe("codex cli transport", () => {
     expect(result.outputText).toBe("plain output");
     expect(result.sessionId).toBe("session-1");
     expect(result.raw).toBe("plain output");
+  });
+
+  it("passes provider-advertised reasoning effort without a static allowlist", async () => {
+    const child = createMockChildProcess();
+    spawnMock.mockReturnValueOnce(child);
+    const validation = validateRuntimeModelEffort(
+      createRunInput({ options: { modelReasoningEffort: " Ultra " } }) as RuntimeRunInput,
+      [
+        {
+          id: "gpt-5.4",
+          metadata: {
+            supportsEffort: true,
+            supportedEffortLevels: ["ultra"],
+          },
+        },
+      ],
+    );
+
+    const runPromise = runCodexCli(validation.input);
+
+    const { cliArgs: args } = getSpawnInvocation();
+    expect(args).toContain('model_reasoning_effort="ultra"');
+
+    child.stdout.emit("data", "plain output");
+    child.emit("close", 0);
+
+    await runPromise;
+  });
+
+  it("does not pass an unvalidated reasoning effort", async () => {
+    const child = createMockChildProcess();
+    spawnMock.mockReturnValueOnce(child);
+
+    const runPromise = runCodexCli(createRunInput({ options: { modelReasoningEffort: "bogus" } }));
+
+    const { cliArgs: args } = getSpawnInvocation();
+    expect(args.join(" ")).not.toContain("model_reasoning_effort");
+
+    child.stdout.emit("data", "plain output");
+    child.emit("close", 0);
+
+    await runPromise;
   });
 
   it("prepends execution.systemPromptAppend to stdin prompt (no --system-prompt CLI flag)", async () => {
@@ -317,6 +361,60 @@ describe("codex cli transport", () => {
       costUsd: 0.3,
     });
     expect(result.events?.[0]?.type).toBe("stream:text");
+  });
+
+  it("does not forward ambient OPENAI_API_KEY / OPENAI_BASE_URL by default", async () => {
+    const child = createMockChildProcess();
+    spawnMock.mockReturnValueOnce(child);
+
+    vi.stubEnv("OPENAI_API_KEY", "sk-000");
+    vi.stubEnv("OPENAI_BASE_URL", "http://host.docker.internal:8317/v1");
+
+    const runPromise = runCodexCli(createRunInput({ options: {} }));
+
+    const { spawnOptions } = getSpawnInvocation() as {
+      spawnOptions: { env?: Record<string, string> };
+    };
+    expect(spawnOptions.env?.OPENAI_API_KEY).toBeUndefined();
+    expect(spawnOptions.env?.OPENAI_BASE_URL).toBeUndefined();
+
+    child.emit("close", 0);
+    await runPromise;
+  });
+
+  it("forwards OPENAI_API_KEY when apiKeyEnvVar is explicitly configured", async () => {
+    const child = createMockChildProcess();
+    spawnMock.mockReturnValueOnce(child);
+
+    vi.stubEnv("OPENAI_API_KEY", "sk-real");
+
+    const runPromise = runCodexCli(createRunInput({ options: { apiKeyEnvVar: "OPENAI_API_KEY" } }));
+
+    const { spawnOptions } = getSpawnInvocation() as {
+      spawnOptions: { env?: Record<string, string> };
+    };
+    expect(spawnOptions.env?.OPENAI_API_KEY).toBe("sk-real");
+
+    child.emit("close", 0);
+    await runPromise;
+  });
+
+  it("injects an explicitly configured literal apiKey into the CLI env", async () => {
+    const child = createMockChildProcess();
+    spawnMock.mockReturnValueOnce(child);
+
+    const runPromise = runCodexCli(
+      createRunInput({ options: { apiKey: "sk-literal", apiKeyEnvVar: "MY_CODEX_KEY" } }),
+    );
+
+    const { spawnOptions } = getSpawnInvocation() as {
+      spawnOptions: { env?: Record<string, string> };
+    };
+    expect(spawnOptions.env?.MY_CODEX_KEY).toBe("sk-literal");
+    expect(spawnOptions.env?.OPENAI_API_KEY).toBe("sk-literal");
+
+    child.emit("close", 0);
+    await runPromise;
   });
 
   it("expands multiple placeholders within one custom arg and suppresses stdin", async () => {
@@ -554,7 +652,9 @@ describe("codex cli transport", () => {
     vi.stubEnv("OPENAI_BASE_URL", "https://api.openai.com/v1");
     vi.stubEnv("npm_config_registry", "https://registry.npmjs.org");
 
-    const runPromise = runCodexCli(createRunInput());
+    // Explicit API-key opt-in so OPENAI_API_KEY forwards; this test asserts that
+    // OPENAI_BASE_URL is still stripped regardless of the key being present.
+    const runPromise = runCodexCli(createRunInput({ options: { apiKeyEnvVar: "OPENAI_API_KEY" } }));
 
     const [, , spawnOptions] = spawnMock.mock.calls[0] as [
       string,

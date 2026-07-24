@@ -31,6 +31,7 @@ const mockRuntimeProfilesData = {
 const mockRuntimesData = {
   data: [] as Array<Record<string, unknown>>,
 };
+const mockQaPipelineEnabled = { value: true };
 
 vi.mock("@/hooks/useProjects", () => ({
   useProjects: () => ({ data: mockProjectsData.data }),
@@ -39,6 +40,7 @@ vi.mock("@/hooks/useProjects", () => ({
 vi.mock("@/hooks/useSettings", () => ({
   useSettings: () => ({ data: mockSettingsData.data }),
   useProjectDefaults: () => ({ data: mockDefaultsData.data }),
+  useQaPipelineEnabled: () => mockQaPipelineEnabled.value,
 }));
 
 vi.mock("@/hooks/useRuntimeProfiles", () => ({
@@ -63,6 +65,7 @@ describe("AddTaskForm", () => {
     mockProjectsData.data = [{ id: "p-1", parallelEnabled: false }];
     mockRuntimeProfilesData.data = [];
     mockRuntimesData.data = [];
+    mockQaPipelineEnabled.value = true;
   });
 
   it("uses autoMode=true by default", { timeout: 15_000 }, async () => {
@@ -515,6 +518,55 @@ describe("AddTaskForm", () => {
       }),
       expect.any(Object),
     );
+  });
+
+  describe("autoQa toggle", () => {
+    it("submits autoQa=true when 'Run QA after done' is checked and the flag is enabled", () => {
+      render(<AddTaskForm projectId="p-1" />);
+
+      fireEvent.click(screen.getByText("Add task"));
+      const checkboxes = screen.getAllByRole("checkbox");
+      const autoQaCheckbox = checkboxes.find((cb) =>
+        cb.closest("label")?.textContent?.includes("Run QA after done"),
+      )!;
+      expect(autoQaCheckbox).toBeDefined();
+      fireEvent.click(autoQaCheckbox);
+      fireEvent.change(screen.getByPlaceholderText("Task title"), {
+        target: { value: "Task with auto QA" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Add" }));
+
+      expect(mutateCreateTask).toHaveBeenCalledWith(
+        expect.objectContaining({ title: "Task with auto QA", autoQa: true }),
+        expect.any(Object),
+      );
+    });
+
+    it("defaults autoQa to false when the toggle is left unchecked", () => {
+      render(<AddTaskForm projectId="p-1" />);
+
+      fireEvent.click(screen.getByText("Add task"));
+      fireEvent.change(screen.getByPlaceholderText("Task title"), {
+        target: { value: "Task without QA" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Add" }));
+
+      expect(mutateCreateTask).toHaveBeenCalledWith(
+        expect.objectContaining({ autoQa: false }),
+        expect.any(Object),
+      );
+    });
+
+    it("hides the 'Run QA after done' toggle when the flag is disabled", () => {
+      mockQaPipelineEnabled.value = false;
+      render(<AddTaskForm projectId="p-1" />);
+
+      fireEvent.click(screen.getByText("Add task"));
+      const autoQaCheckbox = screen
+        .getAllByRole("checkbox")
+        .find((cb) => cb.closest("label")?.textContent?.includes("Run QA after done"));
+      expect(autoQaCheckbox).toBeUndefined();
+    });
   });
 
   describe("priority picker", () => {

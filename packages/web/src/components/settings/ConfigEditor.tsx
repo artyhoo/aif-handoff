@@ -193,6 +193,7 @@ export function ConfigEditor({ config, onConfigChange, projectId }: Props) {
           ["evolution", "Evolution state directory", ".ai-factory/evolution/"],
           ["specs", "Specs directory", ".ai-factory/specs/"],
           ["rules", "Rules directory", ".ai-factory/rules/"],
+          ["qa", "QA artifacts directory", ".ai-factory/qa/"],
         ] as const
       ).map(([key, label, defaultVal]) => (
         <Field key={key} label={label}>

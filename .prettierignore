@@ -2,10 +2,12 @@ dist/
 node_modules/
 coverage/
 data/
+projects/
 .turbo/
 *.sqlite
 .ai-factory/
 docs-html/
+packages/web/.perf-project/
 *SFConflict*
 playwright-report/
 test-results/

@@ -18,8 +18,11 @@
     "AppSummary": {
       "description": "EXPERIMENTAL - app metadata summary for plugin responses.",
       "type": "object",
-      "required": ["id", "name", "needsAuth"],
+      "required": ["id", "name"],
       "properties": {
+        "category": {
+          "type": ["string", "null"]
+        },
         "description": {
           "type": ["string", "null"]
         },
@@ -31,9 +34,6 @@
         },
         "name": {
           "type": "string"
-        },
-        "needsAuth": {
-          "type": "boolean"
         }
       }
     },

@@ -73,6 +73,107 @@ describe("resolveRuntimeProfile", () => {
     expect(resolved.transport).toBe("cli");
   });
 
+  it("does not apply OPENAI env API defaults to local Codex SDK profiles", () => {
+    const resolved = resolveRuntimeProfile({
+      source: "project_default",
+      profile: {
+        id: "profile-codex-sdk",
+        runtimeId: "codex",
+        providerId: "openai",
+        transport: "sdk",
+        defaultModel: "gpt-5.5",
+      },
+      env: {
+        OPENAI_API_KEY: "sk-test",
+        OPENAI_BASE_URL: "http://host.docker.internal:8317/v1",
+      },
+    });
+
+    expect(resolved.transport).toBe("sdk");
+    expect(resolved.baseUrl).toBeNull();
+    expect(resolved.apiKeyEnvVar).toBeNull();
+    expect(resolved.apiKey).toBeNull();
+  });
+
+  it("does not apply OPENAI env API defaults to local Codex CLI profiles", () => {
+    const resolved = resolveRuntimeProfile({
+      source: "project_default",
+      profile: {
+        id: "profile-codex-cli",
+        runtimeId: "codex",
+        providerId: "openai",
+        transport: "cli",
+      },
+      env: {
+        OPENAI_API_KEY: "sk-000",
+        OPENAI_BASE_URL: "http://host.docker.internal:8317/v1",
+      },
+    });
+
+    expect(resolved.transport).toBe("cli");
+    expect(resolved.baseUrl).toBeNull();
+    expect(resolved.apiKeyEnvVar).toBeNull();
+    expect(resolved.apiKey).toBeNull();
+  });
+
+  it("keeps OPENAI env API defaults for the Codex API transport", () => {
+    const resolved = resolveRuntimeProfile({
+      source: "project_default",
+      profile: {
+        id: "profile-codex-api",
+        runtimeId: "codex",
+        providerId: "openai",
+        transport: "api",
+      },
+      env: {
+        OPENAI_API_KEY: "sk-real",
+        OPENAI_BASE_URL: "https://api.openai.com/v1",
+      },
+    });
+
+    expect(resolved.transport).toBe("api");
+    expect(resolved.baseUrl).toBe("https://api.openai.com/v1");
+    expect(resolved.apiKeyEnvVar).toBe("OPENAI_API_KEY");
+    expect(resolved.apiKey).toBe("sk-real");
+  });
+
+  it("infers CODEX_BASE_URL for local Codex transports", () => {
+    const resolved = resolveRuntimeProfile({
+      source: "project_default",
+      profile: {
+        id: "profile-codex-sdk",
+        runtimeId: "codex",
+        providerId: "openai",
+        transport: "sdk",
+      },
+      env: {
+        CODEX_BASE_URL: "https://codex.internal/api",
+        OPENAI_BASE_URL: "http://should-not-be-used/v1",
+      },
+    });
+
+    expect(resolved.baseUrl).toBe("https://codex.internal/api");
+  });
+
+  it("keeps explicit apiKeyEnvVar for local Codex SDK profiles", () => {
+    const resolved = resolveRuntimeProfile({
+      source: "project_default",
+      profile: {
+        id: "profile-codex-sdk",
+        runtimeId: "codex",
+        providerId: "openai",
+        transport: "sdk",
+        apiKeyEnvVar: "OPENAI_API_KEY",
+      },
+      env: {
+        OPENAI_API_KEY: "sk-real",
+      },
+    });
+
+    expect(resolved.apiKeyEnvVar).toBe("OPENAI_API_KEY");
+    expect(resolved.apiKey).toBe("sk-real");
+  });
+
   it("keeps explicit codex app-server transport from profile", () => {
     const debug = vi.fn();
     const resolved = resolveRuntimeProfile({

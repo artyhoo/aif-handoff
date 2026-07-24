@@ -3,13 +3,15 @@ import { Trash2 } from "lucide-react";
 import { Sheet, SheetContent } from "@/components/ui/sheet";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { useTask } from "@/hooks/useTasks";
+import { useTask, useRunQa } from "@/hooks/useTasks";
+import { useQaPipelineEnabled } from "@/hooks/useSettings";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { TaskDescription } from "./TaskDescription";
 import { TaskPlan } from "./TaskPlan";
 import { TaskLog } from "./TaskLog";
 import { AgentTimeline } from "./AgentTimeline";
 import { TaskComments } from "./TaskComments";
+import { TaskQA } from "./TaskQA";
 import { TaskAttachments } from "./TaskAttachments";
 import { TaskSettings } from "./TaskSettings";
 import { PlanChangeDialog } from "./PlanChangeDialog";
@@ -29,6 +31,8 @@ export function TaskDetail({ taskId, onClose }: TaskDetailProps) {
   const { data: task } = useTask(taskId);
   const [selectedTab, setSelectedTab] = useState<TaskDetailTab | null>(null);
   const actions = useTaskDetailActions(task, onClose);
+  const runQaMutation = useRunQa(taskId ?? "");
+  const qaPipelineEnabled = useQaPipelineEnabled();
   const defaultTab: TaskDetailTab = (() => {
     if (!task) return "implementation";
     if (task.status === "review") return "review";
@@ -149,6 +153,13 @@ export function TaskDetail({ taskId, onClose }: TaskDetailProps) {
                     <Section title="Comments">
                       <TaskComments taskId={task.id} />
                     </Section>
+                  )}
+                  {qaPipelineEnabled && activeTab === "qa" && (
+                    <TaskQA
+                      task={task}
+                      onRunQa={() => runQaMutation.mutate()}
+                      isRunning={task.qaStatus === "running"}
+                    />
                   )}
                   {activeTab === "activity" && (
                     <Section

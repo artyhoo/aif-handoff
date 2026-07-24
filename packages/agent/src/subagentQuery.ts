@@ -460,9 +460,11 @@ function createRuntimeRegistryLogger(): RuntimeRegistryLogger {
 async function getRuntimeRegistry(): Promise<RuntimeRegistry> {
   if (runtimeRegistryPromise) return runtimeRegistryPromise;
 
+  const env = getEnv();
   runtimeRegistryPromise = bootstrapRuntimeRegistry({
     logger: createRuntimeRegistryLogger(),
-    runtimeModules: getEnv().AIF_RUNTIME_MODULES,
+    runtimeModules: env.AIF_RUNTIME_MODULES,
+    modelEffortDiscoveryEnabled: env.AIF_RUNTIME_MODEL_EFFORT_DISCOVERY_ENABLED,
     usageSink: createDbUsageSink({
       onRecorded: (event) => {
         notifyRuntimeUsageRefresh({

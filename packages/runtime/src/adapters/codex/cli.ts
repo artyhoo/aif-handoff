@@ -19,6 +19,7 @@ import {
   type CodexSandboxMode,
 } from "./permissions.js";
 import { PROXY_ENV_VARS } from "../../proxyEnv.js";
+import { CODEX_MODEL_EFFORT_LEVELS, resolveModelEffortOption } from "../../modelEffort.js";
 
 const IS_WINDOWS = process.platform === "win32";
 
@@ -39,20 +40,6 @@ function asRecord(value: unknown): Record<string, unknown> {
 
 function readString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
-}
-
-const CODEX_CLI_EFFORT_LEVELS = new Set(["minimal", "low", "medium", "high", "xhigh"] as const);
-
-type CodexCliEffortLevel = "minimal" | "low" | "medium" | "high" | "xhigh";
-
-function normalizeCodexCliEffort(value: unknown): CodexCliEffortLevel | null {
-  if (typeof value === "string") {
-    const trimmed = value.trim().toLowerCase();
-    if (CODEX_CLI_EFFORT_LEVELS.has(trimmed as CodexCliEffortLevel)) {
-      return trimmed as CodexCliEffortLevel;
-    }
-  }
-  return null;
 }
 
 /**
@@ -182,9 +169,13 @@ function normalizeCliArgs(
   if (input.model) {
     args.push("--model", input.model);
   }
-  const effort = normalizeCodexCliEffort(options.modelReasoningEffort);
+  const effort = resolveModelEffortOption(
+    options,
+    "modelReasoningEffort",
+    CODEX_MODEL_EFFORT_LEVELS,
+  );
   if (effort) {
-    args.push("-c", `model_reasoning_effort="${effort}"`);
+    args.push("-c", `model_reasoning_effort=${JSON.stringify(effort)}`);
   }
 
   // Skip git repo check — opt-in via profile for non-git working directories
@@ -232,12 +223,21 @@ const ALLOWED_ENV_PREFIXES = [
 ];
 
 /**
- * Env vars that must NOT be forwarded to the Codex CLI even if they match
- * an allowed prefix.  `OPENAI_BASE_URL` is deprecated by the Codex CLI —
- * it causes a WebSocket endpoint mis-derivation (`wss://.../v1/responses`)
- * and 500 errors.  The CLI reads `openai_base_url` from `config.toml` instead.
+ * Env vars that must NOT be forwarded to the Codex CLI by default, even if they
+ * match an allowed prefix. They are blocked unless API-key auth is explicitly
+ * opted into via profile `apiKeyEnvVar`/`apiKey` (handled before this set is
+ * consulted — see `buildCuratedEnv`).
+ *
+ * - `OPENAI_API_KEY` — a placeholder/ambient key would otherwise hijack an
+ *   OAuth-backed `codex login` session and force the run into API-key auth.
+ * - `OPENAI_BASE_URL` — deprecated by the Codex CLI; it causes a WebSocket
+ *   endpoint mis-derivation (`wss://.../v1/responses`) and 500 errors. The CLI
+ *   reads `openai_base_url` from `config.toml` instead.
+ *
+ * Mirrors the SDK transport's blocklist (`adapters/codex/sdk.ts`) so all three
+ * local Codex transports isolate ambient OpenAI auth env identically.
  */
-const BLOCKED_ENV_KEYS = new Set(["OPENAI_BASE_URL"]);
+const BLOCKED_ENV_KEYS = new Set(["OPENAI_API_KEY", "OPENAI_BASE_URL"]);
 
 interface CuratedEnvResult {
   env: Record<string, string>;
@@ -247,7 +247,17 @@ interface CuratedEnvResult {
   droppedDisallowedPrefixKeys: string[];
 }
 
-function buildCuratedEnv(apiKeyEnvVar: string): CuratedEnvResult {
+interface BuildCuratedEnvOptions {
+  /**
+   * Whether API-key auth was explicitly opted into for this run (profile
+   * `apiKeyEnvVar`/`apiKey`). When false, an ambient `OPENAI_API_KEY` — and a
+   * custom `apiKeyEnvVar` — are blocked so a placeholder key cannot hijack an
+   * OAuth-backed `codex login` session.
+   */
+  allowApiKey: boolean;
+}
+
+function buildCuratedEnv(apiKeyEnvVar: string, opts: BuildCuratedEnvOptions): CuratedEnvResult {
   const env: Record<string, string> = {};
   let forwardedCount = 0;
   let filteredCount = 0;
@@ -255,14 +265,26 @@ function buildCuratedEnv(apiKeyEnvVar: string): CuratedEnvResult {
   const droppedDisallowedPrefixKeys = new Set<string>();
   for (const [key, value] of Object.entries(process.env)) {
     if (value == null) continue;
+    // Explicit API-key opt-in: forward the configured key var (which may be
+    // OPENAI_API_KEY) before the blocklist, so API-key auth still works when a
+    // profile requests it.
+    if (key === apiKeyEnvVar && opts.allowApiKey) {
+      env[key] = value;
+      forwardedCount += 1;
+      continue;
+    }
+    // The configured key var without an opt-in must not leak into the child.
+    if (key === apiKeyEnvVar) {
+      blockedCount += 1;
+      continue;
+    }
+    // Ambient OpenAI auth env (OPENAI_API_KEY / OPENAI_BASE_URL) is blocked by
+    // default so a placeholder key cannot hijack an OAuth-backed `codex login`.
     if (BLOCKED_ENV_KEYS.has(key)) {
       blockedCount += 1;
       continue;
     }
-    if (
-      key === apiKeyEnvVar ||
-      ALLOWED_ENV_PREFIXES.some((prefix) => key === prefix || key.startsWith(prefix))
-    ) {
+    if (ALLOWED_ENV_PREFIXES.some((prefix) => key === prefix || key.startsWith(prefix))) {
       env[key] = value;
       forwardedCount += 1;
     } else {
@@ -974,10 +996,19 @@ export async function runCodexCli(
   const composedPrompt = composePrompt(input);
   const { args, usesPromptPlaceholder } = normalizeCliArgs(input, composedPrompt, logger);
   const options = asRecord(input.options);
-  const apiKeyEnvVar =
-    typeof options.apiKeyEnvVar === "string" ? options.apiKeyEnvVar : "OPENAI_API_KEY";
-  const curatedEnv = buildCuratedEnv(apiKeyEnvVar);
+  const explicitApiKeyEnvVar = readString(options.apiKeyEnvVar);
+  const explicitApiKey = readString(options.apiKey);
+  const allowApiKey = Boolean(explicitApiKeyEnvVar) || Boolean(explicitApiKey);
+  const apiKeyEnvVar = explicitApiKeyEnvVar ?? "OPENAI_API_KEY";
+  const curatedEnv = buildCuratedEnv(apiKeyEnvVar, { allowApiKey });
   const env = curatedEnv.env;
+  // An explicitly configured literal apiKey is injected directly (it is never
+  // forwarded from process.env). Mirror it onto OPENAI_API_KEY so the Codex CLI
+  // picks it up regardless of the custom env var name.
+  if (explicitApiKey) {
+    env[apiKeyEnvVar] = explicitApiKey;
+    env.OPENAI_API_KEY = explicitApiKey;
+  }
   logger?.debug?.(
     {
       runtimeId: input.runtimeId,

@@ -1,9 +1,11 @@
 export const TASK_STATUSES = [
   "backlog",
   "planning",
+  "improve",
   "plan_ready",
   "implementing",
   "review",
+  "verify",
   "blocked_external",
   "done",
   "verified",
@@ -43,6 +45,8 @@ export interface Project {
   planCheckerMaxBudgetUsd: number | null;
   implementerMaxBudgetUsd: number | null;
   reviewSidecarMaxBudgetUsd: number | null;
+  pinnedAt: string | null;
+  groupName: string | null;
   parallelEnabled: boolean;
   autoQueueMode: boolean;
   defaultTaskRuntimeProfileId?: string | null;
@@ -71,6 +75,11 @@ export interface CreateProjectInput {
   defaultPlanRuntimeProfileId?: string | null;
   defaultReviewRuntimeProfileId?: string | null;
   defaultChatRuntimeProfileId?: string | null;
+}
+
+export interface UpdateProjectOrganizationInput {
+  pinned?: boolean;
+  groupName?: string | null;
 }
 
 export interface AppSettings {
@@ -114,6 +123,13 @@ export interface Task {
   planTests: boolean;
   skipReview: boolean;
   useSubagents: boolean;
+  runPlanImprove: boolean;
+  runPostVerify: boolean;
+  autoQa: boolean;
+  qaChangeSummary: string | null;
+  qaTestPlan: string | null;
+  qaTestCases: string | null;
+  qaStatus: "idle" | "running" | "done" | "error";
   status: TaskStatus;
   priority: number;
   position: number;
@@ -150,6 +166,67 @@ export interface Task {
   worktreePath: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface TaskListItem {
+  id: string;
+  projectId: string;
+  title: string;
+  description: string;
+  autoMode: boolean;
+  isFix: boolean;
+  status: TaskStatus;
+  priority: number;
+  position: number;
+  blockedReason: string | null;
+  blockedFromStatus: TaskStatus | null;
+  retryAfter: string | null;
+  retryCount: number;
+  tokenInput?: number;
+  tokenOutput?: number;
+  tokenTotal?: number;
+  costUsd?: number;
+  roadmapAlias: string | null;
+  tags: string[];
+  reworkRequested: boolean;
+  reviewIterationCount: number;
+  maxReviewIterations: number;
+  manualReviewRequired: boolean;
+  paused: boolean;
+  lastSyncedAt: string | null;
+  runtimeProfileId?: string | null;
+  modelOverride?: string | null;
+  runtimeLimitSnapshot?: RuntimeLimitSnapshot | null;
+  runtimeLimitUpdatedAt?: string | null;
+  scheduledAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  hasPlan: boolean;
+}
+
+export interface ProjectTaskPreview {
+  id: string;
+  title: string;
+}
+
+export interface ProjectTaskOverview {
+  projectId: string;
+  lastActivityAt: string | null;
+  totalTasks: number;
+  completedTasks: number;
+  verifiedTasks: number;
+  backlogTasks: number;
+  activeTasks: number;
+  blockedTasks: number;
+  autoModeTasks: number;
+  fixTasks: number;
+  totalRetries: number;
+  totalTokenInput: number;
+  totalTokenOutput: number;
+  totalTokenTotal: number;
+  totalCostUsd: number;
+  statusCounts: Record<TaskStatus, number>;
+  statusPreviews: Record<TaskStatus, ProjectTaskPreview[]>;
 }
 
 export interface TaskActiveRuntimeSelection {
@@ -197,6 +274,9 @@ export interface CreateTaskInput {
   planTests?: boolean;
   skipReview?: boolean;
   useSubagents?: boolean;
+  runPlanImprove?: boolean;
+  runPostVerify?: boolean;
+  autoQa?: boolean;
   maxReviewIterations?: number;
   paused?: boolean;
   runtimeProfileId?: string | null;
@@ -221,6 +301,13 @@ export interface UpdateTaskInput {
   planTests?: boolean;
   skipReview?: boolean;
   useSubagents?: boolean;
+  runPlanImprove?: boolean;
+  runPostVerify?: boolean;
+  autoQa?: boolean;
+  qaChangeSummary?: string | null;
+  qaTestPlan?: string | null;
+  qaTestCases?: string | null;
+  qaStatus?: "idle" | "running" | "done" | "error";
   plan?: string | null;
   implementationLog?: string | null;
   reviewComments?: string | null;
@@ -276,6 +363,7 @@ export interface ReorderTaskInput {
 /** WebSocket event types */
 export type WsEventType =
   | "project:created"
+  | "project:organization_updated"
   | "task:created"
   | "task:updated"
   | "task:deleted"
@@ -300,7 +388,10 @@ export type WsEventType =
   | "project:warmup_updated"
   | "task:commit_started"
   | "task:commit_done"
-  | "task:commit_failed";
+  | "task:commit_failed"
+  | "task:qa_started"
+  | "task:qa_done"
+  | "task:qa_failed";
 
 export interface RoadmapCompletePayload {
   projectId: string;
@@ -324,6 +415,17 @@ export interface RoadmapErrorPayload {
  * `status` is redundant with `type` but makes the payload self-describing.
  */
 export interface TaskCommitPayload {
+  taskId: string;
+  projectId: string;
+  status: "started" | "done" | "failed";
+  error?: string;
+}
+
+/**
+ * Lifecycle of `/aif-qa` runs (manual via `POST /tasks/:id/run-qa` or
+ * auto-triggered on `approve_done` when `task.autoQa = true`).
+ */
+export interface TaskQaPayload {
   taskId: string;
   projectId: string;
   status: "started" | "done" | "failed";
@@ -354,6 +456,7 @@ export interface WsEvent {
     | ChatErrorPayload
     | ChatSession
     | TaskCommitPayload
+    | TaskQaPayload
     | RuntimeLimitBroadcastPayload
     | WarmupBroadcastPayload;
 }

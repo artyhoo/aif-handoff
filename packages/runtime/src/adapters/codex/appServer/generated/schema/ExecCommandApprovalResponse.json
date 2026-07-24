@@ -79,8 +79,26 @@
         },
         {
           "description": "User has denied this command and the agent should not execute it, but it should continue the session and try something else.",
+          "type": "object",
+          "required": ["denied"],
+          "properties": {
+            "denied": {
+              "type": "object",
+              "required": ["rejection"],
+              "properties": {
+                "rejection": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "additionalProperties": false,
+          "title": "DeniedReviewDecision"
+        },
+        {
+          "description": "Automatic approval review timed out before reaching a decision.",
           "type": "string",
-          "enum": ["denied"]
+          "enum": ["timed_out"]
         },
         {
           "description": "User has denied this command and the agent should not do anything until the user's next command.",

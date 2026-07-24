@@ -2,10 +2,15 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "ItemStartedNotification",
   "type": "object",
-  "required": ["item", "threadId", "turnId"],
+  "required": ["item", "startedAtMs", "threadId", "turnId"],
   "properties": {
     "item": {
       "$ref": "#/definitions/ThreadItem"
+    },
+    "startedAtMs": {
+      "description": "Unix timestamp (in milliseconds) when this item lifecycle started.",
+      "type": "integer",
+      "format": "int64"
     },
     "threadId": {
       "type": "string"
@@ -15,6 +20,10 @@
     }
   },
   "definitions": {
+    "AbsolutePathBuf": {
+      "description": "A path that is guaranteed to be absolute and normalized (though it is not guaranteed to be canonicalized or exist on the filesystem).\n\nIMPORTANT: When deserializing an `AbsolutePathBuf`, a base path must be set using [AbsolutePathBufGuard::new]. If no base path is set, the deserialization will fail unless the path being deserialized is already absolute.",
+      "type": "string"
+    },
     "ByteRange": {
       "type": "object",
       "required": ["end", "start"],
@@ -76,7 +85,7 @@
               "type": "string"
             },
             "path": {
-              "type": "string"
+              "$ref": "#/definitions/AbsolutePathBuf"
             },
             "type": {
               "type": "string",
@@ -181,6 +190,21 @@
             }
           },
           "title": "InputImageDynamicToolCallOutputContentItem"
+        },
+        {
+          "type": "object",
+          "required": ["audioUrl", "type"],
+          "properties": {
+            "audioUrl": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": ["inputAudio"],
+              "title": "InputAudioDynamicToolCallOutputContentItemType"
+            }
+          },
+          "title": "InputAudioDynamicToolCallOutputContentItem"
         }
       ]
     },
@@ -215,6 +239,34 @@
         }
       }
     },
+    "ImageDetail": {
+      "type": "string",
+      "enum": ["auto", "low", "high", "original"]
+    },
+    "LegacyAppPathString": {
+      "type": "string"
+    },
+    "McpToolCallAppContext": {
+      "type": "object",
+      "required": ["connectorId"],
+      "properties": {
+        "actionName": {
+          "type": ["string", "null"]
+        },
+        "appName": {
+          "type": ["string", "null"]
+        },
+        "connectorId": {
+          "type": "string"
+        },
+        "linkId": {
+          "type": ["string", "null"]
+        },
+        "resourceUri": {
+          "type": ["string", "null"]
+        }
+      }
+    },
     "McpToolCallError": {
       "type": "object",
       "required": ["message"],
@@ -228,6 +280,7 @@
       "type": "object",
       "required": ["content"],
       "properties": {
+        "_meta": true,
         "content": {
           "type": "array",
           "items": true
@@ -342,9 +395,13 @@
       ]
     },
     "ReasoningEffort": {
-      "description": "See https://platform.openai.com/docs/guides/reasoning?api-mode=responses#get-started-with-reasoning",
+      "description": "A non-empty reasoning effort value advertised by the model.",
       "type": "string",
-      "enum": ["none", "minimal", "low", "medium", "high", "xhigh"]
+      "minLength": 1
+    },
+    "SubAgentActivityKind": {
+      "type": "string",
+      "enum": ["started", "interacted", "interrupted"]
     },
     "TextElement": {
       "type": "object",
@@ -370,6 +427,9 @@
           "type": "object",
           "required": ["content", "id", "type"],
           "properties": {
+            "clientId": {
+              "type": ["string", "null"]
+            },
             "content": {
               "type": "array",
               "items": {
@@ -517,7 +577,11 @@
             },
             "cwd": {
               "description": "The command's working directory.",
-              "type": "string"
+              "allOf": [
+                {
+                  "$ref": "#/definitions/LegacyAppPathString"
+                }
+              ]
             },
             "durationMs": {
               "description": "The duration of the command execution in milliseconds.",
@@ -583,6 +647,16 @@
           "type": "object",
           "required": ["arguments", "id", "server", "status", "tool", "type"],
           "properties": {
+            "appContext": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/McpToolCallAppContext"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "arguments": true,
             "durationMs": {
               "description": "The duration of the MCP tool call in milliseconds.",
@@ -601,6 +675,13 @@
             },
             "id": {
               "type": "string"
+            },
+            "mcpAppResourceUri": {
+              "description": "Deprecated: use `appContext.resourceUri` instead.",
+              "type": ["string", "null"]
+            },
+            "pluginId": {
+              "type": ["string", "null"]
             },
             "result": {
               "anyOf": [
@@ -647,6 +728,9 @@
             },
             "id": {
               "type": "string"
+            },
+            "namespace": {
+              "type": ["string", "null"]
             },
             "status": {
               "$ref": "#/definitions/DynamicToolCallStatus"
@@ -744,6 +828,30 @@
         },
         {
           "type": "object",
+          "required": ["agentPath", "agentThreadId", "id", "kind", "type"],
+          "properties": {
+            "agentPath": {
+              "type": "string"
+            },
+            "agentThreadId": {
+              "type": "string"
+            },
+            "id": {
+              "type": "string"
+            },
+            "kind": {
+              "$ref": "#/definitions/SubAgentActivityKind"
+            },
+            "type": {
+              "type": "string",
+              "enum": ["subAgentActivity"],
+              "title": "SubAgentActivityThreadItemType"
+            }
+          },
+          "title": "SubAgentActivityThreadItem"
+        },
+        {
+          "type": "object",
           "required": ["id", "query", "type"],
           "properties": {
             "action": {
@@ -762,6 +870,12 @@
             "query": {
               "type": "string"
             },
+            "results": {
+              "description": "Structured search results returned out-of-band by standalone web search.\n\nThese stay as opaque JSON at the extension/app-server boundary so new result fields and result types can pass through without a Codex release.",
+              "default": null,
+              "type": ["array", "null"],
+              "items": true
+            },
             "type": {
               "type": "string",
               "enum": ["webSearch"],
@@ -778,7 +892,7 @@
               "type": "string"
             },
             "path": {
-              "type": "string"
+              "$ref": "#/definitions/LegacyAppPathString"
             },
             "type": {
               "type": "string",
@@ -787,6 +901,27 @@
             }
           },
           "title": "ImageViewThreadItem"
+        },
+        {
+          "description": "Display item emitted by the interruptible `clock.sleep` tool.",
+          "type": "object",
+          "required": ["durationMs", "id", "type"],
+          "properties": {
+            "durationMs": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": ["sleep"],
+              "title": "SleepThreadItemType"
+            }
+          },
+          "title": "SleepThreadItem"
         },
         {
           "type": "object",
@@ -802,7 +937,14 @@
               "type": ["string", "null"]
             },
             "savedPath": {
-              "type": ["string", "null"]
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/AbsolutePathBuf"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "status": {
               "type": "string"
@@ -897,6 +1039,17 @@
           "type": "object",
           "required": ["type", "url"],
           "properties": {
+            "detail": {
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ImageDetail"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "type": {
               "type": "string",
               "enum": ["image"],
@@ -912,6 +1065,17 @@
           "type": "object",
           "required": ["path", "type"],
           "properties": {
+            "detail": {
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ImageDetail"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "path": {
               "type": "string"
             },
@@ -922,6 +1086,36 @@
             }
           },
           "title": "LocalImageUserInput"
+        },
+        {
+          "type": "object",
+          "required": ["type", "url"],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": ["audio"],
+              "title": "AudioUserInputType"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "title": "AudioUserInput"
+        },
+        {
+          "type": "object",
+          "required": ["path", "type"],
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": ["localAudio"],
+              "title": "LocalAudioUserInputType"
+            }
+          },
+          "title": "LocalAudioUserInput"
         },
         {
           "type": "object",

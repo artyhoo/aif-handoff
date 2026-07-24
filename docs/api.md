@@ -133,11 +133,73 @@ GET /projects
     "planCheckerMaxBudgetUsd": 2,
     "implementerMaxBudgetUsd": 15,
     "reviewSidecarMaxBudgetUsd": 2,
+    "pinnedAt": "2026-01-02T00:00:00.000Z",
+    "groupName": "Platform",
     "createdAt": "2026-01-01T00:00:00.000Z",
     "updatedAt": "2026-01-01T00:00:00.000Z"
   }
 ]
 ```
+
+### Project Task Overview
+
+```
+GET /projects/overview
+```
+
+Returns compact per-project task aggregates for the projects overview screen.
+This endpoint does not return full task rows.
+
+**Response:** `200 OK`
+
+```json
+[
+  {
+    "projectId": "uuid",
+    "lastActivityAt": "2026-01-03T12:00:00.000Z",
+    "totalTasks": 12,
+    "completedTasks": 2,
+    "verifiedTasks": 0,
+    "backlogTasks": 4,
+    "activeTasks": 6,
+    "blockedTasks": 1,
+    "autoModeTasks": 3,
+    "fixTasks": 1,
+    "totalRetries": 3,
+    "totalTokenInput": 1200,
+    "totalTokenOutput": 800,
+    "totalTokenTotal": 2000,
+    "totalCostUsd": 0.25,
+    "statusCounts": {
+      "backlog": 4,
+      "planning": 1,
+      "plan_ready": 2,
+      "implementing": 1,
+      "review": 1,
+      "blocked_external": 1,
+      "done": 2,
+      "verified": 0
+    },
+    "statusPreviews": {
+      "backlog": [{ "id": "task-1", "title": "Queued work" }],
+      "planning": [],
+      "plan_ready": [],
+      "implementing": [],
+      "review": [],
+      "blocked_external": [],
+      "done": [],
+      "verified": []
+    }
+  }
+]
+```
+
+`completedTasks` counts `done` + `verified`. `activeTasks` counts every status
+that is not `backlog`, `done`, or `verified`. `blockedTasks` counts
+`blocked_external`. `statusPreviews` lists are small (bounded in SQL) and
+include only task id/title pairs — never plan text, logs, or other detail-only
+fields. `lastActivityAt` is the latest task `updatedAt` timestamp for the
+project, or `null` when the project has no tasks.
 
 ### Create Project
 
@@ -149,7 +211,7 @@ POST /projects
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `name` | string | yes | Project name (1-200 chars) |
-| `rootPath` | string | yes | Absolute path to project root |
+| `rootPath` | string | yes | Absolute path to project root, for example `/Users/me/projects/my-project`. With Docker, paths outside `PROJECTS_MOUNT` are resolved below that mount |
 | `plannerMaxBudgetUsd` | number | no | Budget for planner agent. If omitted, unlimited |
 | `planCheckerMaxBudgetUsd` | number | no | Budget for plan-checker agent. If omitted, unlimited |
 | `implementerMaxBudgetUsd` | number | no | Budget for implementer agent. If omitted, unlimited |
@@ -170,6 +232,30 @@ PUT /projects/:id
 **Body:** Same as Create Project.
 
 **Response:** `200 OK` — the updated project object.
+
+### Update Project Organization
+
+```
+PATCH /projects/:id/organization
+```
+
+Updates picker-only organization metadata without requiring the project's name
+or root path.
+
+**Body:**
+
+| Field       | Type         | Required | Description                                                             |
+| ----------- | ------------ | -------- | ----------------------------------------------------------------------- |
+| `pinned`    | boolean      | no       | Pin or unpin the project. Pinning preserves the original pin timestamp. |
+| `groupName` | string\|null | no       | Flat picker group (max 100 chars); `null` or an empty string clears it. |
+
+At least one field is required.
+
+**Response:** `200 OK` — the updated project object. Returns `404` when the
+project does not exist.
+
+**WebSocket event:** `project:organization_updated` with the full project
+object.
 
 Parallel auto-queue with `git.create_branches=true` requires
 `AIF_TASK_WORKTREES_ENABLED=true`. With the default `false`, the API rejects
@@ -225,6 +311,11 @@ Reads `.ai-factory/ROADMAP.md` from the project root, uses Agent SDK to convert 
 
 **Deduplication:** Tasks are deduped by `projectId + normalizedTitle + roadmapAlias`. Re-running import with the same alias skips already-existing tasks.
 
+**Backlog ordering:** Roadmap import is the explicit front-of-queue path. New
+roadmap tasks receive explicit backlog positions ahead of the current backlog
+minimum so auto-queue consumes them by phase/sequence order before ordinary
+backlog rows.
+
 **Tag enrichment:** Each created task automatically receives tags: `roadmap`, `rm:<alias>`, `phase:<number>`, `phase:<name>`, `seq:<nn>`.
 
 **Errors:**
@@ -255,8 +346,10 @@ GET /projects/:id/auto-queue-mode
 ```
 
 Returns the current auto-queue state for the project. When enabled, the
-coordinator advances the next backlog task (by `position`) into planning
-whenever the project has no active/locked task.
+coordinator advances the next backlog task with the smallest `position` into
+planning whenever the project has no active/locked task. Ordinary `POST /tasks`
+creation appends new backlog rows to the tail of that project's backlog, so the
+default create path is FIFO.
 
 **Response:** `200 OK`
 
@@ -571,11 +664,53 @@ The normalized `runtimeLimitSnapshot` object is shared across runtime-profile, t
 GET /tasks?projectId=<uuid>
 ```
 
-| Param       | Type         | Required | Description                               |
-| ----------- | ------------ | -------- | ----------------------------------------- |
-| `projectId` | query string | no       | Filter by project. Omit to list all tasks |
+| Param       | Type         | Required | Description                                                                                                                                                                                                        |
+| ----------- | ------------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `projectId` | query string | optional | Project UUID. Scoped to a project returns lightweight `TaskListItem[]`. Omitting it returns the legacy full `Task[]` across all projects (retained until dashboard consumers migrate to `GET /projects/overview`). |
 
-**Response:** `200 OK` — array of task objects sorted by status order, then position.
+**Response (scoped):** `200 OK` - array of lightweight `TaskListItem` objects sorted by
+status order, then position.
+
+**Response (bare, legacy):** `200 OK` - array of full `Task` objects across all
+projects. This path is transitional and will be removed once the dashboard
+moves to `GET /projects/overview`.
+
+```json
+[
+  {
+    "id": "uuid",
+    "projectId": "uuid",
+    "title": "Task title",
+    "description": "Short board text",
+    "status": "backlog",
+    "priority": 0,
+    "position": 1100,
+    "autoMode": true,
+    "isFix": false,
+    "paused": false,
+    "hasPlan": false,
+    "tokenInput": 0,
+    "tokenOutput": 0,
+    "tokenTotal": 0,
+    "costUsd": 0,
+    "createdAt": "2026-01-01T00:00:00.000Z",
+    "updatedAt": "2026-01-01T00:00:00.000Z"
+  }
+]
+```
+
+The list contract excludes detail-only fields such as `attachments`, `plan`,
+`implementationLog`, `reviewComments`, `agentActivityLog`, `runtimeOptions`,
+`autoReviewState`, and QA markdown artifacts. Use `GET /tasks/:id` for the full
+task detail payload.
+
+**Errors:**
+
+- `400` - invalid `projectId` format
+
+> Backlog ordering: ordinary task creation places new rows at the backlog tail,
+> so API consumers see default-created backlog tasks in creation order unless a
+> caller supplies an explicit `position`.
 
 ### Create Task
 
@@ -596,6 +731,9 @@ POST /tasks
 | `skipReview` | boolean | no | `false` | Skip the review stage — task moves directly from implementing to done |
 | `paused` | boolean | no | `false` | Pause agent processing — coordinator skips this task until resumed |
 | `useSubagents` | boolean | no | `false` | Run via custom subagents (`plan-coordinator`, `implement-coordinator`, sidecars). `false` uses `aif-*` skills directly |
+| `runPlanImprove` | boolean | no | `false` | Skills-mode only (`useSubagents=false`): run optional `/aif-improve` after planning and before `plan_ready`. Ignored and stored as `false` for subagent tasks |
+| `runPostVerify` | boolean | no | `false` | Skills-mode only (`useSubagents=false`): run optional `/aif-verify` after implementation and before review. With `skipReview=true`, verification moves directly to `done`. Ignored and stored as `false` for subagent tasks |
+| `autoQa` | boolean | no | `false` | Automatically run the QA pipeline (`/aif-qa --all`) when the task is approved (`approve_done`: `done → verified`) |
 | `runtimeProfileId` | string \| null | no | `null` | Task-specific runtime override. When absent, resolution falls back to project default, then app default, then environment fallback |
 | `roadmapAlias` | string | no | `null` | Roadmap alias for grouping (e.g., `v1.0`) |
 | `tags` | string[] | no | `[]` | Tags for filtering/categorization (max 50, each max 100 chars) |
@@ -611,6 +749,11 @@ POST /tasks
 
 **Response:** `201 Created` — the created task object.
 
+**Backlog ordering:** When `position` is not supplied by a specialized caller,
+the data layer appends the new backlog task to the tail of that project's
+backlog by assigning `max(position) + 100` within the project. Auto-queue then
+consumes the smallest backlog position.
+
 **WebSocket event:** `task:created`
 
 ### Get Task
@@ -621,6 +764,10 @@ GET /tasks/:id
 
 **Response:** `200 OK` — full task object.
 
+This is the full detail endpoint. It includes heavy task fields such as
+attachments, plan, implementation log, review comments, agent activity log,
+runtime options, auto-review state, and QA detail text when present.
+
 Notable task fields in the response:
 
 | Field                   | Type         | Description                                                                                                      |
@@ -629,6 +776,11 @@ Notable task fields in the response:
 | `autoReviewState`       | object\|null | Latest persisted blocking-findings snapshot used by the auto-review loop (`strategy`, `iteration`, `findings[]`) |
 | `runtimeLimitSnapshot`  | object\|null | Persisted runtime-limit snapshot copied onto the task when quota gating or quota failure blocks execution        |
 | `runtimeLimitUpdatedAt` | string\|null | ISO timestamp for the last task-level runtime-limit snapshot write                                               |
+| `autoQa`                | boolean      | When `true`, the QA pipeline runs automatically once the task is approved (`approve_done`)                       |
+| `qaStatus`              | string       | QA run lifecycle: `idle`, `running`, `done`, or `error`                                                          |
+| `qaChangeSummary`       | string\|null | Markdown change-summary artifact from the latest QA run (`null` until generated)                                 |
+| `qaTestPlan`            | string\|null | Markdown test-plan artifact from the latest QA run (`null` until generated)                                      |
+| `qaTestCases`           | string\|null | Markdown test-cases artifact from the latest QA run (`null` until generated)                                     |
 
 ### Download Task Attachment
 
@@ -672,6 +824,10 @@ PUT /tasks/:id
 | `attachments` | array | File attachments |
 | `priority` | integer | Priority (0-5) |
 | `autoMode` | boolean | Auto-advance mode (includes automatic post-review rework loop when enabled) |
+| `useSubagents` | boolean | Run via custom subagents. When set to `true`, `runPlanImprove` and `runPostVerify` are reset to `false` |
+| `runPlanImprove` | boolean | Skills-mode only: run optional `/aif-improve` after planning and before `plan_ready` |
+| `runPostVerify` | boolean | Skills-mode only: run optional `/aif-verify` after implementation and before review. With `skipReview=true`, verification moves directly to `done` |
+| `autoQa` | boolean | Auto-run the QA pipeline when the task is approved (`done → verified`) |
 | `paused` | boolean | Pause/resume agent processing for this task |
 | `runtimeProfileId` | string\|null | Task-specific runtime override |
 | `isFix` | boolean | Marks task as fix-flow |
@@ -743,11 +899,46 @@ Additional constraints:
 
 **WebSocket event:** `task:moved`
 
+### Run QA
+
+```
+POST /tasks/:id/run-qa
+```
+
+Manually triggers the `/aif-qa --all` pipeline for the task (fire-and-forget). The
+runner generates three markdown artifacts under `<paths.qa>/<branch-slug>/`
+(`change-summary.md`, `test-plan.md`, `test-cases.md`), persists them onto the task
+(`qaChangeSummary`, `qaTestPlan`, `qaTestCases`), and updates `qaStatus`. Execution
+uses the task's worktree root when present (`worktreePath`), otherwise the project
+root. Artifact slugs use the task's persisted `branchName` when present; branchless
+tasks fall back to the current git branch in the execution root. The same pipeline
+runs automatically after `approve_done` when `autoQa = true`.
+
+**Response:** `202 Accepted`
+
+```json
+{ "status": "accepted" }
+```
+
+**Errors:**
+
+- `403` — QA pipeline feature flag is disabled (`AIF_QA_PIPELINE_ENABLED=false`); body carries `code: "feature_disabled"`
+- `404` — task not found
+- `404` — project not found
+- `409` — QA is already running (`qaStatus === "running"`)
+
+**WebSocket events:** `task:qa_started` immediately, then `task:qa_done` or
+`task:qa_failed` when the run finishes. The runner also broadcasts `task:updated`
+as it writes `qaStatus` and the artifacts.
+
 ### Reorder Task
 
 ```
 PATCH /tasks/:id/position
 ```
+
+Manually changing backlog `position` changes auto-queue priority because the
+coordinator always consumes the smallest backlog position first.
 
 **Body:**
 | Field | Type | Description |
@@ -1120,10 +1311,14 @@ All events are JSON with this structure:
 | Event                             | Payload                                                                                            | Triggered By                                                                         |
 | --------------------------------- | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ |
 | `project:created`                 | Full project object                                                                                | `POST /projects`                                                                     |
+| `project:organization_updated`    | Full project object                                                                                | `PATCH /projects/:id/organization`                                                   |
 | `task:created`                    | Full task object                                                                                   | `POST /tasks`, `POST /projects/:id/roadmap/import`                                   |
 | `task:updated`                    | Full task object                                                                                   | `PUT /tasks/:id`, `PATCH /tasks/:id/position`, `POST /tasks/:id/events` (`fast_fix`) |
 | `task:moved`                      | Full task object                                                                                   | `POST /tasks/:id/events`                                                             |
 | `task:deleted`                    | `{ id: string }`                                                                                   | `DELETE /tasks/:id`                                                                  |
+| `task:qa_started`                 | `{ taskId, projectId, status: "started" }`                                                         | `POST /tasks/:id/run-qa`, or `approve_done` with `autoQa=true`                       |
+| `task:qa_done`                    | `{ taskId, projectId, status: "done" }`                                                            | QA pipeline finished successfully                                                    |
+| `task:qa_failed`                  | `{ taskId, projectId, status: "failed", error? }`                                                  | QA pipeline failed (runner returned `{ ok: false }`)                                 |
 | `sync:task_created`               | Full task object                                                                                   | MCP `handoff_create_task`                                                            |
 | `sync:task_updated`               | Full task object                                                                                   | MCP `handoff_update_task`, `handoff_push_plan`                                       |
 | `sync:status_changed`             | Full task object                                                                                   | MCP `handoff_sync_status`                                                            |

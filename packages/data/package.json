@@ -9,6 +9,7 @@
   "types": "./src/index.ts",
   "scripts": {
     "build": "tsc",
+    "normalize:backlog": "node --import tsx src/normalizeBacklogPositions.ts",
     "test": "vitest run --passWithNoTests --configLoader runner",
     "coverage": "vitest run --coverage --passWithNoTests",
     "lint": "eslint \"src/**/*.ts\"",
@@ -19,6 +20,7 @@
     "drizzle-orm": "^0.45.2"
   },
   "devDependencies": {
+    "tsx": "^4.21.0",
     "typescript": "^5.9.3",
     "vitest": "^4.1.2"
   }

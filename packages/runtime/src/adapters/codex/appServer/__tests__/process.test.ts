@@ -75,6 +75,9 @@ describe("codex app-server process helpers", () => {
     const env = buildCodexAppServerEnv({
       runtimeId: "codex",
       options: {},
+      // Explicit API-key opt-in: OPENAI_API_KEY may only be forwarded when the
+      // profile asks for API-key auth (otherwise OAuth runs would be hijacked).
+      apiKeyEnvVar: "OPENAI_API_KEY",
     });
 
     expect(env).toMatchObject({
@@ -116,6 +119,52 @@ describe("codex app-server process helpers", () => {
     expect(env.npm_config_user_agent).toBeUndefined();
 
     vi.unstubAllEnvs();
+  });
+
+  it("does not consume ambient OPENAI_API_KEY / OPENAI_BASE_URL by default", () => {
+    vi.stubEnv("OPENAI_API_KEY", "sk-000");
+    vi.stubEnv("OPENAI_BASE_URL", "http://host.docker.internal:8317/v1");
+
+    const env = buildCodexAppServerEnv({
+      runtimeId: "codex",
+      options: {},
+    });
+
+    expect(env.OPENAI_API_KEY).toBeUndefined();
+    expect(env.OPENAI_BASE_URL).toBeUndefined();
+  });
+
+  it("forwards OPENAI_API_KEY when apiKeyEnvVar opts into API-key auth", () => {
+    vi.stubEnv("OPENAI_API_KEY", "sk-real");
+
+    const env = buildCodexAppServerEnv({
+      runtimeId: "codex",
+      options: { apiKeyEnvVar: "OPENAI_API_KEY" },
+    });
+
+    expect(env.OPENAI_API_KEY).toBe("sk-real");
+  });
+
+  it("injects an explicit literal apiKey under its configured env var", () => {
+    const env = buildCodexAppServerEnv({
+      runtimeId: "codex",
+      options: {},
+      apiKey: "sk-literal",
+      apiKeyEnvVar: "MY_CODEX_KEY",
+    });
+
+    expect(env.MY_CODEX_KEY).toBe("sk-literal");
+    expect(env.OPENAI_API_KEY).toBe("sk-literal");
+  });
+
+  it("maps an explicit baseUrl onto CODEX_BASE_URL", () => {
+    const env = buildCodexAppServerEnv({
+      runtimeId: "codex",
+      options: {},
+      baseUrl: "https://codex.internal/api",
+    });
+
+    expect(env.CODEX_BASE_URL).toBe("https://codex.internal/api");
   });
 
   it("forwards NODE_ENV without forwarding NODE_OPTIONS", () => {

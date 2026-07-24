@@ -32,11 +32,28 @@ describe("codex app-server model discovery env", () => {
       providerId: "openai",
       profileId: "profile-1",
       options: {},
+      // Explicit API-key opt-in: ambient OPENAI_API_KEY is otherwise blocked so
+      // OAuth-backed discovery is not hijacked. This test asserts OPENAI_BASE_URL
+      // is stripped regardless of the key being present.
+      apiKeyEnvVar: "OPENAI_API_KEY",
     });
 
     expect(env.OPENAI_API_KEY).toBe("sk-env");
     expect(env.OPENAI_BASE_URL).toBeUndefined();
     expect(env.npm_config_registry).toBeUndefined();
+  });
+
+  it("does not consume ambient OPENAI_API_KEY for discovery without an opt-in", () => {
+    vi.stubEnv("OPENAI_API_KEY", "sk-000");
+
+    const env = buildCodexAppServerDiscoveryEnv({
+      runtimeId: "codex",
+      providerId: "openai",
+      profileId: "profile-1",
+      options: {},
+    });
+
+    expect(env.OPENAI_API_KEY).toBeUndefined();
   });
 
   it("maps an explicit discovery baseUrl to CODEX_BASE_URL only", () => {

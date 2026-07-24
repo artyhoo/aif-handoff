@@ -108,7 +108,9 @@ const envSchema = z.object({
       return value;
     }, z.boolean())
     .default(true),
-  COORDINATOR_MAX_CONCURRENT_TASKS: z.coerce.number().min(1).max(10).default(3),
+  COORDINATOR_MAX_CONCURRENT_TASKS: z.coerce.number().min(1).max(100).default(12),
+  COORDINATOR_MAX_CONCURRENT_TASKS_PER_PROJECT: z.coerce.number().min(1).max(10).default(3),
+  COORDINATOR_MAX_CONCURRENT_PROJECTS: z.coerce.number().min(1).max(10).default(4),
   AGENT_CHAT_MAX_TURNS: z.coerce.number().min(1).default(50),
   AGENT_MAX_REVIEW_ITERATIONS: z.coerce.number().min(1).default(3),
   AGENT_AUTO_REVIEW_STRATEGY: z.enum(AUTO_REVIEW_STRATEGIES).default("full_re_review"),
@@ -142,7 +144,37 @@ const envSchema = z.object({
       return value;
     }, z.boolean())
     .default(false),
+  AIF_RUNTIME_MODEL_EFFORT_DISCOVERY_ENABLED: z
+    .preprocess((value) => {
+      if (typeof value === "string") {
+        const normalized = value.trim().toLowerCase();
+        if (BOOLEAN_TRUE_VALUES.has(normalized)) return true;
+        if (BOOLEAN_FALSE_VALUES.has(normalized)) return false;
+      }
+      return value;
+    }, z.boolean())
+    .default(false),
+  AIF_API_NODE_SERVER_V2_WEBSOCKET_ENABLED: z
+    .preprocess((value) => {
+      if (typeof value === "string") {
+        const normalized = value.trim().toLowerCase();
+        if (BOOLEAN_TRUE_VALUES.has(normalized)) return true;
+        if (BOOLEAN_FALSE_VALUES.has(normalized)) return false;
+      }
+      return value;
+    }, z.boolean())
+    .default(false),
   AIF_WARMUP_ENABLED: z
+    .preprocess((value) => {
+      if (typeof value === "string") {
+        const normalized = value.trim().toLowerCase();
+        if (BOOLEAN_TRUE_VALUES.has(normalized)) return true;
+        if (BOOLEAN_FALSE_VALUES.has(normalized)) return false;
+      }
+      return value;
+    }, z.boolean())
+    .default(false),
+  AIF_QA_PIPELINE_ENABLED: z
     .preprocess((value) => {
       if (typeof value === "string") {
         const normalized = value.trim().toLowerCase();

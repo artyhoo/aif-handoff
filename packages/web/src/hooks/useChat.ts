@@ -9,6 +9,7 @@ import type {
   RuntimeLimitSnapshot,
 } from "@aif/shared/browser";
 import { api, ApiError } from "@/lib/api";
+import { randomUUID } from "@/lib/uuid";
 import { getWsClientId } from "./useWebSocket";
 
 interface SessionStreamState {
@@ -297,7 +298,7 @@ export function useChat(
         currentSessionIdRef.current = null;
       }
 
-      const newConversationId = crypto.randomUUID();
+      const newConversationId = randomUUID();
       const effectiveSessionId = forceNewSession
         ? null
         : (sessionId ?? currentSessionIdRef.current);

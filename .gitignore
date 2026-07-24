@@ -37,6 +37,7 @@ logs/
 
 # Testing
 coverage/
+/packages/web/.perf-project/
 
 # Astro (generated)
 .astro/
@@ -78,6 +79,7 @@ docs-html/
 # Misc
 .data
 .projects
+/projects/
 
 # Attachment files (stored inside project .ai-factory/files/)
 .ai-factory/files/

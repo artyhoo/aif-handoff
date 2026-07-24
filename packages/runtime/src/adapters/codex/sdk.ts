@@ -6,6 +6,7 @@ import {
   type ThreadEvent,
   type ThreadItem,
   type Usage,
+  type ModelReasoningEffort,
 } from "@openai/codex-sdk";
 import type {
   RuntimeEvent,
@@ -29,6 +30,11 @@ import {
 } from "./permissions.js";
 import { getCodexSessionLimitSnapshot } from "./sessions.js";
 import { PROXY_ENV_VARS } from "../../proxyEnv.js";
+import {
+  CODEX_MODEL_EFFORT_LEVELS,
+  isModelEffortLevel,
+  resolveModelEffortOption,
+} from "../../modelEffort.js";
 
 export interface CodexSdkLogger {
   debug?(context: Record<string, unknown>, message: string): void;
@@ -93,9 +99,19 @@ const ALLOWED_ENV_PREFIXES = [
   ...PROXY_ENV_VARS,
 ];
 
+/**
+ * Env keys that must NOT leak into the Codex SDK child by default. Local Codex
+ * SDK runs delegate auth to `codex login` (OAuth); a placeholder/unrelated
+ * `OPENAI_API_KEY=sk-000` or `OPENAI_BASE_URL` in `.env` would otherwise force
+ * the SDK into API-key auth and break OAuth-backed chat. They are forwarded
+ * only when API-key auth is explicitly opted into via profile `apiKeyEnvVar`.
+ */
+const BLOCKED_ENV_KEYS = new Set(["OPENAI_API_KEY", "OPENAI_BASE_URL"]);
+
 function buildCuratedEnv(
   apiKeyEnvVar: string,
   executionEnv?: Record<string, string>,
+  allowApiKeyEnvVar = false,
 ): {
   env: Record<string, string>;
   forwardedCount: number;
@@ -108,6 +124,15 @@ function buildCuratedEnv(
   const droppedDisallowedPrefixKeys = new Set<string>();
   for (const [key, value] of Object.entries(process.env)) {
     if (value == null) continue;
+    if (key === apiKeyEnvVar && allowApiKeyEnvVar) {
+      env[key] = value;
+      forwardedCount += 1;
+      continue;
+    }
+    if (BLOCKED_ENV_KEYS.has(key)) {
+      filteredCount += 1;
+      continue;
+    }
     if (
       key === apiKeyEnvVar ||
       ALLOWED_ENV_PREFIXES.some((prefix) => key === prefix || key.startsWith(prefix))
@@ -137,9 +162,13 @@ function buildCuratedEnv(
 function buildCodexOptions(input: RuntimeRunInput, logger?: CodexSdkLogger): CodexOptions {
   const options = asRecord(input.options);
   const execution = input.execution;
-  const apiKeyEnvVar =
-    typeof options.apiKeyEnvVar === "string" ? options.apiKeyEnvVar : "OPENAI_API_KEY";
-  const curatedEnv = buildCuratedEnv(apiKeyEnvVar, execution?.environment);
+  const explicitApiKeyEnvVar = readString(options.apiKeyEnvVar);
+  const apiKeyEnvVar = explicitApiKeyEnvVar ?? "OPENAI_API_KEY";
+  const curatedEnv = buildCuratedEnv(
+    apiKeyEnvVar,
+    execution?.environment,
+    Boolean(explicitApiKeyEnvVar),
+  );
   logger?.debug?.(
     {
       runtimeId: input.runtimeId,
@@ -165,19 +194,22 @@ function buildCodexOptions(input: RuntimeRunInput, logger?: CodexSdkLogger): Cod
     env: curatedEnv.env,
   };
 
-  // API key — only passed if explicitly provided via profile options or env var.
-  // Otherwise the SDK delegates auth to the CLI which manages its own credentials
-  // via `codex auth login`, same as Claude SDK uses `claude /login`.
-  const apiKey = readString(options.apiKey) ?? readString(process.env[apiKeyEnvVar]);
+  // API key — only passed if explicitly provided via profile options or an
+  // explicitly configured apiKeyEnvVar. Otherwise the SDK delegates auth to the
+  // CLI which manages its own credentials via `codex login`, same as Claude SDK
+  // uses `claude /login`. An ambient OPENAI_API_KEY is intentionally ignored so
+  // a placeholder key cannot hijack an OAuth-backed session.
+  const apiKey =
+    readString(options.apiKey) ??
+    (explicitApiKeyEnvVar ? readString(process.env[apiKeyEnvVar]) : null);
   if (apiKey) {
     codexOpts.apiKey = apiKey;
   }
 
-  // Base URL override
-  const baseUrl =
-    readString(options.baseUrl) ??
-    readString(process.env.OPENAI_BASE_URL) ??
-    readString(process.env.CODEX_BASE_URL);
+  // Base URL override. OPENAI_BASE_URL is intentionally not inferred here:
+  // Codex OAuth-backed SDK runs should use Codex's own backend unless a profile
+  // baseUrl or CODEX_BASE_URL explicitly opts into another endpoint.
+  const baseUrl = readString(options.baseUrl) ?? readString(process.env.CODEX_BASE_URL);
   if (baseUrl) {
     codexOpts.baseUrl = baseUrl;
   }
@@ -279,15 +311,19 @@ function buildThreadOptions(input: RuntimeRunInput, logger?: CodexSdkLogger): Th
   }
 
   // Reasoning effort
-  const effort = readString(options.modelReasoningEffort) ?? readString(hooks.modelReasoningEffort);
-  if (
-    effort === "minimal" ||
-    effort === "low" ||
-    effort === "medium" ||
-    effort === "high" ||
-    effort === "xhigh"
-  ) {
+  const effortOptions =
+    options.modelReasoningEffort == null
+      ? { ...options, modelReasoningEffort: hooks.modelReasoningEffort }
+      : options;
+  const effort = resolveModelEffortOption(
+    effortOptions,
+    "modelReasoningEffort",
+    CODEX_MODEL_EFFORT_LEVELS,
+  );
+  if (isModelEffortLevel<ModelReasoningEffort>(effort, CODEX_MODEL_EFFORT_LEVELS)) {
     threadOpts.modelReasoningEffort = effort;
+  } else if (effort) {
+    Reflect.set(threadOpts, "modelReasoningEffort", effort);
   }
 
   logger?.debug?.(

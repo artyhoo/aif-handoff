@@ -10,9 +10,10 @@ Describe what was changed and why.
 
 Which AI model was used to generate or assist with this code?
 
-- [ ] Claude Opus 4.6
-- [ ] Claude Sonnet 4.6
-- [ ] Claude Haiku 4.5
+- [ ] GPT (latest)
+- [ ] Claude Fable (latest)
+- [ ] Claude Opus (latest)
+- [ ] Claude Sonnet (latest)
 - [ ] Other: <!-- specify -->
 - [ ] No AI used
 

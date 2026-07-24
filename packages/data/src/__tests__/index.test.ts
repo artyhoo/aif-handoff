@@ -22,10 +22,13 @@ vi.mock("@aif/shared/server", async (importOriginal) => {
 const {
   createTask,
   updateTask,
+  tryStartQaRun,
+  resetStaleQaRuns,
   setTaskFields,
   deleteTask,
   findTaskById,
   listTasks,
+  listTaskListItems,
   toTaskResponse,
   toCommentResponse,
   listTaskComments,
@@ -34,9 +37,11 @@ const {
   getLatestHumanComment,
   getLatestReworkComment,
   listProjects,
+  listProjectTaskOverviews,
   findProjectById,
   createProject,
   updateProject,
+  updateProjectOrganization,
   deleteProject,
   findProjectByTaskId,
   appendTaskActivityLog,
@@ -50,7 +55,10 @@ const {
   persistTaskPlanForTask,
   findCoordinatorTaskCandidate,
   findCoordinatorTaskCandidates,
+  findCoordinatorTaskCandidatesForProject,
+  listCoordinatorActionableProjectIds,
   claimTask,
+  claimCoordinatorTaskIfEligible,
   releaseTaskClaim,
   releaseStaleTaskClaims,
   hasActiveLockedTaskForProject,
@@ -184,6 +192,151 @@ describe("data layer", () => {
     });
   });
 
+  describe("listTaskListItems", () => {
+    it("returns lightweight task list items scoped to a project", () => {
+      seedProject("proj-2");
+      const withPlan = createTask({
+        projectId: "proj-1",
+        title: "A",
+        description: "Board description",
+        priority: 2,
+        tags: ["roadmap"],
+        roadmapAlias: "v1",
+      })!;
+      setTaskFields(withPlan.id, {
+        plan: "## Plan",
+        implementationLog: "heavy implementation log",
+        reviewComments: "heavy review comments",
+        agentActivityLog: "heavy activity log",
+      });
+      updateTask(withPlan.id, {
+        tokenInput: 10,
+        tokenOutput: 20,
+        tokenTotal: 30,
+        costUsd: 0.12,
+      });
+      createTask({ projectId: "proj-2", title: "B", description: "Other project" });
+
+      const result = listTaskListItems("proj-1");
+
+      expect(result).toHaveLength(1);
+      expect(result[0]).toMatchObject({
+        id: withPlan.id,
+        projectId: "proj-1",
+        title: "A",
+        description: "Board description",
+        hasPlan: true,
+        tokenInput: 10,
+        tokenOutput: 20,
+        tokenTotal: 30,
+        costUsd: 0.12,
+        tags: ["roadmap"],
+        roadmapAlias: "v1",
+      });
+      expect(result[0]).not.toHaveProperty("plan");
+      expect(result[0]).not.toHaveProperty("implementationLog");
+      expect(result[0]).not.toHaveProperty("reviewComments");
+      expect(result[0]).not.toHaveProperty("agentActivityLog");
+      expect(result[0]).not.toHaveProperty("attachments");
+      expect(result[0]).not.toHaveProperty("runtimeOptions");
+    });
+
+    it("sorts by kanban status order before position", () => {
+      const planning = createTask({ projectId: "proj-1", title: "Planning", description: "" })!;
+      const blocked = createTask({ projectId: "proj-1", title: "Blocked", description: "" })!;
+      const backlog = createTask({ projectId: "proj-1", title: "Backlog", description: "" })!;
+
+      updateTaskStatus(planning.id, "planning");
+      updateTaskStatus(blocked.id, "blocked_external", {
+        blockedFromStatus: "planning",
+        blockedReason: "rate limit",
+      });
+
+      const result = listTaskListItems("proj-1");
+
+      expect(result.map((task) => task.id)).toEqual([backlog.id, planning.id, blocked.id]);
+    });
+  });
+
+  describe("listProjectTaskOverviews", () => {
+    it("returns compact per-project aggregates and limited previews", () => {
+      seedProject("proj-2");
+      createTask({
+        projectId: "proj-1",
+        title: "Backlog A",
+        description: "D",
+        isFix: true,
+        tags: ["x"],
+      });
+      const firstBacklog = createTask({
+        projectId: "proj-1",
+        title: "Backlog first by position",
+        description: "D",
+        position: 10,
+      })!;
+      const backlog = listTasks("proj-1").find((task) => task.title === "Backlog A")!;
+      updateTask(backlog.id, {
+        tokenInput: 5,
+        tokenOutput: 6,
+        tokenTotal: 11,
+      });
+      const done = createTask({
+        projectId: "proj-1",
+        title: "Done B",
+        description: "D",
+        autoMode: false,
+      })!;
+      updateTaskStatus(done.id, "done", {
+        retryCount: 2,
+      });
+      updateTask(done.id, {
+        tokenInput: 10,
+        tokenOutput: 15,
+        tokenTotal: 25,
+        costUsd: 0.5,
+      });
+      createTask({ projectId: "proj-2", title: "Other project", description: "D" });
+
+      const overviews = listProjectTaskOverviews(1);
+      const proj1 = overviews.find((overview) => overview.projectId === "proj-1")!;
+      const proj2 = overviews.find((overview) => overview.projectId === "proj-2")!;
+
+      expect(proj1.totalTasks).toBe(3);
+      expect(proj1.completedTasks).toBe(1);
+      expect(proj1.backlogTasks).toBe(2);
+      expect(proj1.fixTasks).toBe(1);
+      expect(proj1.totalRetries).toBe(2);
+      expect(proj1.totalTokenInput).toBe(15);
+      expect(proj1.totalTokenOutput).toBe(21);
+      expect(proj1.totalTokenTotal).toBe(36);
+      expect(proj1.totalCostUsd).toBe(0.5);
+      expect(proj1.statusCounts.backlog).toBe(2);
+      expect(proj1.statusCounts.done).toBe(1);
+      expect(proj1.statusPreviews.backlog).toEqual([
+        { id: firstBacklog.id, title: "Backlog first by position" },
+      ]);
+      expect(proj1.statusPreviews.done).toEqual([{ id: done.id, title: "Done B" }]);
+      expect(proj2.totalTasks).toBe(1);
+    });
+
+    it("returns the latest task activity timestamp per project", () => {
+      const older = createTask({ projectId: "proj-1", title: "Older", description: "D" })!;
+      const newer = createTask({ projectId: "proj-1", title: "Newer", description: "D" })!;
+      testDb.current
+        .update(tasks)
+        .set({ updatedAt: "2026-01-01T10:00:00.000Z" })
+        .where(eq(tasks.id, older.id))
+        .run();
+      testDb.current
+        .update(tasks)
+        .set({ updatedAt: "2026-01-02T10:00:00.000Z" })
+        .where(eq(tasks.id, newer.id))
+        .run();
+
+      expect(listProjectTaskOverviews()[0]?.lastActivityAt).toBe("2026-01-02T10:00:00.000Z");
+    });
+  });
+
   describe("updateTask", () => {
     it("updates basic fields", () => {
       const t = createTask({ projectId: "proj-1", title: "Old", description: "D" });
@@ -205,6 +358,60 @@ describe("data layer", () => {
       expect(updated).toBeDefined();
       const resp = toTaskResponse(updated!);
       expect(resp.tags).toEqual(["a", "b"]);
+    });
+  });
+
+  describe("tryStartQaRun", () => {
+    it("claims the running slot from a non-running status and returns true", () => {
+      const t = createTask({ projectId: "proj-1", title: "T", description: "D" });
+      expect(tryStartQaRun(t!.id)).toBe(true);
+      expect(findTaskById(t!.id)!.qaStatus).toBe("running");
+    });
+
+    it("is mutually exclusive: a second claim while running returns false", () => {
+      const t = createTask({ projectId: "proj-1", title: "T", description: "D" });
+      expect(tryStartQaRun(t!.id)).toBe(true);
+      // Already running — the compare-and-set affects no rows.
+      expect(tryStartQaRun(t!.id)).toBe(false);
+      expect(findTaskById(t!.id)!.qaStatus).toBe("running");
+    });
+
+    it("can re-claim after the run finishes (status back to done/error)", () => {
+      const t = createTask({ projectId: "proj-1", title: "T", description: "D" });
+      expect(tryStartQaRun(t!.id)).toBe(true);
+      updateTask(t!.id, { qaStatus: "done" });
+      expect(tryStartQaRun(t!.id)).toBe(true);
+    });
+
+    it("returns false for an unknown task id (no row to flip)", () => {
+      expect(tryStartQaRun("ghost")).toBe(false);
+    });
+  });
+
+  describe("resetStaleQaRuns", () => {
+    it("flips every running row to error and returns the count", () => {
+      const a = createTask({ projectId: "proj-1", title: "A", description: "D" });
+      const b = createTask({ projectId: "proj-1", title: "B", description: "D" });
+      expect(tryStartQaRun(a!.id)).toBe(true);
+      expect(tryStartQaRun(b!.id)).toBe(true);
+      expect(resetStaleQaRuns()).toBe(2);
+      expect(findTaskById(a!.id)!.qaStatus).toBe("error");
+      expect(findTaskById(b!.id)!.qaStatus).toBe("error");
+    });
+
+    it("leaves non-running statuses untouched and returns 0 when nothing is stale", () => {
+      const t = createTask({ projectId: "proj-1", title: "T", description: "D" });
+      updateTask(t!.id, { qaStatus: "done" });
+      expect(resetStaleQaRuns()).toBe(0);
+      expect(findTaskById(t!.id)!.qaStatus).toBe("done");
+    });
+
+    it("unblocks the QA claim: the recovered task can start QA again", () => {
+      const t = createTask({ projectId: "proj-1", title: "T", description: "D" });
+      expect(tryStartQaRun(t!.id)).toBe(true);
+      resetStaleQaRuns();
+      // Stale "running" released — the compare-and-set can win again.
+      expect(tryStartQaRun(t!.id)).toBe(true);
     });
   });
 
@@ -462,6 +669,24 @@ describe("data layer", () => {
       expect(listProjects()).toHaveLength(1);
     });
 
+    it("listProjects returns projects in deterministic case-insensitive name order", () => {
+      testDb.current.delete(projects).run();
+      testDb.current
+        .insert(projects)
+        .values([
+          { id: "zulu-2", name: "zulu", rootPath: "/tmp/zulu-2" },
+          { id: "alpha", name: "Alpha", rootPath: "/tmp/alpha" },
+          { id: "zulu-1", name: "Zulu", rootPath: "/tmp/zulu-1" },
+        ])
+        .run();
+
+      expect(listProjects().map((project) => project.id)).toEqual([
+        "alpha",
+        "zulu-1",
+        "zulu-2",
+      ]);
+    });
+
     it("findProjectById returns project", () => {
       expect(findProjectById("proj-1")).toBeDefined();
     });
@@ -488,6 +713,32 @@ describe("data layer", () => {
       const updated = updateProject(p!.id, { name: "Updated", rootPath: "/tmp/updated" });
       expect(updated!.name).toBe("Updated");
       expect(updated!.rootPath).toBe("/tmp/updated");
+    });
+
+    it("updates project pin and group organization without changing core fields", () => {
+      const pinned = updateProjectOrganization("proj-1", {
+        pinned: true,
+        groupName: "  Platform  ",
+      });
+
+      expect(pinned).toMatchObject({
+        id: "proj-1",
+        name: "Test",
+        rootPath: "/tmp/test",
+        groupName: "Platform",
+      });
+      expect(pinned?.pinnedAt).toBeTruthy();
+
+      const pinnedAgain = updateProjectOrganization("proj-1", { pinned: true });
+      expect(pinnedAgain?.pinnedAt).toBe(pinned?.pinnedAt);
+
+      const cleared = updateProjectOrganization("proj-1", { pinned: false, groupName: "" });
+      expect(cleared?.pinnedAt).toBeNull();
+      expect(cleared?.groupName).toBeNull();
+    });
+
+    it("returns undefined when organizing a missing project", () => {
+      expect(updateProjectOrganization("missing", { pinned: true })).toBeUndefined();
     });
 
     it("updateProject preserves omitted runtime defaults and clears explicit nulls", () => {
@@ -706,6 +957,75 @@ describe("data layer", () => {
       expect(candidates).toHaveLength(1);
       expect(candidates[0].id).toBe("stale-lock");
     });
+
+    it("returns empty project-scoped candidates and lanes when no tasks are actionable", () => {
+      expect(findCoordinatorTaskCandidatesForProject("proj-1", "planner", 10)).toEqual([]);
+      expect(listCoordinatorActionableProjectIds(10)).toEqual([]);
+    });
+
+    it("returns candidates for one project without being crowded by another project", () => {
+      const db = testDb.current;
+      db.insert(projects)
+        .values({ id: "proj-2", name: "Project 2", rootPath: "/tmp/proj-2" })
+        .run();
+      db.insert(tasks)
+        .values({ id: "p1-task", projectId: "proj-1", title: "P1", status: "planning", position: 10 })
+        .run();
+      db.insert(tasks)
+        .values({ id: "p2-task", projectId: "proj-2", title: "P2", status: "planning", position: 1 })
+        .run();
+
+      const candidates = findCoordinatorTaskCandidatesForProject("proj-1", "planner", 10);
+
+      expect(candidates).toHaveLength(1);
+      expect(candidates[0].id).toBe("p1-task");
+    });
+
+    it("lists actionable project lanes ordered by oldest waiting task", () => {
+      const db = testDb.current;
+      const oldest = "2026-01-01T00:00:00.000Z";
+      const newer = "2026-01-02T00:00:00.000Z";
+      db.insert(projects)
+        .values({ id: "proj-2", name: "Project 2", rootPath: "/tmp/proj-2" })
+        .run();
+      db.insert(projects)
+        .values({ id: "proj-3", name: "Project 3", rootPath: "/tmp/proj-3" })
+        .run();
+      db.insert(tasks)
+        .values({
+          id: "newer-low-position",
+          projectId: "proj-1",
+          title: "Newer low position",
+          status: "planning",
+          position: 1,
+          createdAt: newer,
+        })
+        .run();
+      db.insert(tasks)
+        .values({
+          id: "oldest-high-position",
+          projectId: "proj-2",
+          title: "Oldest high position",
+          status: "review",
+          position: 30,
+          createdAt: oldest,
+        })
+        .run();
+      db.insert(tasks)
+        .values({
+          id: "locked",
+          projectId: "proj-3",
+          title: "Locked",
+          status: "planning",
+          position: 0,
+          lockedBy: "worker",
+          lockedUntil: new Date(Date.now() + 60_000).toISOString(),
+          createdAt: "2025-12-31T00:00:00.000Z",
+        })
+        .run();
+
+      expect(listCoordinatorActionableProjectIds(10)).toEqual(["proj-2", "proj-1"]);
+    });
   });
 
   // ── Task claiming ──────────────────────────────────────
@@ -748,6 +1068,138 @@ describe("data layer", () => {
     });
   });
 
+  describe("claimCoordinatorTaskIfEligible", () => {
+    it("atomically claims an eligible task and returns its fresh row", () => {
+      const db = testDb.current;
+      db.insert(tasks)
+        .values({
+          id: "coordinator-claim",
+          projectId: "proj-1",
+          title: "Original title",
+          status: "review",
+        })
+        .run();
+      db.update(tasks)
+        .set({ title: "Fresh title" })
+        .where(eq(tasks.id, "coordinator-claim"))
+        .run();
+
+      const claimed = claimCoordinatorTaskIfEligible({
+        taskId: "coordinator-claim",
+        expectedProjectId: "proj-1",
+        expectedStatus: "review",
+        coordinatorId: "coord-1",
+        lockDurationMs: 600_000,
+      });
+
+      expect(claimed).toMatchObject({
+        id: "coordinator-claim",
+        title: "Fresh title",
+        status: "review",
+        paused: false,
+        lockedBy: "coord-1",
+      });
+      expect(claimed?.lockedUntil).toBeTruthy();
+    });
+
+    it("rejects stale project, status, pause, auto-mode, lock, and missing-row snapshots", () => {
+      const db = testDb.current;
+      const future = new Date(Date.now() + 60_000).toISOString();
+      const candidates = [
+        {
+          id: "wrong-project",
+          values: { projectId: "proj-2", status: "review" as const },
+          expectedProjectId: "proj-1",
+          expectedStatus: "review" as const,
+        },
+        {
+          id: "wrong-status",
+          values: { projectId: "proj-1", status: "done" as const },
+          expectedProjectId: "proj-1",
+          expectedStatus: "review" as const,
+        },
+        {
+          id: "paused",
+          values: { projectId: "proj-1", status: "review" as const, paused: true },
+          expectedProjectId: "proj-1",
+          expectedStatus: "review" as const,
+        },
+        {
+          id: "auto-mode-changed",
+          values: { projectId: "proj-1", status: "plan_ready" as const, autoMode: false },
+          expectedProjectId: "proj-1",
+          expectedStatus: "plan_ready" as const,
+          expectedAutoMode: true,
+        },
+        {
+          id: "actively-locked",
+          values: {
+            projectId: "proj-1",
+            status: "review" as const,
+            lockedBy: "other-coordinator",
+            lockedUntil: future,
+          },
+          expectedProjectId: "proj-1",
+          expectedStatus: "review" as const,
+        },
+      ];
+
+      for (const candidate of candidates) {
+        db.insert(tasks)
+          .values({ id: candidate.id, title: candidate.id, ...candidate.values })
+          .run();
+
+        expect(
+          claimCoordinatorTaskIfEligible({
+            taskId: candidate.id,
+            expectedProjectId: candidate.expectedProjectId,
+            expectedStatus: candidate.expectedStatus,
+            expectedAutoMode: candidate.expectedAutoMode,
+            coordinatorId: "coord-1",
+            lockDurationMs: 600_000,
+          }),
+        ).toBeUndefined();
+        expect(findTaskById(candidate.id)?.lockedBy).toBe(
+          "lockedBy" in candidate.values ? candidate.values.lockedBy : null,
+        );
+      }
+
+      expect(
+        claimCoordinatorTaskIfEligible({
+          taskId: "missing-task",
+          expectedProjectId: "proj-1",
+          expectedStatus: "review",
+          coordinatorId: "coord-1",
+          lockDurationMs: 600_000,
+        }),
+      ).toBeUndefined();
+    });
+
+    it("claims an eligible task with an expired lock", () => {
+      const db = testDb.current;
+      db.insert(tasks)
+        .values({
+          id: "expired-coordinator-claim",
+          projectId: "proj-1",
+          title: "Expired coordinator claim",
+          status: "planning",
+          lockedBy: "dead-coordinator",
+          lockedUntil: new Date(Date.now() - 1_000).toISOString(),
+        })
+        .run();
+
+      const claimed = claimCoordinatorTaskIfEligible({
+        taskId: "expired-coordinator-claim",
+        expectedProjectId: "proj-1",
+        expectedStatus: "planning",
+        coordinatorId: "coord-1",
+        lockDurationMs: 600_000,
+      });
+
+      expect(claimed?.lockedBy).toBe("coord-1");
+    });
+  });
+
   describe("releaseTaskClaim", () => {
     it("clears lock fields", () => {
       const db = testDb.current;
@@ -759,6 +1211,25 @@ describe("data layer", () => {
       const task = findTaskById("release-me");
       expect(task!.lockedBy).toBeNull();
       expect(task!.lockedUntil).toBeNull();
+    });
+
+    it("does not clear a claim owned by another coordinator", () => {
+      const db = testDb.current;
+      const future = new Date(Date.now() + 3600000).toISOString();
+      db.insert(tasks)
+        .values({
+          id: "owned-release",
+          projectId: "proj-1",
+          title: "Owned release",
+          status: "planning",
+          lockedBy: "coord-2",
+          lockedUntil: future,
+        })
+        .run();
+
+      releaseTaskClaim("owned-release", "coord-1");
+
+      expect(findTaskById("owned-release")?.lockedBy).toBe("coord-2");
     });
   });
 
@@ -1194,14 +1665,16 @@ describe("data layer", () => {
       expect(all.map((p) => p.id)).toEqual(["proj-2"]);
     });
 
-    it("nextBacklogTaskByPosition picks the lowest-position backlog task", () => {
+    it("createTask appends default backlog positions per project and keeps auto-queue FIFO", () => {
       const a = createTask({ projectId: "proj-1", title: "A", description: "" });
       const b = createTask({ projectId: "proj-1", title: "B", description: "" });
-      // createTask assigns decreasing positions; b should be lower than a
-      const next = nextBacklogTaskByPosition("proj-1");
-      expect(next).toBeDefined();
-      expect(next!.position).toBeLessThanOrEqual(a!.position);
-      expect([a!.id, b!.id]).toContain(next!.id);
+      seedProject("proj-2");
+      const otherProjectTask = createTask({ projectId: "proj-2", title: "Other", description: "" });
+      const c = createTask({ projectId: "proj-1", title: "C", description: "" });
+
+      expect([a, b, c].map((task) => task?.position)).toEqual([1100, 1200, 1300]);
+      expect(otherProjectTask?.position).toBe(1100);
+      expect(nextBacklogTaskByPosition("proj-1")?.id).toBe(a?.id);
     });
 
     it("createTask honors an explicit position override for batch import callers", () => {
@@ -1233,6 +1706,59 @@ describe("data layer", () => {
       const ready = createTask({ projectId: "proj-1", title: "Ready", description: "" });
       const next = nextBacklogTaskByPosition("proj-1");
       expect(next!.id).toBe(ready!.id);
+    });
+
+    it("nextBacklogTaskByPosition breaks position ties by createdAt", () => {
+      testDb.current
+        .insert(tasks)
+        .values([
+          {
+            id: "later-created",
+            projectId: "proj-1",
+            title: "Later",
+            status: "backlog",
+            position: 100,
+            createdAt: "2026-06-23T00:00:02.000Z",
+          },
+          {
+            id: "earlier-created",
+            projectId: "proj-1",
+            title: "Earlier",
+            status: "backlog",
+            position: 100,
+            createdAt: "2026-06-23T00:00:01.000Z",
+          },
+        ])
+        .run();
+
+      expect(nextBacklogTaskByPosition("proj-1")?.id).toBe("earlier-created");
+    });
+
+    it("nextBacklogTaskByPosition breaks identical position and createdAt ties by id", () => {
+      const createdAt = "2026-06-23T00:00:01.000Z";
+      testDb.current
+        .insert(tasks)
+        .values([
+          {
+            id: "task-b",
+            projectId: "proj-1",
+            title: "Task B",
+            status: "backlog",
+            position: 100,
+            createdAt,
+          },
+          {
+            id: "task-a",
+            projectId: "proj-1",
+            title: "Task A",
+            status: "backlog",
+            position: 100,
+            createdAt,
+          },
+        ])
+        .run();
+
+      expect(nextBacklogTaskByPosition("proj-1")?.id).toBe("task-a");
     });
 
     it("countActivePipelineTasksForProject counts non-terminal pipeline statuses", () => {

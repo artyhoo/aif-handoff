@@ -21,6 +21,10 @@ ENV HTTP_PROXY=${HTTP_PROXY} \
 COPY .docker/apt-install.sh /usr/local/bin/apt-install
 RUN chmod +x /usr/local/bin/apt-install
 
+FROM base AS codex
+ARG CODEX_VERSION=0.145.0
+RUN npm install --prefix /opt/codex --ignore-scripts --no-save --package-lock=false "@openai/codex-sdk@${CODEX_VERSION}"
+
 # ---- Dependencies ----
 FROM base AS deps
 COPY package.json package-lock.json turbo.json ./
@@ -42,19 +46,26 @@ RUN apt-install python3 build-essential ca-certificates
 RUN npm config set fetch-retries 5 \
     && npm config set fetch-retry-mintimeout 20000 \
     && npm config set fetch-retry-maxtimeout 120000 \
-    && npm ci --ignore-scripts \
-    && npm rebuild
+    && npm ci --ignore-scripts
+RUN rm -rf /app/node_modules/@openai /app/node_modules/.bin/codex
+COPY --from=codex /opt/codex/node_modules/@openai ./node_modules/@openai
+COPY --from=codex /opt/codex/node_modules/.bin/codex ./node_modules/.bin/codex
+RUN npm rebuild
 
 # ---- Build ----
 FROM deps AS build
 COPY . .
+RUN npm run codex:app-server:protocol:generate --workspace=@aif/runtime
 RUN npx turbo build
 
 # ---- API ----
 FROM base AS api
-ENV NODE_ENV=production HOME=/home/node
+ENV NODE_ENV=production \
+    HOME=/home/node \
+    CODEX_CLI_PATH=/app/node_modules/.bin/codex \
+    PATH=/app/node_modules/.bin:${PATH}
 RUN apt-install ca-certificates gosu git \
-    && npm i -g @anthropic-ai/claude-code @openai/codex
+    && npm i -g @anthropic-ai/claude-code
 COPY --chown=node:node --from=deps /app/node_modules ./node_modules
 COPY --chown=node:node --from=build /app/packages/shared ./packages/shared
 COPY --chown=node:node --from=build /app/packages/data ./packages/data
@@ -90,9 +101,18 @@ EXPOSE 80 443
 
 # ---- Agent ----
 FROM base AS agent
-ENV NODE_ENV=production HOME=/home/node
-RUN apt-install ca-certificates gosu git curl \
-    && npm i -g @anthropic-ai/claude-code @openai/codex
+ENV NODE_ENV=production \
+    HOME=/home/node \
+    CODEX_CLI_PATH=/app/node_modules/.bin/codex \
+    PATH=/app/node_modules/.bin:${PATH}
+# jq / python3 / gh back the consumer repo's edit-time and commit-time gates that run
+# inside this container: jq parses the hook stdin payload (nearly every PostToolUse hook
+# shells out to it), python3 backs the pre-commit JSON + YAML validity checks, and gh
+# backs spec validation. When absent, those gates do not fail — they SKIP, staying
+# registered while enforcing nothing, which reads as a pass in any settings audit.
+# Diagnosed 2026-07-23 by a parity audit run live inside this image.
+RUN apt-install ca-certificates gosu git curl jq python3 gh \
+    && npm i -g @anthropic-ai/claude-code
 COPY --chown=node:node --from=deps /app/node_modules ./node_modules
 COPY --chown=node:node --from=build /app/packages/shared ./packages/shared
 COPY --chown=node:node --from=build /app/packages/data ./packages/data
@@ -100,14 +120,25 @@ COPY --chown=node:node --from=build /app/packages/runtime ./packages/runtime
 COPY --chown=node:node --from=build /app/packages/agent ./packages/agent
 COPY --chown=node:node package.json .
 COPY --chown=node:node .docker/docker-entrypoint.sh /usr/local/bin/
-RUN install -d -o node -g node /app /data /home/www
+# /home/node/.npm is created ROOT-owned by the `npm i -g` above (that RUN executes as root
+# while HOME=/home/node). The agent process runs as `node` (uid 1000), so every later npx
+# invocation fails with EACCES on /home/node/.npm/_cacache/tmp — which is how a consumer's
+# commit-time gates break: `npx markdownlint-cli2` cannot spawn, pre-commit still reports
+# "markdownlint violations", and the rejection reason is npm cache permissions rather than
+# any real lint finding. Observed live 2026-07-23 by a parity audit run inside this image;
+# the agent had to work around it per-commit with npm_config_cache=/tmp/npmcache.
+RUN install -d -o node -g node /app /data /home/www \
+    && chown -R node:node /home/node/.npm
 EXPOSE 3010
 ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["npx", "tsx", "packages/agent/src/index.ts"]
 
 # ---- MCP ----
 FROM base AS mcp
-ENV NODE_ENV=production HOME=/home/node
+ENV NODE_ENV=production \
+    HOME=/home/node \
+    CODEX_CLI_PATH=/app/node_modules/.bin/codex \
+    PATH=/app/node_modules/.bin:${PATH}
 RUN apt-install ca-certificates gosu
 COPY --chown=node:node --from=deps /app/node_modules ./node_modules
 COPY --chown=node:node --from=build /app/packages/shared ./packages/shared

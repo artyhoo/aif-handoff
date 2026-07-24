@@ -26,6 +26,18 @@ describe("getProjectConfig", () => {
     expect(config.paths.plans).toBe(".ai-factory/plans/");
     expect(config.workflow.plan_id_format).toBe("slug");
     expect(config.workflow.verify_mode).toBe("normal");
+    expect(config.paths.qa).toBe(".ai-factory/qa/");
+  });
+
+  it("overrides paths.qa from config.yaml", () => {
+    writeFileSync(
+      join(projectRoot, ".ai-factory", "config.yaml"),
+      "paths:\n  qa: custom/qa-out/\n",
+    );
+    const config = getProjectConfig(projectRoot);
+    expect(config.paths.qa).toBe("custom/qa-out/");
+    // Non-overridden paths keep defaults
+    expect(config.paths.plan).toBe(".ai-factory/PLAN.md");
   });
 
   it("overrides paths from config.yaml", () => {

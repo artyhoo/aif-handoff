@@ -25,7 +25,7 @@ const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200 });
 vi.stubEnv("AIF_TASK_WORKTREES_ENABLED", "true");
 
 const { processAutoQueueAdvance, processDueScheduledTasks } = await import("../coordinator.js");
-const { findTaskById, setAutoQueueMode, updateTaskStatus, setTaskFields } =
+const { createTask, findTaskById, setAutoQueueMode, updateTaskStatus, setTaskFields } =
   await import("@aif/data");
 
 function seedProject(id: string, opts: { autoQueue?: boolean; parallel?: boolean } = {}) {
@@ -89,6 +89,26 @@ describe("processAutoQueueAdvance", () => {
       expect(advanced).toBe(1);
       expect(findTaskById("t1")?.status).toBe("planning");
       expect(findTaskById("t2")?.status).toBe("backlog");
+    });
+
+    it("advances ordinary created backlog tasks in FIFO order", () => {
+      const a = createTask({ projectId: "seq", title: "A", description: "" });
+      const b = createTask({ projectId: "seq", title: "B", description: "" });
+      const c = createTask({ projectId: "seq", title: "C", description: "" });
+
+      expect(processAutoQueueAdvance()).toBe(1);
+      expect(findTaskById(a!.id)?.status).toBe("planning");
+      expect(findTaskById(b!.id)?.status).toBe("backlog");
+      expect(findTaskById(c!.id)?.status).toBe("backlog");
+
+      updateTaskStatus(a!.id, "done");
+      expect(processAutoQueueAdvance()).toBe(1);
+      expect(findTaskById(b!.id)?.status).toBe("planning");
+      expect(findTaskById(c!.id)?.status).toBe("backlog");
+
+      updateTaskStatus(b!.id, "done");
+      expect(processAutoQueueAdvance()).toBe(1);
+      expect(findTaskById(c!.id)?.status).toBe("planning");
     });
 
     it("does NOT advance while a task is still planning/plan_ready/implementing/review", () => {
@@ -163,8 +183,8 @@ describe("processAutoQueueAdvance", () => {
   describe("parallel project (synergy with parallelEnabled = true)", () => {
     beforeEach(() => seedProject("par", { autoQueue: true, parallel: true }));
 
-    it("fills the pool up to COORDINATOR_MAX_CONCURRENT_TASKS in a single tick", () => {
-      // Default COORDINATOR_MAX_CONCURRENT_TASKS = 3
+    it("fills the pool up to the per-project concurrency cap in a single tick", () => {
+      // Default COORDINATOR_MAX_CONCURRENT_TASKS_PER_PROJECT = 3
       seedTask("t1", "par", 100);
       seedTask("t2", "par", 200);
       seedTask("t3", "par", 300);

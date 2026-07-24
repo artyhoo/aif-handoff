@@ -92,6 +92,7 @@ export async function buildSettingsOverview() {
       autoReviewStrategy: env.AGENT_AUTO_REVIEW_STRATEGY,
       usageLimitsEnabled: env.AIF_USAGE_LIMITS_ENABLED,
       warmupEnabled: env.AIF_WARMUP_ENABLED,
+      qaPipelineEnabled: env.AIF_QA_PIPELINE_ENABLED,
       runtimeReadiness: {
         availableRuntimeCount: registry.listRuntimes().length,
         runtimeProfileCount: runtimeProfiles.length,
@@ -114,6 +115,7 @@ export async function buildSettingsOverview() {
       autoReviewStrategy: env.AGENT_AUTO_REVIEW_STRATEGY,
       usageLimitsEnabled: env.AIF_USAGE_LIMITS_ENABLED,
       warmupEnabled: env.AIF_WARMUP_ENABLED,
+      qaPipelineEnabled: env.AIF_QA_PIPELINE_ENABLED,
       runtimeReadiness: {
         availableRuntimeCount: 0,
         runtimeProfileCount: allProfiles.length,

@@ -1,8 +1,9 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Hono } from "hono";
 import { mkdirSync, mkdtempSync, writeFileSync, rmSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { resetEnvCache } from "@aif/shared";
 
 // Create a temp dir to act as monorepo root and home
 const tempRoot = mkdtempSync(join(tmpdir(), "settings-test-"));
@@ -107,6 +108,7 @@ vi.mock("@aif/data", () => ({
   isRuntimeProfileEligibleForAppDefaults: (runtimeProfileId: string | null) =>
     runtimeProfileId == null || eligibleAppDefaultProfileIds.has(runtimeProfileId),
   createDbUsageSink: () => ({ record: vi.fn() }),
+  listRuntimeProfiles: () => [],
 }));
 
 vi.mock("node:os", async (importOriginal) => {
@@ -117,7 +119,7 @@ vi.mock("node:os", async (importOriginal) => {
   };
 });
 
-const { settingsRoutes } = await import("../routes/settings.js");
+const { settingsRoutes, buildSettingsOverview } = await import("../routes/settings.js");
 
 function createApp() {
   const app = new Hono();
@@ -512,5 +514,32 @@ describe("settings API — config routes", () => {
       const res = await app.request("/settings/mcp", { method: "DELETE" });
       expect(res.status).toBe(200);
     });
+  });
+});
+
+describe("settings overview — QA pipeline flag", () => {
+  const original = process.env.AIF_QA_PIPELINE_ENABLED;
+
+  afterEach(() => {
+    if (original === undefined) {
+      delete process.env.AIF_QA_PIPELINE_ENABLED;
+    } else {
+      process.env.AIF_QA_PIPELINE_ENABLED = original;
+    }
+    resetEnvCache();
+  });
+
+  it("reports qaPipelineEnabled: true when AIF_QA_PIPELINE_ENABLED is on", async () => {
+    process.env.AIF_QA_PIPELINE_ENABLED = "true";
+    resetEnvCache();
+    const overview = await buildSettingsOverview();
+    expect(overview.qaPipelineEnabled).toBe(true);
+  });
+
+  it("reports qaPipelineEnabled: false when AIF_QA_PIPELINE_ENABLED is off", async () => {
+    process.env.AIF_QA_PIPELINE_ENABLED = "false";
+    resetEnvCache();
+    const overview = await buildSettingsOverview();
+    expect(overview.qaPipelineEnabled).toBe(false);
   });
 });

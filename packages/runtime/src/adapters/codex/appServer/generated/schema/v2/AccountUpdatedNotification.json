@@ -42,6 +42,26 @@
           "description": "[UNSTABLE] FOR OPENAI INTERNAL USE ONLY - DO NOT USE.\n\nChatGPT auth tokens are supplied by an external host app and are only stored in memory. Token refresh must be handled by the external host app.",
           "type": "string",
           "enum": ["chatgptAuthTokens"]
+        },
+        {
+          "description": "Backend auth supplied as request headers.",
+          "type": "string",
+          "enum": ["headers"]
+        },
+        {
+          "description": "Programmatic Codex auth backed by a registered Agent Identity.",
+          "type": "string",
+          "enum": ["agentIdentity"]
+        },
+        {
+          "description": "Programmatic Codex auth backed by a personal access token.",
+          "type": "string",
+          "enum": ["personalAccessToken"]
+        },
+        {
+          "description": "Amazon Bedrock bearer token managed by Codex.",
+          "type": "string",
+          "enum": ["bedrockApiKey"]
         }
       ]
     },
@@ -52,6 +72,7 @@
         "go",
         "plus",
         "pro",
+        "prolite",
         "team",
         "self_serve_business_usage_based",
         "business",

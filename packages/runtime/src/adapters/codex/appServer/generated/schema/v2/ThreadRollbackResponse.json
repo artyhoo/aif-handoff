@@ -14,6 +14,10 @@
     }
   },
   "definitions": {
+    "AbsolutePathBuf": {
+      "description": "A path that is guaranteed to be absolute and normalized (though it is not guaranteed to be canonicalized or exist on the filesystem).\n\nIMPORTANT: When deserializing an `AbsolutePathBuf`, a base path must be set using [AbsolutePathBufGuard::new]. If no base path is set, the deserialization will fail unless the path being deserialized is already absolute.",
+      "type": "string"
+    },
     "AgentPath": {
       "type": "string"
     },
@@ -40,8 +44,10 @@
           "type": "string",
           "enum": [
             "contextWindowExceeded",
+            "sessionBudgetExceeded",
             "usageLimitExceeded",
             "serverOverloaded",
+            "cyberPolicy",
             "internalServerError",
             "unauthorized",
             "badRequest",
@@ -190,7 +196,7 @@
               "type": "string"
             },
             "path": {
-              "type": "string"
+              "$ref": "#/definitions/AbsolutePathBuf"
             },
             "type": {
               "type": "string",
@@ -295,6 +301,21 @@
             }
           },
           "title": "InputImageDynamicToolCallOutputContentItem"
+        },
+        {
+          "type": "object",
+          "required": ["audioUrl", "type"],
+          "properties": {
+            "audioUrl": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": ["inputAudio"],
+              "title": "InputAudioDynamicToolCallOutputContentItemType"
+            }
+          },
+          "title": "InputAudioDynamicToolCallOutputContentItem"
         }
       ]
     },
@@ -343,6 +364,34 @@
         }
       }
     },
+    "ImageDetail": {
+      "type": "string",
+      "enum": ["auto", "low", "high", "original"]
+    },
+    "LegacyAppPathString": {
+      "type": "string"
+    },
+    "McpToolCallAppContext": {
+      "type": "object",
+      "required": ["connectorId"],
+      "properties": {
+        "actionName": {
+          "type": ["string", "null"]
+        },
+        "appName": {
+          "type": ["string", "null"]
+        },
+        "connectorId": {
+          "type": "string"
+        },
+        "linkId": {
+          "type": ["string", "null"]
+        },
+        "resourceUri": {
+          "type": ["string", "null"]
+        }
+      }
+    },
     "McpToolCallError": {
       "type": "object",
       "required": ["message"],
@@ -356,6 +405,7 @@
       "type": "object",
       "required": ["content"],
       "properties": {
+        "_meta": true,
         "content": {
           "type": "array",
           "items": true
@@ -474,9 +524,9 @@
       ]
     },
     "ReasoningEffort": {
-      "description": "See https://platform.openai.com/docs/guides/reasoning?api-mode=responses#get-started-with-reasoning",
+      "description": "A non-empty reasoning effort value advertised by the model.",
       "type": "string",
-      "enum": ["none", "minimal", "low", "medium", "high", "xhigh"]
+      "minLength": 1
     },
     "SessionSource": {
       "oneOf": [
@@ -507,6 +557,10 @@
           "title": "SubAgentSessionSource"
         }
       ]
+    },
+    "SubAgentActivityKind": {
+      "type": "string",
+      "enum": ["started", "interacted", "interrupted"]
     },
     "SubAgentSource": {
       "oneOf": [
@@ -595,6 +649,7 @@
         "id",
         "modelProvider",
         "preview",
+        "sessionId",
         "source",
         "status",
         "turns",
@@ -609,6 +664,17 @@
           "description": "Optional role (agent_role) assigned to an AgentControl-spawned sub-agent.",
           "type": ["string", "null"]
         },
+        "threadSource": {
+          "description": "Optional analytics source classification for this thread.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ThreadSource"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "cliVersion": {
           "description": "Version of the CLI that created the thread.",
           "type": "string"
@@ -620,11 +686,24 @@
         },
         "cwd": {
           "description": "Working directory captured for the thread.",
-          "type": "string"
+          "allOf": [
+            {
+              "$ref": "#/definitions/AbsolutePathBuf"
+            }
+          ]
         },
         "ephemeral": {
           "description": "Whether the thread is ephemeral and should not be materialized on disk.",
           "type": "boolean"
+        },
+        "updatedAt": {
+          "description": "Unix timestamp (in seconds) when the thread was last updated.",
+          "type": "integer",
+          "format": "int64"
+        },
+        "forkedFromId": {
+          "description": "Source thread id when this thread was created by forking another thread.",
+          "type": ["string", "null"]
         },
         "gitInfo": {
           "description": "Optional Git metadata captured when the thread was created.",
@@ -637,7 +716,15 @@
             }
           ]
         },
+        "turns": {
+          "description": "Only populated on `thread/resume`, `thread/rollback`, `thread/fork`, and `thread/read` (when `includeTurns` is true) responses. For all other responses and notifications returning a Thread, the turns field will be an empty list.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Turn"
+          }
+        },
         "id": {
+          "description": "Identifier for this thread. Codex-generated thread IDs are UUIDv7.",
           "type": "string"
         },
         "modelProvider": {
@@ -648,12 +735,25 @@
           "description": "Optional user-facing thread title.",
           "type": ["string", "null"]
         },
+        "parentThreadId": {
+          "description": "The ID of the parent thread. This will only be set if this thread is a subagent.",
+          "type": ["string", "null"]
+        },
         "path": {
           "description": "[UNSTABLE] Path to the thread on disk.",
           "type": ["string", "null"]
         },
         "preview": {
           "description": "Usually the first user message in the thread, if available.",
+          "type": "string"
+        },
+        "recencyAt": {
+          "description": "Unix timestamp (in seconds) used for thread recency ordering.",
+          "type": ["integer", "null"],
+          "format": "int64"
+        },
+        "sessionId": {
+          "description": "Session id shared by threads that belong to the same session tree.",
           "type": "string"
         },
         "source": {
@@ -671,24 +771,20 @@
               "$ref": "#/definitions/ThreadStatus"
             }
           ]
-        },
-        "turns": {
-          "description": "Only populated on `thread/resume`, `thread/rollback`, `thread/fork`, and `thread/read` (when `includeTurns` is true) responses. For all other responses and notifications returning a Thread, the turns field will be an empty list.",
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/Turn"
-          }
-        },
-        "updatedAt": {
-          "description": "Unix timestamp (in seconds) when the thread was last updated.",
-          "type": "integer",
-          "format": "int64"
         }
       }
     },
     "ThreadActiveFlag": {
       "type": "string",
       "enum": ["waitingOnApproval", "waitingOnUserInput"]
+    },
+    "ThreadExtra": {
+      "description": "Extra app-server data for a thread.",
+      "type": "object"
+    },
+    "ThreadHistoryMode": {
+      "type": "string",
+      "enum": ["legacy", "paginated"]
     },
     "ThreadId": {
       "type": "string"
@@ -699,6 +795,9 @@
           "type": "object",
           "required": ["content", "id", "type"],
           "properties": {
+            "clientId": {
+              "type": ["string", "null"]
+            },
             "content": {
               "type": "array",
               "items": {
@@ -846,7 +945,11 @@
             },
             "cwd": {
               "description": "The command's working directory.",
-              "type": "string"
+              "allOf": [
+                {
+                  "$ref": "#/definitions/LegacyAppPathString"
+                }
+              ]
             },
             "durationMs": {
               "description": "The duration of the command execution in milliseconds.",
@@ -912,6 +1015,16 @@
           "type": "object",
           "required": ["arguments", "id", "server", "status", "tool", "type"],
           "properties": {
+            "appContext": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/McpToolCallAppContext"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "arguments": true,
             "durationMs": {
               "description": "The duration of the MCP tool call in milliseconds.",
@@ -930,6 +1043,13 @@
             },
             "id": {
               "type": "string"
+            },
+            "mcpAppResourceUri": {
+              "description": "Deprecated: use `appContext.resourceUri` instead.",
+              "type": ["string", "null"]
+            },
+            "pluginId": {
+              "type": ["string", "null"]
             },
             "result": {
               "anyOf": [
@@ -976,6 +1096,9 @@
             },
             "id": {
               "type": "string"
+            },
+            "namespace": {
+              "type": ["string", "null"]
             },
             "status": {
               "$ref": "#/definitions/DynamicToolCallStatus"
@@ -1073,6 +1196,30 @@
         },
         {
           "type": "object",
+          "required": ["agentPath", "agentThreadId", "id", "kind", "type"],
+          "properties": {
+            "agentPath": {
+              "type": "string"
+            },
+            "agentThreadId": {
+              "type": "string"
+            },
+            "id": {
+              "type": "string"
+            },
+            "kind": {
+              "$ref": "#/definitions/SubAgentActivityKind"
+            },
+            "type": {
+              "type": "string",
+              "enum": ["subAgentActivity"],
+              "title": "SubAgentActivityThreadItemType"
+            }
+          },
+          "title": "SubAgentActivityThreadItem"
+        },
+        {
+          "type": "object",
           "required": ["id", "query", "type"],
           "properties": {
             "action": {
@@ -1091,6 +1238,12 @@
             "query": {
               "type": "string"
             },
+            "results": {
+              "description": "Structured search results returned out-of-band by standalone web search.\n\nThese stay as opaque JSON at the extension/app-server boundary so new result fields and result types can pass through without a Codex release.",
+              "default": null,
+              "type": ["array", "null"],
+              "items": true
+            },
             "type": {
               "type": "string",
               "enum": ["webSearch"],
@@ -1107,7 +1260,7 @@
               "type": "string"
             },
             "path": {
-              "type": "string"
+              "$ref": "#/definitions/LegacyAppPathString"
             },
             "type": {
               "type": "string",
@@ -1116,6 +1269,27 @@
             }
           },
           "title": "ImageViewThreadItem"
+        },
+        {
+          "description": "Display item emitted by the interruptible `clock.sleep` tool.",
+          "type": "object",
+          "required": ["durationMs", "id", "type"],
+          "properties": {
+            "durationMs": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": ["sleep"],
+              "title": "SleepThreadItemType"
+            }
+          },
+          "title": "SleepThreadItem"
         },
         {
           "type": "object",
@@ -1131,7 +1305,14 @@
               "type": ["string", "null"]
             },
             "savedPath": {
-              "type": ["string", "null"]
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/AbsolutePathBuf"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "status": {
               "type": "string"
@@ -1197,6 +1378,9 @@
         }
       ]
     },
+    "ThreadSource": {
+      "type": "string"
+    },
     "ThreadStatus": {
       "oneOf": [
         {
@@ -1259,6 +1443,16 @@
       "type": "object",
       "required": ["id", "items", "status"],
       "properties": {
+        "completedAt": {
+          "description": "Unix timestamp (in seconds) when the turn completed.",
+          "type": ["integer", "null"],
+          "format": "int64"
+        },
+        "durationMs": {
+          "description": "Duration between turn start and completion in milliseconds, if known.",
+          "type": ["integer", "null"],
+          "format": "int64"
+        },
         "error": {
           "description": "Only populated when the Turn's status is failed.",
           "anyOf": [
@@ -1271,14 +1465,29 @@
           ]
         },
         "id": {
+          "description": "Identifier for this turn. Codex-generated turn IDs are UUIDv7.",
           "type": "string"
         },
         "items": {
-          "description": "Only populated on a `thread/resume` or `thread/fork` response. For all other responses and notifications returning a Turn, the items field will be an empty list.",
+          "description": "Thread items currently included in this turn payload.",
           "type": "array",
           "items": {
             "$ref": "#/definitions/ThreadItem"
           }
+        },
+        "itemsView": {
+          "description": "Describes how much of `items` has been loaded for this turn.",
+          "default": "full",
+          "allOf": [
+            {
+              "$ref": "#/definitions/TurnItemsView"
+            }
+          ]
+        },
+        "startedAt": {
+          "description": "Unix timestamp (in seconds) when the turn started.",
+          "type": ["integer", "null"],
+          "format": "int64"
         },
         "status": {
           "$ref": "#/definitions/TurnStatus"
@@ -1307,6 +1516,25 @@
           "type": "string"
         }
       }
+    },
+    "TurnItemsView": {
+      "oneOf": [
+        {
+          "description": "`items` was not loaded for this turn. The field is intentionally empty.",
+          "type": "string",
+          "enum": ["notLoaded"]
+        },
+        {
+          "description": "`items` contains only a display summary for this turn.",
+          "type": "string",
+          "enum": ["summary"]
+        },
+        {
+          "description": "`items` contains every ThreadItem available from persisted app-server history for this turn.",
+          "type": "string",
+          "enum": ["full"]
+        }
+      ]
     },
     "TurnStatus": {
       "type": "string",
@@ -1341,6 +1569,17 @@
           "type": "object",
           "required": ["type", "url"],
           "properties": {
+            "detail": {
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ImageDetail"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "type": {
               "type": "string",
               "enum": ["image"],
@@ -1356,6 +1595,17 @@
           "type": "object",
           "required": ["path", "type"],
           "properties": {
+            "detail": {
+              "default": null,
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/ImageDetail"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "path": {
               "type": "string"
             },
@@ -1366,6 +1616,36 @@
             }
           },
           "title": "LocalImageUserInput"
+        },
+        {
+          "type": "object",
+          "required": ["type", "url"],
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": ["audio"],
+              "title": "AudioUserInputType"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "title": "AudioUserInput"
+        },
+        {
+          "type": "object",
+          "required": ["path", "type"],
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": ["localAudio"],
+              "title": "LocalAudioUserInputType"
+            }
+          },
+          "title": "LocalAudioUserInput"
         },
         {
           "type": "object",

@@ -28,7 +28,8 @@ const {
   buildTaskTags,
   RoadmapGenerationError,
 } = await import("../services/roadmapGeneration.js");
-const { findTasksByRoadmapAlias, nextBacklogTaskByPosition } = await import("@aif/data");
+const { createTask, findTasksByRoadmapAlias, nextBacklogTaskByPosition } =
+  await import("@aif/data");
 
 function createProjectWithRoadmap(roadmapContent: string) {
   const tmpDir = mkdtempSync(join(tmpdir(), "roadmap-test-"));
@@ -419,6 +420,38 @@ describe("roadmapGeneration", () => {
         "Phase 1 tie B",
         "Phase 5",
       ]);
+      expect(nextBacklogTaskByPosition(projectId)?.title).toBe("Phase 1 first");
+    });
+
+    it("should keep roadmap imports ahead of ordinary backlog tasks via explicit positions", () => {
+      const { projectId } = createProjectWithRoadmap("# Roadmap");
+      const ordinary = createTask({
+        projectId,
+        title: "Ordinary backlog task",
+        description: "",
+      });
+
+      const result = importGeneratedTasks(projectId, {
+        alias: "v1",
+        tasks: [
+          { title: "Phase 2 later", description: "", phase: 2, phaseName: "Later", sequence: 1 },
+          {
+            title: "Phase 1 first",
+            description: "",
+            phase: 1,
+            phaseName: "Earlier",
+            sequence: 1,
+          },
+        ],
+      });
+
+      expect(result.created).toBe(2);
+
+      const imported = findTasksByRoadmapAlias(projectId, "v1").sort(
+        (a, b) => a.position - b.position,
+      );
+      expect(imported.map((task) => task.title)).toEqual(["Phase 1 first", "Phase 2 later"]);
+      expect(imported.at(-1)!.position).toBeLessThan(ordinary!.position);
       expect(nextBacklogTaskByPosition(projectId)?.title).toBe("Phase 1 first");
     });
 
