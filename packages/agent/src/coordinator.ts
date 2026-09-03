@@ -5,7 +5,9 @@ import {
   evaluateRuntimeLimitGate,
   findCoordinatorTaskCandidatesForProject,
   listCoordinatorActionableProjectIds,
+  findTaskById,
   findProjectById,
+  handoffTaskExecution,
   hasActiveLockedTaskForProject,
   claimCoordinatorTaskIfEligible,
   releaseTaskClaim,
@@ -17,15 +19,25 @@ import {
   nextBacklogTaskByPosition,
   countActivePipelineTasksForProject,
   hasActiveBranchBoundTasksForProject,
+  hasBlockingAutoQueueCommitForProject,
   claimBacklogTaskForAdvance,
   persistTaskRuntimeLimitSnapshot,
   resolveEffectiveRuntimeProfile,
+  setTaskFields,
   type CoordinatorStage,
+  type ProjectRow,
   type TaskFieldsPatch,
   type TaskRow,
 } from "@aif/data";
 import { initProject, type RuntimeRegistry } from "@aif/runtime";
-import { logger, getEnv, CLEAN_STATE_RESET, withTimeout, type TaskStatus } from "@aif/shared";
+import {
+  logger,
+  getEnv,
+  CLEAN_STATE_RESET,
+  getHeadCommitSha,
+  withTimeout,
+  type TaskStatus,
+} from "@aif/shared";
 import { runPlanner } from "./subagents/planner.js";
 import { runImprover } from "./subagents/improver.js";
 import { runPlanChecker } from "./subagents/planChecker.js";
@@ -48,6 +60,8 @@ import { handleAutoReviewGate } from "./autoReviewHandler.js";
 import { classifyStageError } from "./stageErrorHandler.js";
 import { setActiveStageAbortController } from "./stageAbort.js";
 import { setCoordinatorId } from "./subagentQuery.js";
+import { ensureAutoQueueTaskCommit } from "./autoQueueCommit.js";
+import { publishGitHubTask, synchronizeGitHubProjects } from "./githubWorkflow.js";
 import {
   getRandomBackoffMinutes,
   releaseDueBlockedTasks,
@@ -56,6 +70,7 @@ import {
 
 const log = logger("coordinator");
 const env = getEnv();
+const AUTO_QUEUE_COMMIT_GATE_ENABLED = env.AIF_AGENT_AUTO_QUEUE_COMMIT_GATE_ENABLED;
 const STAGE_RUN_TIMEOUT_MS = Math.max(env.AGENT_STAGE_RUN_TIMEOUT_MS, 60_000);
 const CLAIM_LOCK_DURATION_MS = STAGE_RUN_TIMEOUT_MS + 5 * 60 * 1000; // stage timeout + 5 min buffer
 export const COORDINATOR_ID = crypto.randomUUID();
@@ -261,10 +276,69 @@ function updateTaskStatus(
   extra: Omit<TaskFieldsPatch, "status" | "lastHeartbeatAt" | "updatedAt"> = {},
   info: TaskNotificationInfo = {},
 ): void {
-  updateTaskStatusRow(taskId, status, extra);
+  updateTaskStatusRow(taskId, status, extra, {
+    kind: "agent",
+    id: "coordinator",
+    displayNameSnapshot: "Coordinator",
+  });
   const broadcastType =
     info.fromStatus && info.fromStatus === status ? "task:updated" : "task:moved";
   void notifyTaskBroadcast(taskId, broadcastType, { ...info, toStatus: status });
+}
+
+async function ensureCommitBeforeTerminalStatus(task: TaskRow, projectRoot: string): Promise<void> {
+  if (!AUTO_QUEUE_COMMIT_GATE_ENABLED) {
+    return;
+  }
+  try {
+    await ensureAutoQueueTaskCommit({ taskId: task.id, projectRoot });
+  } finally {
+    flushActivityQueue(task.id);
+  }
+}
+
+function resolveAutoQueueCommitPreparation(
+  projectRoot: string,
+): { status: "pending"; baseSha: string | null } | { status: "not_applicable"; baseSha: null } {
+  return isGitRepo(projectRoot)
+    ? { status: "pending", baseSha: getHeadCommitSha(projectRoot) }
+    : { status: "not_applicable", baseSha: null };
+}
+
+function projectRequiresSerialExecution(project: ProjectRow): boolean {
+  const hasSharedBranchTask = hasActiveBranchBoundTasksForProject(project.id);
+  const taskWorktreesUnavailable =
+    !env.AIF_TASK_WORKTREES_ENABLED || !projectSupportsTaskWorktrees(project.rootPath);
+  const usesSharedBranchIsolation =
+    projectUsesSharedBranchIsolation(project.rootPath) && taskWorktreesUnavailable;
+  const usesAutoQueueSharedGitWorktree =
+    AUTO_QUEUE_COMMIT_GATE_ENABLED &&
+    project.autoQueueMode &&
+    isGitRepo(project.rootPath) &&
+    taskWorktreesUnavailable;
+
+  return hasSharedBranchTask || usesSharedBranchIsolation || usesAutoQueueSharedGitWorktree;
+}
+
+function scheduledTaskHasDirtyAutoQueueWorktree(
+  task: TaskRow,
+  project: ProjectRow | null | undefined,
+): boolean {
+  if (!AUTO_QUEUE_COMMIT_GATE_ENABLED || !project?.autoQueueMode) {
+    return false;
+  }
+
+  const projectRoot = task.worktreePath ?? project.rootPath;
+  const dirtyPreview = isGitRepo(projectRoot) ? describeDirtyWorkingTree(projectRoot) : null;
+  if (!dirtyPreview) {
+    return false;
+  }
+
+  log.warn(
+    { taskId: task.id, projectId: task.projectId, projectRoot, dirtyPreview },
+    "Scheduled auto-queue task deferred because its Git worktree is dirty",
+  );
+  return true;
 }
 
 function runtimeProfileModeForStage(stage: CoordinatorStage): "task" | "plan" | "review" {
@@ -445,6 +519,13 @@ function blockCandidateIfRuntimeLimited(task: TaskRow, stage: StatusTransition):
 
 /** Returns true on success, false on failure. */
 async function processOneTask(task: TaskRow, stage: StatusTransition): Promise<boolean> {
+  if (task.executionOwner !== "ai") {
+    log.warn(
+      { taskId: task.id, stage: stage.label, executionOwner: task.executionOwner },
+      "Skipped runtime execution because task is not AI-owned",
+    );
+    return false;
+  }
   const project = findProjectById(task.projectId);
 
   if (!project) {
@@ -494,14 +575,34 @@ async function processOneTask(task: TaskRow, stage: StatusTransition): Promise<b
 
   try {
     const executionRoot = task.worktreePath ?? project.rootPath;
+    const executionBoundaryTask = findTaskById(task.id);
+    if (!executionBoundaryTask || executionBoundaryTask.executionOwner !== "ai") {
+      log.warn(
+        {
+          taskId: task.id,
+          stage: stage.label,
+          executionOwner: executionBoundaryTask?.executionOwner ?? null,
+        },
+        "Aborted runtime execution at ownership boundary",
+      );
+      return false;
+    }
     await runStageWithTimeout(stage.runner, task.id, executionRoot, stage.label);
 
     flushActivityQueue(task.id);
+
+    if (stage.label === "implementer") {
+      await publishGitHubTask(task.id, project.rootPath);
+      flushActivityQueue(task.id);
+    }
 
     if (stage.label === "implementer" && task.skipReview) {
       clearTaskActiveRuntimeSelection(task.id);
       clearTaskRuntimeLimitSnapshot(task.id);
       const doneStatus = shouldRunSkillsModeVerify(task) ? "verify" : "done";
+      if (doneStatus === "done") {
+        await ensureCommitBeforeTerminalStatus(task, project.rootPath);
+      }
       updateTaskStatus(task.id, doneStatus, CLEAN_STATE_RESET, {
         title: taskTitle,
         fromStatus: stage.inProgress,
@@ -520,33 +621,56 @@ async function processOneTask(task: TaskRow, stage: StatusTransition): Promise<b
         taskId: task.id,
         projectRoot: task.worktreePath ?? project.rootPath,
       });
+      await publishGitHubTask(task.id, project.rootPath);
+      flushActivityQueue(task.id);
 
       if (outcome?.status === "manual_review_required") {
         clearTaskActiveRuntimeSelection(task.id);
         clearTaskRuntimeLimitSnapshot(task.id);
-        updateTaskStatus(
-          task.id,
-          "done",
-          {
-            blockedReason: null,
-            blockedFromStatus: null,
-            retryAfter: null,
-            retryCount: 0,
-            reworkRequested: false,
-            reviewIterationCount: outcome.currentIteration,
-            manualReviewRequired: true,
-            autoReviewState: outcome.autoReviewState,
+        const currentTask = findTaskById(task.id);
+        if (!currentTask) return false;
+        const handoff = handoffTaskExecution({
+          taskId: task.id,
+          executionOwner: "human",
+          expectedOwnershipRevision: currentTask.ownershipRevision,
+          expectedExecutionOwner: "ai",
+          expectedStatus: currentTask.status,
+          actor: {
+            kind: "system",
+            id: "auto-review-gate",
+            displayNameSnapshot: "Auto Review Gate",
           },
-          {
-            title: taskTitle,
-            fromStatus: stage.inProgress,
-          },
-        );
+          reason: outcome.handoffReason,
+          allowLockedBy: COORDINATOR_ID,
+        });
+        if (!handoff.ok) {
+          log.error(
+            { taskId: task.id, code: handoff.code, handoffReason: outcome.handoffReason },
+            "Auto review manual handoff failed",
+          );
+          return false;
+        }
+        setTaskFields(task.id, {
+          blockedReason: null,
+          blockedFromStatus: null,
+          retryAfter: null,
+          retryCount: 0,
+          reworkRequested: false,
+          reviewIterationCount: outcome.currentIteration,
+          manualReviewRequired: true,
+          autoReviewState: outcome.autoReviewState,
+        });
+        void notifyTaskBroadcast(task.id, "task:updated", {
+          title: taskTitle,
+          fromStatus: stage.inProgress,
+          toStatus: stage.inProgress,
+        });
         log.info(
           {
             taskId: task.id,
             from: stage.inProgress,
-            to: "done",
+            to: stage.inProgress,
+            executionOwner: "human",
             reviewIteration: outcome.currentIteration,
             handoffReason: outcome.handoffReason,
           },
@@ -570,6 +694,11 @@ async function processOneTask(task: TaskRow, stage: StatusTransition): Promise<b
             reviewIterationCount: outcome.currentIteration,
             manualReviewRequired: false,
             autoReviewState: outcome.autoReviewState,
+            autoQueueCommitStatus: "pending",
+            autoQueueCommitBaseSha: findTaskById(task.id)?.commitSha ?? null,
+            commitSha: null,
+            autoQueueCommitError: null,
+            autoQueueCommitCompletedAt: null,
           },
           { title: taskTitle, fromStatus: stage.inProgress },
         );
@@ -586,6 +715,7 @@ async function processOneTask(task: TaskRow, stage: StatusTransition): Promise<b
       }
 
       if (outcome?.status === "accepted") {
+        await ensureCommitBeforeTerminalStatus(task, project.rootPath);
         clearTaskActiveRuntimeSelection(task.id);
         clearTaskRuntimeLimitSnapshot(task.id);
         updateTaskStatus(task.id, "done", CLEAN_STATE_RESET, {
@@ -601,6 +731,9 @@ async function processOneTask(task: TaskRow, stage: StatusTransition): Promise<b
     }
 
     const successStatus = getStageSuccessStatus(task, stage);
+    if (successStatus === "done" || successStatus === "verified") {
+      await ensureCommitBeforeTerminalStatus(task, project.rootPath);
+    }
     clearTaskActiveRuntimeSelection(task.id);
     clearTaskRuntimeLimitSnapshot(task.id);
     updateTaskStatus(
@@ -709,10 +842,18 @@ export function processDueScheduledTasks(): number {
   let fired = 0;
   for (const task of due) {
     try {
+      const project = findProjectById(task.projectId);
+      if (scheduledTaskHasDirtyAutoQueueWorktree(task, project)) {
+        continue;
+      }
+      const autoQueueCommit =
+        AUTO_QUEUE_COMMIT_GATE_ENABLED && project?.autoQueueMode === true
+          ? resolveAutoQueueCommitPreparation(task.worktreePath ?? project.rootPath)
+          : undefined;
       // CAS-style claim: only proceed if the row is still backlog+unpaused
       // at the moment of the write. Prevents racing with auto-queue or with
       // a parallel coordinator instance.
-      if (!claimBacklogTaskForAdvance(task.id)) {
+      if (!claimBacklogTaskForAdvance(task.id, autoQueueCommit)) {
         log.debug({ taskId: task.id }, "Scheduler: task no longer backlog/unpaused, skipped");
         continue;
       }
@@ -781,18 +922,15 @@ export function processAutoQueueAdvance(): number {
     // switch HEAD in the shared root, so they force serial execution. Projects
     // that support task worktrees can keep the parallel pool open because the
     // planner provisions an isolated cwd before mutating files.
-    const usesSharedBranchIsolation =
-      (projectUsesSharedBranchIsolation(project.rootPath) &&
-        (!env.AIF_TASK_WORKTREES_ENABLED || !projectSupportsTaskWorktrees(project.rootPath))) ||
-      hasActiveBranchBoundTasksForProject(project.id);
-    if (project.parallelEnabled && usesSharedBranchIsolation) {
+    const requiresSerialExecution = projectRequiresSerialExecution(project);
+    if (project.parallelEnabled && requiresSerialExecution) {
       log.warn(
         { projectId: project.id, projectRoot: project.rootPath },
-        "Auto-queue parallel pool disabled while legacy branch-bound tasks without worktrees are active",
+        "Auto-queue parallel pool disabled while tasks share one Git working tree",
       );
     }
     const limit =
-      project.parallelEnabled && !usesSharedBranchIsolation
+      project.parallelEnabled && !requiresSerialExecution
         ? env.COORDINATOR_MAX_CONCURRENT_TASKS_PER_PROJECT
         : 1;
     let active = countActivePipelineTasksForProject(project.id);
@@ -801,6 +939,14 @@ export function processAutoQueueAdvance(): number {
       log.debug(
         { projectId: project.id, active, limit },
         "Auto-queue: project pipeline at capacity, skipping",
+      );
+      continue;
+    }
+
+    if (AUTO_QUEUE_COMMIT_GATE_ENABLED && hasBlockingAutoQueueCommitForProject(project.id)) {
+      log.warn(
+        { projectId: project.id },
+        "Auto-queue paused because a task has blocking commit state",
       );
       continue;
     }
@@ -843,7 +989,10 @@ export function processAutoQueueAdvance(): number {
         // CAS-style claim: only proceed if the row is still backlog+unpaused.
         // If false, another pass (scheduler / parallel coordinator / human
         // start_ai click) won the race — re-read pool counters and continue.
-        if (!claimBacklogTaskForAdvance(next.id)) {
+        const autoQueueCommit = AUTO_QUEUE_COMMIT_GATE_ENABLED
+          ? resolveAutoQueueCommitPreparation(next.worktreePath ?? project.rootPath)
+          : undefined;
+        if (!claimBacklogTaskForAdvance(next.id, autoQueueCommit)) {
           log.debug(
             { taskId: next.id, projectId: project.id },
             "Auto-queue: task no longer backlog/unpaused, skipped",
@@ -909,6 +1058,7 @@ async function runPollCycle(): Promise<void> {
   releaseDueBlockedTasks();
   recoverStaleInProgressTasks();
   processDueScheduledTasks();
+  await synchronizeGitHubProjects();
   processAutoQueueAdvance();
 
   const maxProjectLanes = env.COORDINATOR_MAX_CONCURRENT_PROJECTS;
@@ -927,22 +1077,18 @@ async function runPollCycle(): Promise<void> {
       const project = findProjectById(projectId);
       const configuredParallel = project?.parallelEnabled ?? false;
       // Mirror processAutoQueueAdvance: config OR task-state forces serial.
-      const usesSharedBranchIsolation = project
-        ? (projectUsesSharedBranchIsolation(project.rootPath) &&
-            (!env.AIF_TASK_WORKTREES_ENABLED || !projectSupportsTaskWorktrees(project.rootPath))) ||
-          hasActiveBranchBoundTasksForProject(projectId)
-        : false;
+      const requiresSerialExecution = project ? projectRequiresSerialExecution(project) : false;
       cached = {
-        parallel: configuredParallel && !usesSharedBranchIsolation,
+        parallel: configuredParallel && !requiresSerialExecution,
         max:
-          configuredParallel && !usesSharedBranchIsolation
+          configuredParallel && !requiresSerialExecution
             ? env.COORDINATOR_MAX_CONCURRENT_TASKS_PER_PROJECT
             : 1,
       };
-      if (configuredParallel && usesSharedBranchIsolation) {
+      if (configuredParallel && requiresSerialExecution) {
         log.warn(
           { projectId, projectRoot: project?.rootPath },
-          "Project parallel execution forced to serial while legacy branch-bound tasks without worktrees remain active",
+          "Project parallel execution forced to serial while tasks share one Git working tree",
         );
       }
       projectConcurrencyCache.set(projectId, cached);

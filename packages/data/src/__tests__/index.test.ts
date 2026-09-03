@@ -78,6 +78,7 @@ const {
   listAutoQueueProjects,
   countActivePipelineTasksForProject,
   hasActiveBranchBoundTasksForProject,
+  hasBlockingAutoQueueCommitForProject,
   claimBacklogTaskForAdvance,
   createChatSession,
   createRuntimeWarmupSession,
@@ -1538,7 +1539,7 @@ describe("data layer", () => {
 
     it("filters by status", () => {
       const t = createTask({ projectId: "proj-1", title: "Status test", description: "" });
-      setTaskFields(t!.id, { status: "planning" });
+      updateTaskStatus(t!.id, "planning");
       createTask({ projectId: "proj-1", title: "Backlog", description: "" });
       const result = listTasksPaginated({ status: "planning" });
       expect(result.total).toBe(1);
@@ -1663,6 +1664,49 @@ describe("data layer", () => {
       setAutoQueueMode("proj-2", true);
       const all = listAutoQueueProjects();
       expect(all.map((p) => p.id)).toEqual(["proj-2"]);
+    });
+
+    it("atomically records the commit baseline when auto-queue claims a task", () => {
+      const task = createTask({ projectId: "proj-1", title: "A", description: "" });
+
+      expect(
+        claimBacklogTaskForAdvance(task!.id, {
+          status: "pending",
+          baseSha: "a".repeat(40),
+        }),
+      ).toBe(true);
+
+      const claimed = findTaskById(task!.id);
+      expect(claimed?.status).toBe("planning");
+      expect(claimed?.autoQueueCommitStatus).toBe("pending");
+      expect(claimed?.autoQueueCommitBaseSha).toBe("a".repeat(40));
+      expect(claimed?.commitSha).toBeNull();
+    });
+
+    it("detects unresolved commit state on terminal auto-queue tasks", () => {
+      testDb.current
+        .insert(tasks)
+        .values({
+          id: "terminal-pending",
+          projectId: "proj-1",
+          title: "Pending commit",
+          status: "done",
+          autoQueueCommitStatus: "running",
+        })
+        .run();
+
+      expect(hasBlockingAutoQueueCommitForProject("proj-1")).toBe(true);
+
+      setTaskFields("terminal-pending", {
+        autoQueueCommitStatus: "committed",
+        commitSha: "b".repeat(40),
+      });
+      expect(hasBlockingAutoQueueCommitForProject("proj-1")).toBe(false);
+
+      updateTaskStatus("terminal-pending", "blocked_external", {
+        autoQueueCommitStatus: "failed",
+      });
+      expect(hasBlockingAutoQueueCommitForProject("proj-1")).toBe(true);
     });
 
     it("createTask appends default backlog positions per project and keeps auto-queue FIFO", () => {
