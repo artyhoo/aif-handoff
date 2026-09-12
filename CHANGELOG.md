@@ -48,6 +48,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ### Fixed
 
+- **Mid-cycle admission latency** — a backlog task on a parallel-enabled project with free slots now starts processing within one poll interval of becoming eligible, even while another project's lane is mid-pass; previously admission waited for the active poll cycle's longest lane to drain (multi-hour waits observed). Poll ticks / wake events during an active cycle now fire a single-flight admission pass (auto-queue advance + parallel-project lanes via the existing semaphore/CAS claim path). Sequential projects keep exact cycle-boundary semantics; all concurrency caps unchanged. Rollout flag: `AGENT_MID_CYCLE_ADMISSION_ENABLED` (default `true`; `false` restores cycle-boundary-only admission)
 - Sheet portal rendering and dialog overflow on small viewports
 - Auto-focus chat input on new session creation
 - Hide empty message bubble when response is only an action block
