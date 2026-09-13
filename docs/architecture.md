@@ -439,6 +439,15 @@ single-flight admission pass:
    one-task-at-a-time invariant stays owned by the serialized cycle, with no
    new lock-gap windows.
 
+The pass is single-flight, and it stays alive until the work it admitted
+drains — so a busy cycle sees at most one admission wave: triggers arriving
+while a pass is still running are covered only by the coalesced follow-up
+cycle, i.e. they wait for the cycle boundary as before. A project can also be
+served by a cycle lane and an admission lane at the same time; both hold
+permits under per-project-_stage_ keys, so its in-flight task count can exceed
+what one stage-sequential lane allowed, bounded by the per-stage allowance and
+`COORDINATOR_MAX_CONCURRENT_TASKS`.
+
 The pass does not extend the active cycle's promise, does not run the
 cycle-start recovery jobs (stale-claim release, watchdog, GitHub sync), and is
 bounded by `COORDINATOR_MAX_CONCURRENT_PROJECTS` exactly like a cycle-start

@@ -1339,10 +1339,16 @@ let midCycleAdmissionPromise: Promise<void> | null = null;
  *    owned by the cycle lanes, and a mid-cycle lane could otherwise claim a
  *    task in the brief lock gap between a sequential task's stages.
  *
- * Caps are unchanged: the lanes share `stageSemaphore` (per-project-stage and
- * global limits), the `[FIX:149]` revalidation, and the CAS claims with cycle
- * lanes. `COORDINATOR_MAX_CONCURRENT_PROJECTS` bounds this pass's lane batch
- * too, so the knob's per-batch contract holds for both callers.
+ * Cap semantics are unchanged: the lanes share `stageSemaphore` (per-project-
+ * stage and global limits), the `[FIX:149]` revalidation, and the CAS claims
+ * with cycle lanes. `COORDINATOR_MAX_CONCURRENT_PROJECTS` bounds this pass's
+ * lane batch too, so the knob's per-batch contract holds for both callers.
+ * Note what the per-stage key means once two lanes exist for one project: a
+ * cycle lane mid-`implementing` and an admission lane starting `planning` hold
+ * permits under different keys, so a parallel project's in-flight task count
+ * can exceed what one stage-sequential lane used to allow (measured: 2 tasks
+ * with `COORDINATOR_MAX_CONCURRENT_TASKS_PER_PROJECT=1`). The per-stage
+ * allowance and `COORDINATOR_MAX_CONCURRENT_TASKS` still bound it.
  */
 async function runMidCycleAdmissionPass(): Promise<void> {
   processAutoQueueAdvance();
