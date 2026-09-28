@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockFindTaskById = vi.fn();
 const mockCreateTaskComment = vi.fn();
@@ -14,6 +14,15 @@ vi.mock("../reviewGate.js", () => ({
   evaluateReviewCommentsForAutoMode: vi.fn(),
 }));
 
+vi.mock("@aif/shared", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@aif/shared")>();
+  return {
+    ...actual,
+    // Re-parse process env for each call so test-local vi.stubEnv overrides are visible.
+    getEnv: () => actual.validateEnv(process.env),
+  };
+});
+
 const { handleAutoReviewGate } = await import("../autoReviewHandler.js");
 const { evaluateReviewCommentsForAutoMode } = await import("../reviewGate.js");
 
@@ -22,6 +31,12 @@ describe("handleAutoReviewGate", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    // Pin the strategy so an ambient AGENT_AUTO_REVIEW_STRATEGY in the shell cannot leak in.
+    vi.stubEnv("AGENT_AUTO_REVIEW_STRATEGY", "full_re_review");
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
   });
 
   it("returns null when task is not in autoMode", async () => {
