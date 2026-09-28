@@ -4,7 +4,7 @@
 
 ## Overview
 
-AIF Handoff is a Turborepo monorepo with six packages. The system automates task management: a React Kanban UI lets users create tasks, the API and agent operate through a centralized data layer backed by SQLite, and runtime execution goes through `@aif/runtime` so orchestration is provider-neutral.
+AIF Handoff is a Turborepo monorepo with seven packages. The system automates task management: a React Kanban UI lets users create tasks, the API and agent operate through a centralized data layer backed by SQLite, and runtime execution goes through `@aif/runtime` so orchestration is provider-neutral.
 
 ```
 ┌─────────────┐     HTTP/WS      ┌─────────────┐
@@ -44,6 +44,7 @@ AIF Handoff is a Turborepo monorepo with six packages. The system automates task
 | `packages/api`     | `@aif/api`     | Hono REST + WebSocket server (port 3009)                      |
 | `packages/web`     | `@aif/web`     | React Kanban UI (port 5180)                                   |
 | `packages/agent`   | `@aif/agent`   | Coordinator + runtime-driven subagent orchestration           |
+| `packages/mcp`     | `@aif/mcp`     | MCP task read/write tools and HTTP/stdio transports           |
 
 ### Dependency Graph
 
@@ -55,6 +56,7 @@ runtime ← agent
 shared ← web (browser export only)
 data   ← api
 data   ← agent
+data   ← mcp
 ```
 
 No cross-dependencies between `api`, `web`, and `agent`. Runtime integration is:
@@ -133,6 +135,41 @@ Implementing ──[runPostVerify]──► Verify ──► Review
 | Implementing → Verify → Review / Done                                                            | `/aif-verify`                                                             | Optional skills-mode implementation verification against the plan before review. Enabled per task with `runPostVerify`; ignored when `useSubagents=true` |
 | Review → Done / Review → request_changes → Implementing / Review → Done + manual review required | `review-sidecar` + `security-sidecar` (+ auto review gate in coordinator) | Code review and security audit in parallel; in auto mode, structured blocking findings drive automatic rework until success or explicit manual handoff   |
 
+### GitHub Issue-to-PR Workflow
+
+The entire workflow is guarded by the off-by-default `AIF_GITHUB_ISSUE_PR_ENABLED` rollout
+flag. When disabled, the API, UI, planner, and coordinator preserve legacy behavior and make
+no GitHub calls or GitHub-specific Git mutations.
+
+One optional GitHub repository connection belongs to a project. The API periodically reads
+eligible issues and atomically maps `(project_id, issue_number)` to one full-mode task. Issue
+title, body, labels, assignees, milestone, comments, state, and source timestamps remain a
+refreshable snapshot; the task description is read-only in the UI.
+
+```text
+GitHub issue → sync/dedupe → task → isolated worktree/branch → commit + push
+      ↑                                                        │
+      └── changes requested ← same task/PR ← automated review ← PR publish/update
+                                                               │
+                                     human merge → Done → Verified
+```
+
+GitHub tasks always use a persisted per-task worktree when Git supports it, independent of
+the general parallel-worktree rollout flag. The agent never embeds a token in Git commands:
+push uses configured Git credentials, while PR operations go through the authenticated
+internal API. PR creation tolerates restart races by looking up the branch after GitHub's
+duplicate-validation response, and review comments are fingerprinted to avoid duplicates.
+
+`Done` is the terminal **PR ready for human decision** state in this mode. The coordinator
+never merges and the web UI does not offer local approve/request-change actions for these
+tasks. During first import, sync detects an open PR with a same-repository
+`Closes`/`Fixes`/`Resolves #<issue>` reference and atomically creates the linked task in
+`Done`; an existing changes-requested review sends it to `Implementing` instead. GitHub sync
+alone moves a merged PR to `Verified` or resumes the same task and branch at `Implementing`
+after a later changes-requested review. Authentication/access failures, rate limits, push
+failures, closed issues, closed unmerged PRs, and unavailable API services are surfaced or
+paused without creating a second task or PR.
+
 ### Reliability Guards
 
 The pipeline includes four reliability layers for long-running autonomous execution:
@@ -186,6 +223,54 @@ Auto-review strategy is controlled globally by `AGENT_AUTO_REVIEW_STRATEGY`:
 Tasks also have a `skipReview` flag (default `false`). When `true`, the coordinator bypasses the review stage entirely — after successful implementation the task moves directly to `done`, skipping the `review-sidecar` and `security-sidecar` runs. This is useful for small changes or tasks where code review is unnecessary.
 
 Skills-mode tasks (`useSubagents=false`) also have two opt-in flags. `runPlanImprove` inserts `/aif-improve` after the initial plan and before `plan_ready`. This is plan refinement: it may replace the stored plan only when the improver returns a complete plan-shaped update. `runPostVerify` inserts `/aif-verify` after implementation and before review. This is an execution validation gate: it stores verification output, passes through to review/done on pass or warn, and moves to `blocked_external` for a blocking gate result. Both flags default to `false` and are ignored for subagent tasks.
+
+### Participants, Ownership, and Manual Execution
+
+Participants Mode is an off-by-default policy layer around the existing state machine.
+The browser authenticates with an opaque local session cookie and session-derived CSRF
+token; the API attaches an immutable actor context and computes task permissions from the
+same resolver used to apply transitions. WebSocket upgrades use the same session and exact
+origin policy. HTTP MCP uses a separate bearer token and cannot mutate ownership.
+
+```text
+browser cookie + Origin + CSRF
+              │
+              ▼
+API auth/RBAC ──► @aif/data atomic mutation ──► audit + executor history
+              │                                  │
+              └──────── safe WS snapshots ◄──────┘
+```
+
+Every task has `executionOwner`, `ownershipRevision`, and zero or more assignment rows.
+`autoMode` remains a separate approval-gate setting. AI-owned tasks follow the legacy
+pipeline. Human-owned tasks are excluded at the shared data-query boundary from
+coordinator claims, scheduled execution, auto-queue, watchdog recovery, permit waiting,
+and runtime-budget consumption.
+
+| Human-owned status    | Assigned participant actions                                            |
+| --------------------- | ----------------------------------------------------------------------- |
+| `backlog`             | `start_human_work` → `planning`                                         |
+| `planning`, `improve` | `mark_plan_ready` → `plan_ready`                                        |
+| `plan_ready`          | `start_implementation` → `implementing`                                 |
+| `implementing`        | `submit_implementation` → `verify`, `review`, or `done` from task flags |
+| `review`              | `complete_review`, `request_review_changes`                             |
+| `verify`              | `pass_verification`, `fail_verification`                                |
+| `blocked_external`    | `retry_from_blocked`                                                    |
+| `done`                | `approve_done`, `request_changes`                                       |
+| `verified`            | terminal; no handoff or action                                          |
+
+Handoffs replace owner and assignments in one SQLite transaction. The request must match
+the expected ownership revision and may also assert the previous owner/status. A live AI
+lease, stale revision, inactive assignee, or invalid resume transition returns a structured
+conflict without partial writes. Human → AI at manual `plan_ready` requires
+`start_implementation`; at `blocked_external` it requires `retry_from_blocked`.
+Executor-history and audit rows snapshot titles, statuses, actors, assignee names/roles,
+and active flags so later account edits do not rewrite history.
+
+Ownership is execution policy, not filesystem isolation. A handoff waits for live leases,
+but operators must still avoid simultaneous edits to the same project root/worktree.
+
+### Skills-mode Flag Interactions
 
 Flag interaction table:
 
@@ -273,6 +358,11 @@ which makes ordinary backlog creation FIFO instead of LIFO.
   absolute path in `tasks.worktree_path`, and downstream stages run from that
   path. Legacy branch-bound tasks without `worktreePath` still force serial
   execution until they leave the pipeline.
+  When `AIF_AGENT_AUTO_QUEUE_COMMIT_GATE_ENABLED=true`, Git-backed auto-queue
+  projects that do not provide isolated task worktrees are also forced to pool
+  depth `1`, even when `parallelEnabled=true`, because task-scoped commits
+  cannot safely share one working directory. Non-auto-queue projects retain
+  their existing concurrency behavior.
 
 The advance step:
 
@@ -289,18 +379,44 @@ The advance step:
 4. The fill loop runs in a single tick so a parallel project can start its
    full pool without waiting for additional poll cycles.
 
+When `AIF_AGENT_AUTO_QUEUE_COMMIT_GATE_ENABLED=true`, the coordinator runs a
+synchronous commit gate in an auto-queued task's project root or isolated
+worktree before publishing the task as `done`:
+
+1. The backlog claim atomically stores the task's starting Git `HEAD` and marks
+   its commit state `pending`.
+2. A dirty worktree invokes the existing `/aif-commit` workflow with push
+   disabled. The coordinator then verifies that the worktree is clean, `HEAD`
+   changed, the expected branch is still checked out, and exactly one commit
+   was created by the commit run.
+3. A clean worktree is recorded as `no_changes`, unless `HEAD` already differs
+   from the stored baseline (for example, the implementer committed directly);
+   in that case the current SHA is recorded as `committed`.
+4. The verified SHA is stored in `tasks.commit_sha` before the status changes
+   to `done`. A commit failure moves the task to `blocked_external`, so it still
+   counts as in flight and the next backlog task cannot start.
+5. After a restart, a clean `HEAD` that differs from the stored baseline is
+   reconciled without creating a duplicate commit. Terminal tasks with an
+   unresolved commit state defensively pause project advancement.
+
+The flag defaults to `false`. In that state, terminal transitions and project
+concurrency follow the legacy path and no auto-queue commit state is prepared.
+
 Task worktrees are retained after `done` / `verified` so operators can inspect
-or commit follow-up changes. Handoff records the path but does not automatically
-remove the sibling worktree directory.
+follow-up changes. Handoff records the path but does not automatically remove
+the sibling worktree directory.
 
 Auto-queue and scheduled execution compose in the same poll cycle:
-`processDueScheduledTasks()` runs first and fires every backlog task whose
-`scheduledAt` is due, then `processAutoQueueAdvance()` runs and **tops up the
-remaining pool slots**. Order matters because once the scheduler advances a
-task, it counts as in-flight and reduces how many slots auto-queue still
-needs to fill. Both passes use the same atomic `claimBacklogTaskForAdvance`
-write so a row is moved out of `backlog` exactly once even when both passes
-target the same task in the same cycle.
+`processDueScheduledTasks()` runs first and fires every eligible backlog task
+whose `scheduledAt` is due, then `processAutoQueueAdvance()` runs and **tops up
+the remaining pool slots**. With the completion-commit flag enabled, a due
+auto-queue task remains scheduled/backlogged while its Git worktree is dirty,
+preventing unrelated pre-existing changes from entering the task's commit.
+Order matters because once the scheduler advances a task, it counts as
+in-flight and reduces how many slots auto-queue still needs to fill. Both
+passes use the same atomic `claimBacklogTaskForAdvance` write so a row is moved
+out of `backlog` exactly once even when both passes target the same task in the
+same cycle.
 
 ## Roadmap Import
 
@@ -382,6 +498,8 @@ SQLite via `better-sqlite3` with `drizzle-orm` for type-safe queries. Schema is 
 Key tables:
 
 - **tasks** — task data, status, plan/logs, heartbeat metadata, runtime override fields (`runtime_profile_id`, `model_override`, `runtime_options_json`), runtime session id (`session_id`), internal stage-scoped runtime retry pin (`active_runtime_status`, `active_runtime_selection_json`), auto-review convergence state (`manual_review_required`, `auto_review_state_json`), and task-level runtime-limit copy (`runtime_limit_snapshot_json`, `runtime_limit_updated_at`). The active runtime fields are distinct from `session_id` and `runtime_limit_snapshot_json`; they store the runtime/profile/model/options selected for same-status retries and are cleared on stage or human transitions except `retry_from_blocked`.
+- **github_repositories** — one non-secret repository connection and eligibility policy per project
+- **github_issues** — idempotent project/issue-to-task mapping plus PR, checks, and review state
 - **runtime_profiles** — project-scoped or global runtime/provider profiles with non-secret transport/model config plus authoritative runtime-limit state (`runtime_limit_snapshot_json`, `runtime_limit_updated_at`)
 - **projects** — project metadata plus default runtime profile ids for tasks and chat
 - **chat_sessions / chat_messages** — persisted chat state with runtime profile/session linkage

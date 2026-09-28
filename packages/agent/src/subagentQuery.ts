@@ -57,6 +57,26 @@ import { notifyProjectRuntimeLimitBroadcast } from "./notifier.js";
 
 const log = logger("subagent-query");
 
+export class AiHandoffRequiredError extends Error {
+  readonly code = "ai_handoff_required" as const;
+
+  constructor(taskId: string) {
+    super(`Task ${taskId} must be handed to AI before runtime execution`);
+    this.name = "AiHandoffRequiredError";
+  }
+}
+
+function assertAiExecutionOwner(taskId: string): void {
+  const task = findTaskById(taskId);
+  if (task?.executionOwner === "human") {
+    log.warn(
+      { taskId, executionOwner: task.executionOwner },
+      "Runtime execution rejected for human-owned task",
+    );
+    throw new AiHandoffRequiredError(taskId);
+  }
+}
+
 const HEARTBEAT_INTERVAL_MS = 30_000;
 
 const FIRST_ACTIVITY_TIMEOUT_ERROR = "first_activity_timeout";
@@ -367,6 +387,8 @@ export interface SubagentQueryOptions {
   includePartialMessages?: boolean;
   /** Optional max turns for runtime adapters that support it. */
   maxTurns?: number;
+  /** Usage accounting source. Coordinator stages default to SUBAGENT. */
+  usageSource?: UsageSource;
 }
 
 export interface SubagentQueryResult {
@@ -816,6 +838,7 @@ export async function executeSubagentQuery(
   options: SubagentQueryOptions,
 ): Promise<SubagentQueryResult> {
   const { taskId, projectRoot, agentName } = options;
+  assertAiExecutionOwner(taskId);
   const stderrCollector = createStderrCollector();
   const heartbeatTimer = startHeartbeat(taskId);
 
@@ -1070,13 +1093,14 @@ export async function executeSubagentQuery(
         options: context.options,
         execution: executionIntent,
         usageContext: {
-          source: UsageSource.SUBAGENT,
+          source: options.usageSource ?? UsageSource.SUBAGENT,
           projectId: projectIdForUsage,
           taskId,
         },
       } as const;
 
       try {
+        assertAiExecutionOwner(taskId);
         if (warmupSourceSessionId && adapter.forkSession) {
           result = await adapter.forkSession({
             ...runInput,
