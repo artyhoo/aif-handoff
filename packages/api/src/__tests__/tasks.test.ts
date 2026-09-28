@@ -2264,6 +2264,83 @@ describe("tasks API", () => {
       expect(res.status).toBe(409);
       expect(mockRunApiRuntimeOneShot).not.toHaveBeenCalled();
     });
+    it("closes a human-owned manual-review park with complete_review in legacy mode", async () => {
+      const db = testDb.current;
+      db.insert(tasks)
+        .values({
+          id: "ev-manual-review-park",
+          projectId: "test-project",
+          title: "Parked review",
+          status: "review",
+          executionOwner: "human",
+          manualReviewRequired: true,
+          reviewIterationCount: 4,
+          maxReviewIterations: 4,
+        })
+        .run();
+
+      const res = await app.request("/tasks/ev-manual-review-park/events", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ event: "complete_review" }),
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.status).toBe("done");
+      expect(body.manualReviewRequired).toBe(false);
+      expect(body.reviewIterationCount).toBe(0);
+      const row = db.select().from(tasks).where(eq(tasks.id, "ev-manual-review-park")).get();
+      expect(row?.status).toBe("done");
+      expect(row?.manualReviewRequired).toBe(false);
+    });
+
+    it("rejects complete_review for an ai-owned task in review", async () => {
+      const db = testDb.current;
+      db.insert(tasks)
+        .values({
+          id: "ev-ai-review",
+          projectId: "test-project",
+          title: "AI review in flight",
+          status: "review",
+          executionOwner: "ai",
+          manualReviewRequired: true,
+        })
+        .run();
+
+      const res = await app.request("/tasks/ev-ai-review/events", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ event: "complete_review" }),
+      });
+
+      expect(res.status).toBe(409);
+      const row = db.select().from(tasks).where(eq(tasks.id, "ev-ai-review")).get();
+      expect(row?.status).toBe("review");
+      expect(row?.manualReviewRequired).toBe(true);
+    });
+
+    it("rejects complete_review for a human-owned review that is not parked", async () => {
+      const db = testDb.current;
+      db.insert(tasks)
+        .values({
+          id: "ev-human-review-unparked",
+          projectId: "test-project",
+          title: "Human review not parked",
+          status: "review",
+          executionOwner: "human",
+          manualReviewRequired: false,
+        })
+        .run();
+
+      const res = await app.request("/tasks/ev-human-review-unparked/events", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ event: "complete_review" }),
+      });
+
+      expect(res.status).toBe(409);
+    });
   });
 
   describe("PATCH /tasks/:id/position", () => {
