@@ -386,4 +386,83 @@ describe("task state machine", () => {
       }),
     ).toMatchObject({ ok: true, patch: { status: "planning" } });
   });
+  describe("legacy-mode manual-review exit", () => {
+    const legacyContext = {
+      participantsModeEnabled: false,
+      actor: { kind: "anonymous" as const, id: null, displayNameSnapshot: null },
+    };
+    const parkedReview = {
+      ...makeTask("review"),
+      executionOwner: "human" as const,
+      manualReviewRequired: true,
+      reviewIterationCount: 4,
+    };
+
+    it("lets complete_review close a human-owned manual-review park to done", () => {
+      const result = resolveTaskAction(parkedReview, "complete_review", legacyContext);
+      expect(result).toMatchObject({
+        ok: true,
+        patch: { status: "done", manualReviewRequired: false, reviewIterationCount: 0 },
+      });
+    });
+
+    it("goes straight to done even when runPostVerify is set", () => {
+      const result = resolveTaskAction(
+        { ...parkedReview, runPostVerify: true },
+        "complete_review",
+        legacyContext,
+      );
+      expect(result).toMatchObject({ ok: true, patch: { status: "done" } });
+    });
+
+    it("lists complete_review in permitted actions for a parked review", () => {
+      expect(resolveTaskPermissions(parkedReview, legacyContext).permittedActions).toEqual([
+        "complete_review",
+      ]);
+    });
+
+    it("denies complete_review for an ai-owned task mid auto-review", () => {
+      const result = resolveTaskAction(
+        { ...parkedReview, executionOwner: "ai" as const },
+        "complete_review",
+        legacyContext,
+      );
+      expect(result).toMatchObject({ ok: false, code: "action_not_allowed" });
+      expect(
+        resolveTaskPermissions({ ...parkedReview, executionOwner: "ai" as const }, legacyContext)
+          .permittedActions,
+      ).toEqual([]);
+    });
+
+    it("denies complete_review for a human-owned review that is not parked", () => {
+      const result = resolveTaskAction(
+        { ...parkedReview, manualReviewRequired: false },
+        "complete_review",
+        legacyContext,
+      );
+      expect(result).toMatchObject({ ok: false, code: "action_not_allowed" });
+    });
+
+    it("denies complete_review outside review", () => {
+      const result = resolveTaskAction(
+        { ...parkedReview, status: "implementing" as const },
+        "complete_review",
+        legacyContext,
+      );
+      expect(result).toMatchObject({ ok: false, code: "action_not_allowed" });
+    });
+
+    it("denies an ai-owned parked review under participants mode too", () => {
+      const result = resolveTaskAction(
+        { ...parkedReview, executionOwner: "ai" as const },
+        "complete_review",
+        {
+          participantsModeEnabled: true,
+          actor: { kind: "participant", id: "admin-1", displayNameSnapshot: "Admin" },
+          participantRole: "admin",
+        },
+      );
+      expect(result).toMatchObject({ ok: false, code: "action_not_allowed" });
+    });
+  });
 });

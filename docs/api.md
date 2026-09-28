@@ -1116,6 +1116,7 @@ Transitions a task through the state machine.
 | ------------------ | -------------------------------------------------------- |
 | `backlog`          | `start_ai`, `accept_existing_plan`                       |
 | `plan_ready`       | `start_implementation`, `request_replanning`, `fast_fix` |
+| `review`           | `complete_review` (manual-review park only, see below)   |
 | `blocked_external` | `retry_from_blocked`                                     |
 | `done`             | `approve_done`, `request_changes`                        |
 
@@ -1144,6 +1145,7 @@ Additional constraints:
 - `request_changes` transitions `done -> implementing`, sets `reworkRequested=true`, and resets watchdog retry state (`retryCount=0`).
 - With `autoMode=true`, coordinator can trigger this same `request_changes`-style rework loop automatically after review if blocking findings are extracted from `reviewComments`.
 - If auto-review stops converging, the coordinator leaves the task in `done`, sets `manualReviewRequired=true`, and waits for a human `approve_done` or `request_changes` action.
+- With Participants Mode disabled, `complete_review` is accepted from `review` only for a task parked for manual review: `executionOwner=human` and `manualReviewRequired=true` (the auto review reached `maxReviewIterations`). It moves the task straight to `done` and clears `manualReviewRequired` and `reviewIterationCount`. AI-owned tasks in `review` are rejected with `409 action_not_allowed`, so an in-flight auto review can never be short-circuited. Use it when the work was already accepted elsewhere (for example merged); a handoff back to AI would only re-run the capped review loop.
 
 **Response:** `200 OK` — the updated task object.
 

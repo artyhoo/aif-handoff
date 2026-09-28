@@ -381,6 +381,7 @@ export async function handleTaskEvent(input: EventHandlerInput): Promise<EventHa
           blockedFromStatus: task.blockedFromStatus,
           skipReview: task.skipReview,
           runPostVerify: task.runPostVerify,
+          manualReviewRequired: task.manualReviewRequired,
         },
         input.event,
         {

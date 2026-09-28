@@ -325,6 +325,7 @@ export function applyTaskAction(input: ApplyTaskActionInput): TaskTransitionResu
           blockedFromStatus: task.blockedFromStatus,
           skipReview: task.skipReview,
           runPostVerify: task.runPostVerify,
+          manualReviewRequired: task.manualReviewRequired,
         },
         input.event,
         context,

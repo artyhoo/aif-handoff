@@ -48,6 +48,7 @@ export type TaskPolicyView = Pick<
   | "blockedFromStatus"
   | "skipReview"
   | "runPostVerify"
+  | "manualReviewRequired"
 >;
 
 /** Default reset values applied when transitioning out of blocked/retry states. */
@@ -68,7 +69,8 @@ function denied(code: TaskActionDeniedCode, error: string): TransitionResult {
 }
 
 function resolveLegacyAction(
-  task: Pick<TaskPolicyView, "status" | "autoMode" | "blockedFromStatus">,
+  task: Pick<TaskPolicyView, "status" | "autoMode" | "blockedFromStatus"> &
+    Partial<Pick<TaskPolicyView, "executionOwner" | "manualReviewRequired">>,
   event: TaskEvent,
 ): TransitionResult {
   switch (event) {
@@ -95,6 +97,19 @@ function resolveLegacyAction(
       return task.status === "plan_ready"
         ? { ok: true, patch: { ...CLEAN_STATE_RESET, status: "plan_ready" } }
         : denied("action_not_allowed", "fast_fix is only allowed from plan_ready");
+    case "complete_review":
+      // Narrow exit for a review parked for a human (auto review hit
+      // max_iterations and ownership moved to human). Handing it back to AI
+      // would only re-run the review loop, so the human closes it directly.
+      // AI-owned tasks mid auto-review never qualify.
+      return task.status === "review" &&
+        task.executionOwner === "human" &&
+        task.manualReviewRequired === true
+        ? { ok: true, patch: { ...CLEAN_STATE_RESET, status: "done" } }
+        : denied(
+            "action_not_allowed",
+            "complete_review is only allowed from review for a human-owned task awaiting manual review",
+          );
     case "approve_done":
       return task.status === "done"
         ? { ok: true, patch: { ...CLEAN_STATE_RESET, status: "verified" } }
