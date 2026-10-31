@@ -1,52 +1,66 @@
-# PC wake-on-work P2 — authenticated durable intake foundation (revised plan, R1–R5)
+# PC wake-on-work P2 — authenticated durable intake foundation (revised plan, R1–R5 + R2/M1–M5)
 
 - **Branch:** `feature/p2-wake-on-work-5d7f45`
-- **Created / revised:** 2026-10-31 / 2026-10-31 (REVISE feedback on plan SHA256 `43610764…433`)
-- **Task ID (AIF):** `5d7f458d-6fdb-41fb-a33e-720114a7033b`, project `ec817095-89ec-4959-a4c9-34327326df11` (aif-handoff)
-- **Baseline:** `002f93e7036e423c53ed4b2d6f4d43812c866b80` (re-verified this session: HEAD matches, tree clean except this plan; fork origin `artyhoo/aif-handoff`)
-- **Authoritative inputs:** execution brief (SHA256 `1615000f…92ae4`), handoff (`bd81ef00…6f17`), P1 owner-review (`e8b66179…dd55`) — all three re-verified against the task private input root this session. Host-signal snapshots (see §6) read and SHA-pinned after the direction owner's verified transfer.
+- **Created / revised:** 2026-10-31 / 2026-10-31 — round 2 REVISE (M1–M5 + notes); round 1 decisions R1–R5 retained where accepted
+- **Task/project identity:** recorded only in untracked private evidence (`.ai-factory/evidence/`), intentionally absent from this committed plan and its headers
+- **Baseline (implementation target):** `002f93e7036e423c53ed4b2d6f4d43812c866b80` (= observed fork main); branch HEAD at this replanning commit is a plan-only commit on top of it (fork origin `artyhoo/aif-handoff`)
+- **Authoritative inputs:** execution brief (SHA256 `1615000f…92ae4`), handoff (`bd81ef00…6f17`), P1 owner-review (`e8b66179…dd55`) — all three re-verified against the task private input root this session. R2 review cited line ranges that match this file's committed content exactly; the reviewed SHA-256 `7a7d849c…37f8` differs from the committed blob hash `6d80c0d7…9665` (serialization difference, unresolved; content mapping verified by the line citations). Host-signal snapshots (§8.1) remain SHA-pinned in private evidence.
 
 ## Settings
 
-- **Testing:** yes — Vitest, ≥70% coverage per touched package; paired negative/positive; crash/replay/handover tests; real SQLite files in tmpdir (no DB mocks for data-layer tests); distinct-connection contention case.
+- **Testing:** yes — Vitest, ≥70% coverage per touched package; paired negative/positive; crash/replay/handover tests; real SQLite files in tmpdir (no DB mocks for data-layer tests); distinct-connection and **distinct-process** contention cases.
 - **Docs:** yes — `docs/api.md`, `docs/architecture.md`, new `docs/workstation-intake.md`, relay README + parameterized deploy/host-hook templates (all sanitized; raw host values only in untracked private evidence).
-- **Stage gating:** plan stops at **plan_ready, `autoMode:false`**. Implementation starts only after a bound independent PlanReview returns GO. No implementation from an unreviewed plan or a successful model turn.
+- **Stage gating:** plan stops at **plan_ready, `autoMode:false`**. Implementation starts only after a bound independent PlanReview returns GO. No implementation from an unreviewed plan or a successful model turn. **This round is replanning only — no source implementation.**
 
-## Review reconciliation (R1–R5 → decisions in this plan)
+## Review reconciliation
+
+### Round 1 (R1–R5) — retained decisions (accepted by R2)
 
 | Finding | Resolution (section) |
 |---|---|
-| R1 transport/principal fiction | Named candidate transport = PC-initiated reverse forward over the existing bridge SSH boundary; existence of the PC-held forward-only credential is an owner wiring fact → **BLOCKED D1b**; source ships **fail-closed retain-only mode** (no delivery, no wake) until the endpoint is explicitly configured (§5). Bridge principal bound to operator-owned fingerprint map + sshd-provided key identity; project/action/payload scope checked **before retention/wake** (§4). Old ":22 session = sleep protection" claim removed. |
-| R2 accepted-attachment loss | Keyed path **rejects non-empty attachments at BOTH ends** before any acceptance/wake/write (API 422 `intake_attachments_unavailable` pre-write; bridge refusal pre-spool). Verified window: `packages/api/src/routes/tasks.ts:442-485` (create → persistAttachments → updateTask; also silently drops attachments when project lookup fails). Legacy no-intake behavior unchanged (§7.3). |
-| R3 fictional busy marker | Real snapshots read (SHAs pinned in §6): `wsl-report` is the **single writer** (readonly SQLite count via container exec; `aif_busy=?`/stack-down semantics; 2-min cadence), guard freshness 6 min, fail-awake on unknown/stale, `tunnel-passive.txt` is an **exclusion** marker, all-clear → 2 s → S3. Integration = **owner-reviewed amendments to the existing writer/guard** (BLOCKED D1c) + source-owned canonical pending predicate that closes ACK-before-start and timed-obligation races; no marker-file fiction, no second writer (§8). |
-| R4 cached dueAt not ownership | Relay-owned due timers **removed entirely**. Timed wake while asleep = **N/A-BLOCKED with evidence** (no qualified always-on wake source exists). Honest fallback per brief: canonical pending predicate keeps an awake PC awake for admitted timed obligations (fires/cancels derive from the live task row — reschedule/cancel/restart/timezone-safe by construction; overdue catch-up is the coordinator's existing `scheduledAt <= now` pickup, `packages/data/src/index.ts:2630-2647`) (§8.3). |
-| R5 unimplementable reconciliation/identity | No read endpoint invented (verified: no `requestId` route/query exists in api/data/shared). The **same keyed POST is both admission and reconciliation** — binding atomicity guarantees it and never restarts a terminal task (tested). 401/403/422 → retained **HOLD**, no retry/wake storms; network/unknown outcome → bounded retry of a **byte-identical** body. One collision-free identity bound: principal₁ ≤64 + client id ≤128, charset `[A-Za-z0-9._-]`, namespaced `pid:cid` ≤**193** enforced identically at bridge (pre-retention) and API (schema regex+max), column comment 193 (§7.4). |
-| Precision: spool durability | Receipt only after file fsync **and parent-directory fsync**; restart scan discards receipt-less temps, conservatively re-pending the rest (redelivery is idempotent); bounds refuse new work, never evict accepted work (§9.1). |
-| Precision: singleton | OS-managed: systemd unit (deployment) **plus** source-level loopback TCP port bind — second instance exits on `EADDRINUSE`. No PID/timestamp lockfile used as cessation proof (§9.2). |
-| Precision: contention | Real-file SQLite test with **two independent better-sqlite3 connections** (worker thread) racing the same dedup key → exactly one `created`; task/binding counts and identities asserted; broadcast spies assert no forbidden wake/write effects (§11.2). |
-| Precision: sanitization | This tracked plan is sanitized (no host paths/ports/identifiers); raw reconciliation (snapshot contents, decoded queries, npm-ci child evidence) lives in untracked private evidence, never committed (§3, §12). |
-| Precision: npm-ci child `bi2wt2dn3` | Reconciled first, before any write: recorded output ends `added 733 packages in 2m` (success, husky prepare ran); no npm/node process found running now (`ps` unavailable in container — checked via shell builtin listing; observation is limited to this container, not blanket host proof). Completed install reused; no new install needed for this replanning turn. |
+| R1 transport/principal fiction | Named candidate transport = PC-initiated reverse forward over the existing bridge SSH boundary; PC-held forward-only credential is an owner wiring fact → **BLOCKED D1b**; source ships **fail-closed retain-only mode** (no delivery, no wake) until the endpoint is explicitly configured (§5). Bridge principal = operator-owned fingerprint map + sshd-presented key identity; project/action/payload scope checked **before retention/wake** (§4). Old ":22 session = sleep protection" claim withdrawn. |
+| R2 accepted-attachment loss | Keyed path rejects non-empty attachments at BOTH ends before any acceptance/wake/write (API 422 `intake_attachments_unavailable` pre-write; bridge refusal pre-spool). Verified window `packages/api/src/routes/tasks.ts:442-485`. Legacy no-intake behavior unchanged (§7.3). |
+| R3 fictional busy marker | Real snapshots pinned (private evidence): `wsl-report` is the **single writer**, guard freshness 6 min, fail-awake on unknown/stale, `tunnel-passive.txt` is an exclusion marker. Integration = owner-reviewed amendments to the existing writer/guard (**BLOCKED D1c**) + source-owned canonical workload predicate; no marker-file fiction, no second writer (§8). |
+| R4 cached dueAt not ownership | Relay-owned due timers removed entirely. Timed wake while asleep = **N/A-BLOCKED with evidence** (D7). Inhibit-while-awake fallback derives from live task rows; overdue catch-up = coordinator's existing `scheduledAt <= now` pickup (§8.4). |
+| R5 unimplementable reconciliation/identity | Same keyed POST is both admission and reconciliation (verified: no `requestId` route/query exists in api/data/shared/agent source — re-grepped this session). 401/403/422 → retained HOLD; network/unknown → bounded retry of a byte-identical body. One collision-free identity bound `pid:cid` ≤193 enforced identically at bridge and API (§7.4). |
+| Precision: spool durability | Receipt only after file fsync **and parent-directory fsync**; restart scan discards receipt-less temps, conservatively re-pends the rest; bounds refuse new work, never evict accepted work (§9.1). |
+| Precision: singleton | OS-managed: systemd unit (deployment) plus source-level loopback TCP port bind — second instance exits on `EADDRINUSE`. No PID/timestamp lockfile used as cessation proof (§9.2). |
+
+### Round 2 (M1–M5 + notes) — resolutions in this revision
+
+| Finding | Resolution (section) |
+|---|---|
+| **M1** canonical row ≠ consumed awake signal / wake source | The claim "ACK-before-start gap closed canonically" is **withdrawn** — a pending row protects nothing while the host writer can be up to 2 min stale and the guard may consume an old all-clear. Replaced by an explicit **fenced handover contract**: the relay does NOT consider delivery complete at API ACK — envelopes stay `admitted` until **pickup evidence** (task observed left `backlog` / live lock / terminal via authenticated `GET /tasks/:id` poll, bounded), and outstanding `admitted`-unconfirmed work drives the deliver-mode wake loop (endpoint loss mid-handover ⇒ bounded WoL ⇒ forward re-establishes ⇒ re-check). Pickup-poll caps exhausted → truthful `hold_handover_unconfirmed`, never an infinite wake storm. Until D1b+D1c are applied, **automatic sleep with admitted-but-unpicked work is explicitly NOT qualified (BLOCKED)** and the host material defaults fail-awake. No general scheduler; source-only fixtures (§8.3). |
+| **M2** moving validation breaks stable retry / overdue admission | Verified in source: past-rejection inside `scheduledAtSchema` (`packages/api/src/schemas.ts:59-67`), env-injected defaults `useSubagents`/`maxReviewIterations` (`schemas.ts:166,170-175`), plus route-level moving inputs — project-config `planPath` default (`tasks.ts:407-410`), `parallelEnabled` forcing `plannerMode` (`tasks.ts:413-415`), mode-driven flag defaults (`tasks.ts:418-423`). Fix = **frozen client-content digest** (absent optional fields canonicalized to pinned sentinels, never env/route-resolved values; schema-normalized UTC-Z `scheduledAt` included) + **lookup-before-time/env-validation ordering**: auth → identity/attachments/structural (format-normalization only) → digest → binding lookup; a hit resolves the original task/tombstone **regardless of elapsed time or changed defaults**; a miss applies an explicit keyed overdue policy = **admit past `scheduledAt`** (catch-up via the existing scheduler, `listDueScheduledTasks` + coordinator fire). Legacy path byte-identical incl. past-rejection. Tests §11.9 (§7.3, §7.5). |
+| **M3** rollback does not fail closed on an older API | The claim "older code over the new DB fails closed on keyed admission" is **withdrawn as false** (verified: baseline `createTaskSchema` is a plain `z.object` without `intake`; unknown keys are stripped and legacy creation proceeds — an old API would create an unbound duplicate). Replaced by a **mechanically enforced compat fence**: the deliverer probes `GET /agent/status` for `intakeCompat` before any keyed delivery; missing/mismatched level → all keyed delivery enters `hold_api_compat` with **zero POSTs to `/tasks`**. A rolled-back API does not report the field → the relay fences itself. Deployment material adds the enforceable ordering: fence delivery → drain/reconcile in-flight → then swap API (§9.3). |
+| **M4** timed-work fallback omitted non-intake obligations | The workload predicate and the host amendment SQL are **binding-agnostic** — they count ALL canonical AI-owned timed/pending obligations from `tasks` alone, **no `task_intake_bindings` join**. Actual timed-work surfaces inspected and enumerated this session: creation/PUT validation (`schemas.ts:182,218`), due-pickup `listDueScheduledTasks` (`data/src/index.ts:2555-2573`), fire-and-clear in the coordinator scheduler (`agent/src/coordinator.ts:828-879`), `nextBacklogTaskByPosition` skipping future schedules (`data/src/index.ts:2628-2648`), `updateScheduledAt`/`clearScheduledAt` (`:2575-2595`), and `scheduledAt` cleared by `CLEAN_STATE_RESET` on blocked/retry exits (`stateMachine.ts:54-65`) and by AI-handoff transitions (`taskOwnership.ts:388-448`). Tests §11.12 (§8.2). |
+| **M5** concurrent submits must share the capacity decision | **Single-writer spool**: ALL spool mutations (retention, state transitions, restart scan) happen inside the deliverer process, which owns the quota+write+fsync+durable-ACK boundary serially. `submit.mjs` (forced command, concurrent by nature) becomes a **client of the writer** over the singleton loopback port: principal resolution and scope checks stay in submit, then the envelope is handed to the writer, which alone decides capacity and ACKs. Writer unreachable → truthful refusal (`retention_unavailable`), never an unserialized local write. Distinct-process contention test at the last count/byte capacity (§11.13) (§9.1–§9.2). |
+| Note: identifiers in committed plan | Task/project/profile/A1 identifiers removed from this file entirely (header included); they live in untracked private evidence only. No "identifier-free" claim is made — the identifiers are simply not here. |
+| Note: digest-vector wording | Shared vectors pin the **covered contract** and catch drift for covered cases; no absolute "can never drift" claim. |
+| Note: npm-ci child | Recorded output is complete (`added 733 packages in 2m`, husky `prepare` ran) — install reused, no new install this turn. Remaining-child reconciliation re-run this session: `/proc/*/cwd` scan finds only this session's own harness process and ephemeral shell tooling (PIDs gone on re-read); no npm/node install child. |
 
 ## Summary
 
 Source work in this repository plus parameterized deployment material — three slices:
 
-1. **Slice A — keyed canonical admission (G5, brief V3):** optional `intake` block on `POST /tasks` binding API-verified principal + project + namespaced request ID + server-computed immutable digest to exactly one canonical task ID, committed atomically with admission, before acknowledgment. Identical replay returns the original task at any later status (never restarts it); deleted-original replay returns an explicit tombstone; content mismatch is rejected. Legacy clients without `intake` behave exactly as today.
-2. **Slice B — bridge relay engine (G4, brief V2+V3):** narrow `scripts/workstation/intake-relay/` — dependency-free Node ESM modules for principal-resolved submit, atomic durable spool with bounded storage and honest refusal, coalesced bounded wake (only when a delivery endpoint is explicitly configured), and classification-correct redelivery. Default mode is **fail-closed retain-only** (§5).
-3. **Slice C — awake/busy/due ownership (brief V4):** a canonical workload predicate at the source (`/agent/status` + data query) that counts required pending autonomous work — closing the ACK-before-start and timed-obligation gaps — plus **owner-reviewed amendment material** for the existing host writer/guard (BLOCKED D1c). No relay scheduler, no marker-file fiction.
+1. **Slice A — keyed canonical admission (G5, brief V3):** optional `intake` block on `POST /tasks` binding API-verified principal + project + namespaced request ID + **frozen client-content digest** to exactly one canonical task ID, committed atomically with admission, before acknowledgment. Validation is split so a binding hit resolves the original task despite elapsed time or changed defaults; identical replay returns the original task at any later status (never restarts it); deleted-original replay returns an explicit tombstone; content mismatch is rejected. Legacy clients without `intake` behave exactly as today.
+2. **Slice B — bridge relay engine (G4, brief V2+V3):** narrow `scripts/workstation/intake-relay/` — dependency-free Node ESM modules: principal-resolved submit (**client** of the single writer), atomic durable spool with bounded storage and honest refusal owned by one writer process, compat-fenced coalesced wake, handover-watched delivery with classification-correct redelivery. Default mode is **fail-closed retain-only** (§5).
+3. **Slice C — awake/busy/due ownership (brief V4):** a canonical, **binding-agnostic** workload predicate at the source (`/agent/status` + data query) that counts required pending autonomous work from any entry path — closing the ACK-before-start and timed-obligation gaps while the PC is awake — plus **owner-reviewed amendment material** for the existing host writer/guard (BLOCKED D1c) and a relay-side fenced handover contract so admitted work cannot lie dormant (§8.3). No relay scheduler, no marker-file fiction.
 
 **This is not:** a bot planner, replacement coordinator, second task store, new identity service, general orchestration/security platform, or any host/production change. No main merge; no new package; no Docker/compose change (relay runs on the bridge; any PC-side mount/forward unit is owner material); no runtime adapter change; no web UI change; no new npm dependencies.
 
 ## Environment snapshot (verified this session, before any write)
 
-- Baseline `002f93e7` = reviewed target; clean tree; plan file the only untracked item.
-- Prior-session facts re-verified against source: no request-key anywhere (`grep -rn requestId packages/{api,data,shared}/src` → none); `createTask` (`packages/data/src/index.ts:1177`) mints a fresh UUID per call; `createTaskSchema` (`packages/api/src/schemas.ts:151-183`) has no idempotency field; latest migration 28 → new is **v29**; `scheduledAtSchema` normalizes any-offset ISO-8601 to future UTC-Z (`packages/api/src/schemas.ts:49-64`).
-- `GET /agent/status` (`packages/api/src/index.ts:50-75`) derives from `listStaleInProgressTasks` (`packages/data/src/index.ts:2650-2668`) which **excludes** actively-locked tasks (stale-detector polarity — stays untouched as a detector; Slice A adds the separate workload predicate rather than repurposing it).
+- Branch HEAD at replanning = plan-only commit on baseline `002f93e7`; tree otherwise clean; only untracked item is the private evidence directory.
+- No `requestId` anywhere (`grep -rn requestId packages/{api,data,shared,agent}/src` → no matches, re-run this session); `createTask` (`packages/data/src/index.ts:1177`) mints a fresh UUID per call; `createTaskSchema` (`packages/api/src/schemas.ts:151-183`) has no idempotency field; latest migration 28 → new is **v29**.
+- **Moving-validation inventory (M2 basis):** `scheduledAtSchema` normalizes any-offset ISO-8601 to UTC-Z **and rejects the past via `Date.now()`** (`schemas.ts:59-67`); `createTaskSchema` defaults `useSubagents` ← `AGENT_USE_SUBAGENTS` and `maxReviewIterations` ← `AGENT_MAX_REVIEW_ITERATIONS` (`schemas.ts:166,170-175`); the create route additionally derives `planPath` from project config (`tasks.ts:407-410`), forces `plannerMode='full'` for `parallelEnabled` projects (`tasks.ts:413-415`), and applies mode-driven flag defaults (`tasks.ts:418-423`). None of these may enter the keyed digest or pre-lookup validation.
+- `GET /agent/status` (`packages/api/src/index.ts:50-75`) derives from `listStaleInProgressTasks` (`data/src/index.ts:2650-2668`) which excludes actively-locked tasks (stale-detector polarity — untouched; Slice A adds a separate workload predicate). `/health` exists at `index.ts:42-47`. Global middleware chain: `participantCors → trackApiLoad → requestLogger → participantAuth → participantRouteAuthorization → participantCsrf` (`index.ts:34-39`).
+- `GET /tasks/:id` exists (`tasks.ts:647-658`) and returns the full task row — the relay handover watch reuses it; the relay service participant's read access is a D1a bootstrap configuration fact.
 - Post-create broadcasts happen in the route (`tasks.ts:499-506`): `task:created` always, `agent:wake` when `executionOwner==='ai'` — keyed `created` keeps both; pure replay emits **neither**.
-- Attachment window confirmed at `tasks.ts:442-485`: task created with `attachments: []`, then `persistAttachments` + `updateTask`; attachments are also silently dropped when the project lookup fails (`if (project)`). Keyed path closes this by rejection (R2); legacy behavior untouched.
-- Participant verifier inventory (reuse, unchanged from prior verification): `participant_sessions` (unique `token_digest`, `revoked_at`, `expires_at`), `participantAuth` (cookie or `Authorization: Bearer`), CSRF token + Origin allowlist, `requestActionContext(c)` exposing participants-mode state and actor on routes; `PARTICIPANTS_MODE_ENABLED` default `false`.
+- Timed-work surfaces (M4 basis) enumerated in the M4 row above; terminal statuses are `done`/`verified` (`tasks.ts:617-618`); human/external gates are `paused`, `blocked_external`, `plan_ready` with `autoMode:false` (`stateMachine.ts:85-95`), and `manualReviewRequired`.
+- Attachment window confirmed at `tasks.ts:442-485` (create with `attachments: []` → `persistAttachments` → `updateTask`; silently dropped when project lookup fails). Keyed path closes this by rejection (round-1 R2); legacy behavior untouched.
+- Participant verifier inventory (reuse, unchanged): `participant_sessions` (unique `token_digest`, `revoked_at`, `expires_at`), `participantAuth` (cookie or `Authorization: Bearer`), CSRF token + Origin allowlist, `requestActionContext(c)`; `PARTICIPANTS_MODE_ENABLED` default `false`.
 - Root `scripts/**.mjs` tested from package tests via URL-import precedent (`packages/shared/src/__tests__/workspaceResolutionGuard.test.ts`) — Slice B follows it.
-- Host-signal snapshots (transferred by direction owner, manifest-verified): `sleep-guard.ps1` SHA256 `6bc3caac0cda1adffa005e5484155342bb84f4a1b97ae55bf83ff4b668196967`, `wsl-report.ps1` SHA256 `82bc4b9a810bc319d9cc9df6d1d12d6eb43b7a581ef93fc1519a4dcfc543ed75`. Raw contents/decoded query kept in private evidence; contract summary in §8.
 
 ## Verifier / principal path (V2)
 
@@ -59,24 +73,26 @@ authenticated client ──(SSH pubkey, existing bridge boundary)──▶ bridg
         │ client-supplied principal fields are ignored/overwritten, never read
         │ checks allowedProjects / payload size / attachments-empty BEFORE retention or wake
         ▼
-bridge relay spool (atomic + directory-durable, bounded) ──(coalesced wake, only in deliver mode)──▶ PC AIF API
-   POST /tasks {intake:{requestId}, …}  +  Authorization: Bearer <relay service participant session>
+bridge relay spool (atomic + directory-durable, bounded; SINGLE WRITER = deliverer, §9.2)
+   ──(coalesced wake + delivery, deliver mode only, compat-fenced §9.3)──▶ PC AIF API
+        POST /tasks {intake:{requestId}, …}  +  Authorization: Bearer <relay service participant session>
         │ participantAuth resolves principal₂ = relay service participant (revocable, expiring)
         ▼
-task_intake_bindings row: principal₂ + projectId + namespaced requestId + SERVER-computed digest → one task ID
+task_intake_bindings row: principal₂ + projectId + namespaced requestId + SERVER-computed frozen digest → one task ID
+        ▼ (deliver mode: handover watch — GET /tasks/:id until pickup evidence, §8.3)
 ```
 
-- **principal₁ resolution (R1):** the resolver prefers sshd's `ExposeAuthInfo` identity file (fingerprint of the actually-presented key) checked against an operator-owned, service-user-readable-only `principals.json` (fingerprint → `{principalId, allowedProjects[], maxRequestBytes}`); the per-key `environment=` variant is documented as a fallback with its trust caveat (sshd-set per key, but not derived from the presented key at parse time). An arbitrary inherited environment variable is **never** sufficient by itself. Spoofed client identity (any envelope field claiming a principal) is overwritten.
-- **Scope before retention/wake (R1):** envelope `projectId` must be in `allowedProjects`; payload within `maxRequestBytes`; attachments must be absent/empty (R2); request identity within the §7.4 bound. Any violation → refusal receipt, **no spool write, no wake**.
+- **principal₁ resolution (R1):** the resolver prefers sshd's `ExposeAuthInfo` identity file (fingerprint of the actually-presented key) checked against an operator-owned, service-user-readable-only `principals.json` (fingerprint → `{principalId, allowedProjects[], maxRequestBytes}`); the per-key `environment=` variant is documented as a fallback with its trust caveat. An arbitrary inherited environment variable is **never** sufficient by itself. Spoofed client identity (any envelope field claiming a principal) is overwritten.
+- **Scope before retention/wake (R1):** envelope `projectId` must be in `allowedProjects`; payload within `maxRequestBytes`; attachments must be absent/empty; request identity within the §7.4 bound. Any violation → refusal receipt, **no spool write, no wake**.
 - **principal₂ is always the API-verified session principal.** HOLD semantics: `intake` present but participants mode disabled or session anonymous → **422 `intake_principal_unavailable`** before any DB write or wake broadcast. No fallback principal, no broadened trust. Legacy `POST /tasks` without `intake` keeps working in every mode.
 - Missing/revoked/expired credentials therefore cannot enqueue or wake: unauthenticated requests never reach the spool (SSH boundary); unauthenticated/anonymous keyed requests create nothing (401/422 pre-write).
 
 ## Transport decision (R1) — named candidate, fail-closed default
 
-- **Fact:** no bridge→PC delivery transport exists today. The PC API is PC-local; the bridge holds no verified PC credential; LAN/tailnet exposure of the API is not a qualified route. The prior plan's implicit "fetch to a PC URL" and its ":22 session counts as busy" corollary are **withdrawn**.
+- **Fact:** no bridge→PC delivery transport exists today. The PC API is PC-local; the bridge holds no verified PC credential; LAN/tailnet exposure of the API is not a qualified route.
 - **Named candidate (owner wiring, existing authority only):** PC-initiated reverse forward over the bridge's existing SSH boundary — a PC-side unit maintains an SSH session to the bridge exposing PC-local API as a **bridge-loopback** endpoint; the relay delivers only to that configured loopback URL. The bridge never holds a PC credential; the API is never exposed beyond loopback on either host. Dependency: a PC-held, forward-only bridge credential — **existence unconfirmed**; confirming or enrolling it (through existing owner routes) is D1b. No trust is granted by this task.
-- **Source behavior until then (fail closed):** relay mode `retain-only` (the default; no endpoint configured) — submit still authenticates, scope-checks, and durably retains with an honest receipt `retained (delivery pending: transport not configured)`; the deliverer makes **no network calls and issues no wake**; `--status` reports the hold truthfully. Delivery and wake activate only in `deliver` mode (endpoint + transport explicitly configured).
-- Wake ordering in `deliver` mode is internally consistent: the reverse endpoint exists only while the PC is awake, so unreachable-endpoint ⇒ wake (WoL) ⇒ PC start ⇒ forward re-establishes ⇒ delivery proceeds.
+- **Source behavior until then (fail closed):** relay mode `retain-only` (the default; no endpoint configured) — submit still authenticates, scope-checks, and durably retains with an honest receipt `retained (delivery pending: transport not configured)`; the deliverer makes **no network calls and issues no wake**; `--status` reports the hold truthfully. Delivery and wake activate only in `deliver` mode (endpoint + transport explicitly configured **and** compat probe passes, §9.3).
+- Wake ordering in `deliver` mode is internally consistent: the reverse endpoint exists only while the PC is awake, so unreachable-endpoint ⇒ wake (WoL) ⇒ PC start ⇒ forward re-establishes ⇒ delivery/handover proceeds. This is also the M1 recovery mechanism: the relay (always-on, on the bridge) re-wakes a PC that suspended mid-handover.
 
 ## Destination transaction boundary (V3)
 
@@ -89,7 +105,7 @@ CREATE TABLE IF NOT EXISTS task_intake_bindings (
   principal_kind TEXT NOT NULL,      -- 'participant' | 'internal'
   principal_id TEXT NOT NULL,
   request_id TEXT NOT NULL,          -- namespaced 'pid:cid', ≤ 193 chars, charset [A-Za-z0-9._-] plus one ':'
-  payload_digest TEXT NOT NULL,      -- server-computed sha256 hex
+  payload_digest TEXT NOT NULL,      -- server-computed sha256 hex (frozen client-content canonicalization, §7.3)
   task_id TEXT NOT NULL,             -- NO FK: tombstones must survive task deletion
   source TEXT NOT NULL,              -- server-derived from the verified principal, never client-claimed
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
@@ -101,79 +117,99 @@ Append-only for the supported replay lifetime — bindings and tombstones are th
 
 ### 7.2 Atomicity
 
-New data-layer `createTaskWithIntakeBinding` runs **one** better-sqlite3 transaction: (1) select by `dedup_key`; (2a) hit + digest match → `{outcome:"replayed", task}` (task row read live — any status, including terminal: **replay never restarts, re-wakes, or re-admits it**); task row deleted → `{outcome:"replayed", task:null}` tombstone — never re-admit; (2b) hit + digest mismatch → `{outcome:"conflict"}`, zero writes; (3) miss → insert task (the existing `createTask` transaction body refactored into a tx-taking helper — byte-identical behavior for legacy calls) + insert binding + commit → `{outcome:"created"}`. `SQLITE_CONSTRAINT` on the PK (possible from a second connection/process) → catch → re-read → replay/conflict. Cross-connection correctness is proven by test (§11.2), not asserted by JS serialization.
+New data-layer `createTaskWithIntakeBinding` runs **one** better-sqlite3 transaction: (1) select by `dedup_key`; (2a) hit + digest match → `{outcome:"replayed", task}` (task row read live — any status, including terminal: **replay never restarts, re-wakes, or re-admits it**); task row deleted → `{outcome:"replayed", task:null}` tombstone — never re-admit; (2b) hit + digest mismatch → `{outcome:"conflict"}`, zero writes; (3) miss → insert task (the existing `createTask` transaction body refactored into a tx-taking helper — byte-identical behavior for legacy calls) + insert binding + commit → `{outcome:"created"}`. `SQLITE_CONSTRAINT` on the PK (possible from a second connection/process) → catch → re-read → replay/conflict. Cross-connection correctness is proven by test (§11.3), not asserted by JS serialization.
 
-### 7.3 Attachments (R2) and digest
+### 7.3 Attachments (round-1 R2) and the frozen digest (M2)
 
-- Keyed path: non-empty `attachments` → **422 `intake_attachments_unavailable` before any write/wake** (API), and refusal before retention/wake (bridge). Empty/absent is fine. The legacy window (`tasks.ts:442-485`) is documented as pre-existing legacy behavior, not broadened; a future slice may stage attachments transactionally.
-- Digest: new `packages/shared/src/intakeDigest.ts` — canonical JSON over a fixed field list of the validated create payload, **excluding `intake` and `attachments`**; declared sort-tolerant arrays (`assigneeIds`, `tags`); `scheduledAt` in its schema-normalized UTC-Z form. Pinned vectors shared by API and relay tests via a tracked fixtures file, so bridge-computed and server-computed digests can never drift.
+- Keyed path: non-empty `attachments` → **422 `intake_attachments_unavailable` before any write/wake** (API), and refusal before retention/wake (bridge). Empty/absent is fine. The legacy window (`tasks.ts:442-485`) is documented as pre-existing legacy behavior, not broadened.
+- **Frozen client-content digest (M2):** new `packages/shared/src/intakeDigest.ts` — canonical JSON over the **client-supplied** create-payload fields only:
+  - absent optional fields canonicalize to **pinned sentinels** (e.g. `null`), never to env defaults (`AGENT_USE_SUBAGENTS`, `AGENT_MAX_REVIEW_ITERATIONS`), route defaults (`planPath` from project config), forced values (`parallelEnabled → plannerMode`), or mode-driven flag defaults — so a changed environment, project config, or route default cannot change the digest of identical original bytes;
+  - `scheduledAt` is included in its schema-normalized UTC-Z form when present (conflicting schedules ⇒ different digest ⇒ conflict, which is correct); normalization is format-level only — no past/future judgment happens anywhere in the digest;
+  - declared sort-tolerant arrays (`assigneeIds`, `tags`); `intake` and `attachments` excluded.
+  - Pinned vectors shared by API and relay tests via a tracked fixtures file — they pin the covered contract and catch drift for covered cases (no absolute drift-immunity claim).
 
 ### 7.4 Identity bounds (R5) — one encoding everywhere
 
 - Client request ID: 1–128 chars, `[A-Za-z0-9._-]`.
 - principal₁ id (operator map value): 1–64 chars, same charset (validated at relay config load).
-- Namespaced request ID: `${principal1}:${clientRequestId}` → 3–193 chars, regex `^[A-Za-z0-9._-]{1,64}:[A-Za-z0-9._-]{1,128}$`, hard max **193** — enforced identically by the bridge envelope validator (pre-retention), the API schema (`intake.requestId` regex + `max(193)`), and the v29 column comment. No other delimiter is legal, so prefix/delimiter ambiguity is impossible by construction.
-- Identity and digest are **immutable after retention**: the spooled envelope body is sealed; every retry (including after restart) re-sends the byte-identical body. Therefore no accepted envelope can be retentively un-submittable downstream — the bridge applies the same bound the API enforces.
+- Namespaced request ID: `${principal1}:${clientRequestId}` → 3–193 chars, regex `^[A-Za-z0-9._-]{1,64}:[A-Za-z0-9._-]{1,128}$`, hard max **193** — enforced identically by the bridge envelope validator (pre-retention), the API schema (`intake.requestId` regex + `max(193)`), and the v29 column comment. No other delimiter is legal.
+- Identity and digest are **immutable after retention**: the spooled envelope body is sealed; every retry (including after restart) re-sends the byte-identical body.
 
-### 7.5 API mapping and HOLD classes (R5)
+### 7.5 API mapping, ordering, HOLD classes (R5 + M2)
 
-`POST /tasks` keyed branch (order matters — all pre-write checks precede `createTask`):
+Keyed branch of `POST /tasks` — **order matters**; every pre-lookup check is effect-free and moving-validation inputs are kept out of the lookup path:
 
-| Condition | Response | Side effects |
+| Step | Check | On failure |
 |---|---|---|
-| participants mode off / anonymous + `intake` | 422 `intake_principal_unavailable` | none (AUTH/CONFIG HOLD) |
-| `intake` + non-empty attachments | 422 `intake_attachments_unavailable` | none |
-| created | 201 `{task, intake:{replayed:false, requestId, digest}}` | task+binding commit; existing `task:created` + `agent:wake` broadcasts preserved |
-| replayed (task exists, any status incl. done) | 200 `{task, intake:{replayed:true}}` | **no broadcasts, no status change, no restart** |
-| replayed tombstone (task deleted) | 410 `{code:"intake_tombstone", taskId}` | none |
-| digest conflict | 409 `{code:"intake_conflict", taskId}` | none |
+| 1 | `participantAuth` session resolves principal₂ (participants mode on, non-anonymous) | 422 `intake_principal_unavailable`, no writes (AUTH/CONFIG HOLD) |
+| 2 | `intake` + non-empty attachments | 422 `intake_attachments_unavailable`, no writes |
+| 3 | **Static/structural validation** (split schema): types, lengths, charsets, `projectId` present, `scheduledAt` **format + UTC-Z normalization only** | 400, no writes |
+| 4 | Project existence / runtime-profile validation (existing route checks) | 400/404, no writes |
+| 5 | Compute frozen digest (§7.3); binding lookup by dedup key | — |
+| 6a | **Hit + digest match** → resolve original task live (any status) or tombstone; **no time or env re-validation** — elapsed time / changed defaults can never reject a hit | 200 `{task, intake:{replayed:true}}` (no broadcasts, no restart) or 410 `intake_tombstone` |
+| 6b | Hit + digest mismatch | 409 `intake_conflict`, no writes |
+| 7 | **Miss → keyed overdue policy: admit** — `scheduledAt` stored in normalized UTC-Z form even if in the past (fresh delayed delivery is admitted and caught up by the existing scheduler: `listDueScheduledTasks` + coordinator fire). The legacy future-only rule does not apply to keyed first delivery | — |
+| 8 | `createTaskWithIntakeBinding` transaction (§7.2); broadcasts preserved (`task:created` always, `agent:wake` when AI-owned) | 201 `{task, intake:{replayed:false, requestId, digest}}` |
 
-- Reconciliation needs **no new endpoint** (verified none exists): the same keyed POST is safe admission reconciliation under commit-before-ACK-loss, restart, and concurrency, because §7.2 makes it idempotent-by-binding.
-- Relay response classes: 201/200 → delivered (tombstone + receipt); 409/410 → recorded terminal rejection (reported, not retried); **401/403/422 → retained HOLD** (`hold_auth_config`) — no retry, no wake, cleared only by an operator/config change plus documented resume; network/timeout/5xx → **unknown admission outcome** → bounded exponential backoff retry of the identical body (safe: if it committed, replay returns 200). The relay performs no other external effects, so "arbitrary task external-effect uncertainty" never arises inside it; effect-before-receipt uncertainty inside AIF remains the coordinator's existing idempotency/receipt domain, untouched.
+- **Legacy path is byte-identical to today**, including past-`scheduledAt` rejection (`schemas.ts:59-67`) and env/route default resolution — covered by the existing golden tests (e.g. `packages/api/src/__tests__/tasks.test.ts` POST scheduledAt suite) which are not modified, only kept green.
+- Reconciliation needs **no new admission endpoint** (verified none exists): the same keyed POST is safe admission reconciliation under commit-before-ACK-loss, restart, and concurrency, because §7.2 makes it idempotent-by-binding — and with §7.5 ordering it stays idempotent **across time and changed defaults**.
+- Relay response classes: 201/200 → admission receipt (envelope → `admitted`, handover watch §8.3); 409/410 → recorded terminal rejection (reported, not retried); **401/403 → retained HOLD** (`hold_auth_config`) — no retry, no wake; **422 → retained HOLD** — with §7.5 ordering, a keyed 422 can now only mean principal/attachments/structural faults, never elapsed time, so it is always a config/auth condition; network/timeout/5xx → unknown admission outcome → bounded exponential backoff retry of the identical body (safe: if it committed, replay returns 200). Compat fence (§9.3) prevents any of these from ever being sent to an API that lacks the keyed path.
 - Audit: `task.created` metadata gains `{intake:{requestId, digest, source}}` (source server-derived); replay appends a `task.intake_replayed` audit event.
 
 ## Awake / busy / due-time ownership (V4)
 
 ### 8.1 Actual host contract (from verified snapshots; raw text in private evidence)
 
-- **Single writer:** `wsl-report.ps1` runs in the owner's session every 2 min, queries the task store read-only from inside the API container, and writes `wsl-state.txt` (`ts=`, `aif_busy=`, `docker_cpu=`, `hub_busy_age=`, `hub_stop_age=`). Stack not running → `aif_busy=0`; query failure → `aif_busy=?`. `aif_busy` counts tasks `status in (planning, improve, implementing, review, verify) and paused=0 and locked_by not null and locked_until > now and last_heartbeat_at > now-15min` — i.e. **live lock + fresh heartbeat only**.
-- **Consumer:** `sleep-guard.ps1` (SYSTEM, 5 min) treats missing/stale (>6 min) state or non-numeric `aif_busy` as **unknown → stay awake** (fail-awake); blocks on TCP sessions on remote ports (with `tunnel-passive.txt` being an **exclusion** marker for one passive tunnel connection — not a keep-awake flag), docker CPU, hub marker ages, CPU/GPU, idle, `powercfg` requests; on all-clear it sleeps 2 s then suspends to S3.
-- **Marker precedent:** the hub markers are age-of-file signals reported *through the single writer* — the pattern any new signal must follow. No second writer of `wsl-state.txt` is ever introduced by this task.
+- **Single writer:** `wsl-report.ps1` runs in the owner's session every 2 min, queries the task store read-only from inside the API container, and writes `wsl-state.txt` (`ts=`, `aif_busy=`, `docker_cpu=`, `hub_busy_age=`, `hub_stop_age=`). Stack not running → `aif_busy=0`; query failure → `aif_busy=?`. `aif_busy` counts tasks `status in (planning, improve, implementing, review, verify) and paused=0 and locked_by not null and locked_until > now and last_heartbeat_at > now-15min` — live lock + fresh heartbeat only.
+- **Consumer:** `sleep-guard.ps1` (SYSTEM, 5 min) treats missing/stale (>6 min) state or non-numeric `aif_busy` as **unknown → stay awake** (fail-awake); blocks on TCP sessions on remote ports (`tunnel-passive.txt` = exclusion marker), docker CPU, hub marker ages, CPU/GPU, idle, `powercfg` requests; on all-clear it sleeps 2 s then suspends to S3.
+- **Marker precedent:** hub markers are age-of-file signals reported *through the single writer* — the pattern any new signal must follow. No second writer of `wsl-state.txt` is ever introduced by this task.
 
-### 8.2 The gap and the owned fix
+### 8.2 The gap and the owned fix (M4: binding-agnostic)
 
-The writer's predicate covers only locked+fresh in-stage work. Not covered: (a) an admitted task in the interval between admission ACK and the coordinator taking a lock (**ACK-before-start**), (b) admitted tasks waiting on their `scheduledAt` timer (**timed obligations** — no lock exists until due), (c) in-stage but currently unlocked tasks between stages. The PC can therefore reach an all-clear while required canonical work exists.
+The writer's predicate covers only locked+fresh in-stage work. Not covered: (a) an admitted task between admission ACK and coordinator lock (**ACK-before-start**), (b) tasks waiting on a future `scheduledAt` (**timed obligations** — no lock exists until due; these arrive from ANY entry path: UI create, PUT reschedule, keyed intake), (c) in-stage but currently unlocked tasks between stages. The PC can therefore reach an all-clear while required canonical work exists.
 
-- **Source-owned (this slice, tested):** new data query `getAiWorkloadState()` — one live computation over task rows (no cache), returning `busy` (AI-owned, unpaused, in-stage **including** locked — quiet model waiting is busy) plus `pendingIntake` = count of intake-bound tasks in autonomous-pending states: admitted-not-started (`backlog`), **or** in-stage without a live lock, **or** carrying a future `scheduledAt` (the inhibit fallback). Human-gated waits (`plan_ready` with `autoMode:false`, human review park, `blocked_external`, paused) and terminal states are excluded, mirroring the guard's documented philosophy that human-waiting is not machine work. An old completion cannot clear a newer task's protection — the predicate aggregates over all rows. Exposed on `GET /agent/status` (`busy`, `pendingIntakeCount`, `timedPendingCount`, `earliestScheduledAt`) alongside the existing stale-detector fields, which remain untouched.
-- **Owner-reviewed host material (BLOCKED D1c; produced, not applied):** parameterized amendments following the existing patterns exactly — `wsl-report` gains one line emitting `aif_pending=<n|?>` from the same readonly query path (exact pinned SQL over `tasks ⋈ task_intake_bindings`), preserving not-running→0 / failure→`?` semantics; `sleep-guard` gains the matching blocker rule (`aif_pending>0` → blocker; non-numeric → `aif-pending:unknown` → stay awake) and an optional immediate re-read between all-clear and suspend. Optional immediacy variant (age-marker file through the writer, hub-busy pattern) documented for the sub-writer-cadence window. `/agent/status` is observability; the host fence consumes the SQL amendment because the writer's auth-free readonly path is its established channel.
+- **Source-owned (this slice, tested):** new data query `getAiWorkloadState()` — one live computation over `tasks` rows only (**no join on `task_intake_bindings`**; intake-bound tasks are a subset, not a special class), returning:
+  - `busy` — AI-owned, unpaused, in autonomous-active stage (`planning`, `improve`, `implementing`, `review`, `verify`) **including** locked ones (quiet model waiting is busy);
+  - `pendingCount` — admitted-not-started (`backlog`) **or** autonomous-active without a live lock (coordinator owes a transition) **or** `plan_ready` with `autoMode` true awaiting auto-start;
+  - `timedPendingCount` — non-terminal, AI-owned, unpaused tasks with `scheduledAt > now`, from **any entry path** (intake or legacy), and `earliestScheduledAt`.
+  - **Excluded (human/external gates, mirroring guard philosophy):** `paused`, `blocked_external`, `plan_ready` with `autoMode:false`, `manualReviewRequired`, terminal `done`/`verified`. An old completion cannot clear a newer task's protection — the predicate aggregates over all rows. Exposed on `GET /agent/status` (plus `intakeCompat`, §9.3); the existing stale-detector fields remain untouched.
+- **Owner-reviewed host material (BLOCKED D1c; produced, not applied):** parameterized amendments following the existing patterns exactly — `wsl-report` gains one line emitting `aif_pending=<n|?>` from the same readonly query path (**pinned SQL over `tasks` only**, no intake join), preserving not-running→0 / failure→`?` semantics; `sleep-guard` gains the matching blocker rule (`aif_pending>0` → blocker; non-numeric → `aif-pending:unknown` → stay awake) and an optional immediate re-read between all-clear and suspend. Not-running→0 preserves existing stack-down semantics (documented honestly in C1: sleep support for legacy work while the stack is down is pre-existing behavior, unchanged by this slice). `/agent/status` is observability; the host fence consumes the SQL amendment because the writer's auth-free readonly path is its established channel.
 
-### 8.3 Handover and races
+### 8.3 Fenced handover / recovery contract (M1)
 
-- **ACK-before-worker-start:** closed canonically — the admission commit itself creates the pending row; any post-commit workload read sees it. The relay needs no post-ACK PC-side protection (its old "pending marker" idea is withdrawn); protection is ownership of required pending work in the canonical store.
-- **Arrival during final idle-to-suspend:** the guard's residual window is bounded by the writer cadence (2 min) plus its freshness bound (6 min); the amendment's optional re-read narrows the decision-time gap, and no work is ever lost if the race hits — the envelope is already a canonical task row; only start latency is affected, recovered by the coordinator's existing due-pickup on next wake. Documented honestly; not claimed as zero-width from source.
-- **Quiet work:** status-based `busy` (in-stage incl. locked), not CPU/heartbeat — a model quietly waiting on a runtime is busy; a paused or human-gated task is not.
-- **Reporter failure:** existing fail-awake semantics are preserved by the amendments (unknown/stale/`?` → stay awake); a dead reporter can never suspend the machine by accident.
-- **Old completion vs newer work:** aggregate predicate (tested: old done + new pending → still protected).
+The round-1 claim that the pending row alone "closes" ACK-before-start is **withdrawn**. The real contract has two legs:
+
+**Leg 1 — relay-owned handover fence (deliver mode; source-tested):** delivery is NOT complete at API ACK.
+
+- Envelope states: `pending` → (deliver) → `admitted` (201/200 receipt) → **`completed`** only on **pickup evidence**; terminal-rejected (409/410 at admission); HOLD states (`hold_auth_config`, `hold_api_compat`, `hold_handover_unconfirmed`).
+- **Pickup evidence** = the task observed, via authenticated `GET /tasks/:id` polling (existing endpoint, `tasks.ts:647-658`) with bounded exponential backoff and a capped attempt budget, in any of: status left `backlog`, live lock present (`lockedBy`/`lockedUntil`), or terminal status. Broadcasts are not consumed (no WebSocket dependency — plain GET only).
+- **Eligibility split at admission:** if the admitted task carries a future `scheduledAt`, handover watch is unnecessary (the relay owns no timers — R4) → envelope `completed` at admission with the schedule recorded; due-while-asleep remains D7. Only immediately-eligible tasks are watched.
+- **Mid-handover suspend:** endpoint unreachable while an `admitted`-unconfirmed eligible envelope exists ⇒ the PC suspended after commit but before pickup ⇒ the wake loop fires (bounded WoL repeats/backoff per existing caps), forward re-establishes, polling resumes. Dormancy of accepted work is therefore bounded by the relay (an always-on component), not by a stale host report.
+- **Bounds exhausted** (poll cap reached without pickup, or wake repeats exhausted): envelope → `hold_handover_unconfirmed`; `--status` reports it truthfully; no infinite wake storm. Coordinator-down is an operator condition (HOLD), not something the relay may retry blindly.
+- **Retain-only mode:** no endpoint, no watch — accepted envelopes stay `retained` with the honest "delivery pending" receipt; zero network calls (asserted).
+
+**Leg 2 — host-side narrowing (owner material, BLOCKED D1c):** the C2/C3 amendments make an awake PC stay awake while `aif_pending>0` (which includes admitted-not-started and future-scheduled rows), and the optional suspend-time re-read narrows the decision gap. **Honest residual race:** a task arriving after the guard's final read can still let the PC suspend — with Leg 1 the cost is bounded start latency plus relay-driven re-wake, never loss or unbounded dormancy; without Leg 1 (retain-only) accepted work is retained on the bridge but not delivered, truthfully reported. **Until D1b and D1c are applied and qualified, automatic sleep with admitted-but-unpicked work on this new path is explicitly BLOCKED, and the produced material defaults fail-awake** (`aif_pending` unknown/`?` → stay awake). Source-only fixtures are acceptable; no falsely closed gap is claimed.
 
 ### 8.4 Due-time ownership (R4)
 
 - The relay keeps **no dueAt cache and no timers**. Timed wake while the PC is asleep has no qualified source today → recorded **N/A-BLOCKED with evidence** (D7).
-- Honest fallback (brief-sanctioned): while the PC is awake, admitted timed obligations hold it awake via `pendingIntake` (future `scheduledAt` counts until fired/cancelled/terminal). Reschedule and cancel are re-read live from the task row each cycle — restart reconstruction, timezone normalization (schema-level UTC-Z), overdue catch-up (coordinator's existing `scheduledAt <= now` pickup) and cross-schedule conflicts all reduce to canonical state, not relay memory. The always-awake cost of the fallback is documented for the owner, who may scope it in the amendment config.
+- Honest fallback (brief-sanctioned): while the PC is awake, admitted timed obligations hold it awake via `timedPendingCount`/`aif_pending` (future `scheduledAt` counts until fired/cancelled/terminal). Reschedule and cancel are re-read live from the task row each cycle; fires clear `scheduledAt` through the existing scheduler (`clearScheduledAt` / `CLEAN_STATE_RESET` / handoff resets), so restart reconstruction, timezone normalization (schema-level UTC-Z), overdue catch-up (coordinator's existing pickup), and cross-schedule conflicts all reduce to canonical state, not relay memory. The always-awake cost of the fallback is documented for the owner, who may scope it in the amendment config.
 
 ## Recovery / rollback ownership
 
-### 9.1 Spool durable-ACK boundary (precision item)
+### 9.1 Spool durable-ACK boundary (M5: single writer)
 
-Receipt for `retained` is issued only after: write temp file (unique `O_EXCL` name) → `fsync(file)` → `rename` into place → **`fsync(spool parent directory)`** → state-transition files follow the same protocol. On restart: scan discards receipt-less temp files (no receipt was ever issued for them — the client saw a refusal/timeout, and resubmit is idempotent at the API), and reconciles any ambiguous entry to `pending` (safe direction: redelivery is idempotent by binding). Storage bounds (count+bytes) **refuse new work truthfully** (distinct refusal receipt + exit code; no partial file left behind) and never evict accepted work. ENOSPC-class errors surface as refusal, never as silent loss.
+**All spool mutations happen in one process** — the deliverer (singleton, §9.2). The retention boundary it executes per envelope: quota reservation (count+bytes) → write temp file (unique `O_EXCL` name) → `fsync(file)` → `rename` into place → **`fsync(spool parent directory)`** → issue receipt. Because reservation, write, durability, and ACK are serialized inside one process, concurrent submitters cannot each observe the last free slot — there is no check-then-write race to lose. State-transition files follow the same protocol. On restart: scan discards receipt-less temps (no receipt was ever issued; resubmit is idempotent at the API) and reconciles ambiguous entries to `pending` (safe direction: redelivery is idempotent by binding). Storage bounds refuse new work truthfully (distinct refusal receipt + exit code; no partial file left behind) and never evict accepted work. ENOSPC-class errors surface as refusal, never as silent loss.
 
-### 9.2 Singleton deliverer (precision item)
+### 9.2 Singleton deliverer + retention writer (M5)
 
-The deliverer is single-instance by an OS-held contract: the systemd user unit (deployment material) plus a source-level bind on a configured loopback TCP port — a second instance exits non-zero on `EADDRINUSE`; the kernel releases the port on process death. PID/timestamp lockfiles are not used as cessation proof. The submit path (forced command) may run concurrently — spool writes are per-file atomic and uniquely named.
+The deliverer is single-instance by an OS-held contract: the systemd user unit (deployment material) plus a source-level bind on a configured loopback TCP port — a second instance exits non-zero on `EADDRINUSE`; the kernel releases the port on process death. The same bound port is the **retention-writer endpoint**: `submit.mjs` (forced command; concurrent by nature) resolves principal₁, applies scope checks, then hands the envelope to the writer over that port and relays the writer's receipt/refusal to the client. Writer unreachable → truthful refusal exit `retention_unavailable` (the systemd unit restarts the writer; clients retry) — the submit path never writes the spool directly. PID/timestamp lockfiles are not used as cessation proof; port liveness is kernel-managed. The writer endpoint is loopback-only with an optional shared token (parameterized in config).
 
-### 9.3 Rollback invariants
+### 9.3 Rollback / compatibility fence (M3)
 
-- PC code/config rollback must never restore a pre-image DB over acknowledged work: v29 bindings are append-only and only read/inserted by code, so older code over a newer DB fails closed on the keyed path (bindings unreadable → legacy path unaffected). Runbook states the invariant: reconcile accepted request IDs before any DB restore; one fenced deliverer at all times; bridge spool + tombstones (bridge disk) are named separately from canonical PC storage and survive relay upgrades.
-- Deployment templates document preimage hashing (sha256 before/after) and a rollback procedure that preserves spool, tombstones, and bindings.
+- **Withdrawn (was false):** "older code over a newer DB fails closed on keyed admission." Verified against baseline: the old `createTaskSchema` is an ordinary `z.object` without `intake` — unknown keys are stripped and legacy creation proceeds, so a redelivery to an old API would create a **new unbound task**. Preserving v29 rows does not make old code consult them.
+- **Mechanical fence (source):** `GET /agent/status` reports `intakeCompat: <level>` (constant in the API; bumped on breaking changes to the keyed contract). The deliverer probes it before any keyed delivery and on endpoint (re)establishment; missing field, mismatched level, or unparseable response → **all keyed delivery enters `hold_api_compat`**, zero POSTs to `/tasks`, truthful `--status`. A rolled-back API does not report the field, so the relay fences itself without operator intervention.
+- **Deployment material (exact, enforceable ordering):** rollback runbook — (1) fence delivery (stop the relay unit or let the compat probe HOLD), (2) drain/reconcile in-flight envelopes to recorded states (report), (3) only then swap the API binary/image. Forward direction: API with `intakeCompat` first, relay second. Preimage hashing (sha256 before/after) retained in templates. Runbook invariant: reconcile accepted request IDs before any DB restore; one fenced deliverer at all times; bridge spool + tombstones (bridge disk) are named separately from canonical PC storage and survive relay upgrades; a stale DB is never restored over acknowledged work (bindings are append-only and consulted before any admission effect).
 
 ## File ownership (exact)
 
@@ -183,63 +219,68 @@ The deliverer is single-instance by an OS-held contract: the systemd user unit (
 |---|---|---|
 | A1 | `packages/shared/src/db.ts` | edit — append migration v29 (§7.1) |
 | A2 | `packages/shared/src/schema.ts` | edit — `taskIntakeBindings` drizzle table + row types |
-| A3 | `packages/shared/src/intakeDigest.ts` | new — canonicalization + digest (§7.3) |
+| A3 | `packages/shared/src/intakeDigest.ts` | new — frozen client-content canonicalization + digest (§7.3): sentinels for absent optionals, normalized `scheduledAt` included, no env/route defaults |
 | A4 | `packages/shared/src/index.ts` | edit — export A3 |
 | A5 | `packages/data/src/taskIntake.ts` | new — `createTaskWithIntakeBinding` (§7.2) |
-| A6 | `packages/data/src/index.ts` | edit — re-export A5; add `getAiWorkloadState()` (§8.2); `listStaleInProgressTasks` untouched |
-| A7 | `packages/api/src/schemas.ts` | edit — optional `intake:{requestId}` (regex + max 193); client digest/principal fields rejected |
-| A8 | `packages/api/src/routes/tasks.ts` | edit — keyed admission branch in POST / (pre-write checks, outcome mapping, broadcasts per §7.5) |
-| A9 | `packages/api/src/index.ts` | edit — `/agent/status` workload fields (§8.2) |
-| A10 | `packages/shared/src/__tests__/intakeDigest.test.ts` | new — pinned vectors, order/array-sort stability, paired pos/neg |
+| A6 | `packages/data/src/index.ts` | edit — re-export A5; add `getAiWorkloadState()` **binding-agnostic** (§8.2); `listStaleInProgressTasks` untouched |
+| A7 | `packages/api/src/schemas.ts` | edit — split static/structural task schema (format-normalizing `scheduledAt` without past-check, no env-default injection into the keyed path) + optional `intake:{requestId}` (regex + max 193); client digest/principal fields rejected; **legacy `createTaskSchema` composition unchanged** |
+| A8 | `packages/api/src/routes/tasks.ts` | edit — keyed admission branch with §7.5 ordering (pre-lookup checks, frozen digest, binding-first resolution, keyed overdue-admit policy, broadcasts per §7.5) |
+| A9 | `packages/api/src/index.ts` | edit — `/agent/status` workload fields + `intakeCompat` (§8.2, §9.3) |
+| A10 | `packages/shared/src/__tests__/intakeDigest.test.ts` | new — pinned vectors; **stability under changed env/route/project defaults**; order/array-sort stability; paired pos/neg |
 | A11 | `packages/shared/src/__tests__/schema.test.ts` | edit — v29 table/index assertions |
-| A12 | `packages/data/src/__tests__/taskIntake.test.ts` | new — tx atomicity, replay/conflict/tombstone, replay-after-done no-restart, reopen-file durability, **two-connection contention**, workload predicate cases (§11.2, §11.6) |
-| A13 | `packages/api/src/__tests__/taskIntakeAdmission.test.ts` | new — route contract: HOLD branches pre-write, attachments rejection, identity bounds, broadcast spies, task/binding count proofs, CSRF/bearer |
-| A14 | `packages/api/src/__tests__/agentStatus.test.ts` | edit — workload-field assertions |
+| A12 | `packages/data/src/__tests__/taskIntake.test.ts` | new — tx atomicity, replay/conflict/tombstone, replay-after-done no-restart, reopen-file durability, two-connection contention, **M2 replay-after-due / changed-default identity**, **M4 bindingless workload-predicate cases** (§11.2, §11.9, §11.12) |
+| A13 | `packages/api/src/__tests__/taskIntakeAdmission.test.ts` | new — route contract: HOLD branches pre-write, attachment rejection, identity bounds, broadcast spies, task/binding count proofs, **ordering proof (now-past body replays → 200)**, **first-delivery-after-due → 201 + due-pickup**, **legacy past-rejection golden retained**, CSRF/bearer |
+| A14 | `packages/api/src/__tests__/agentStatus.test.ts` | edit — workload-field + `intakeCompat` assertions |
 
 **Slice B — relay engine (all new, zero npm deps):**
 
 | # | File | Purpose |
 |---|---|---|
-| B1 | `scripts/workstation/intake-relay/config.mjs` | validated config: mode (`retain-only` default / `deliver`), endpoint, principal map path, spool bounds, retry/backoff/wake caps, singleton port |
-| B2 | `scripts/workstation/intake-relay/envelope.mjs` | validation (identity bounds §7.4, size, attachments-empty), principal stamping (resolver output authoritative), namespacing, digest |
-| B3 | `scripts/workstation/intake-relay/spool.mjs` | §9.1 durability protocol, states pending/delivered/rejected/tombstoned/**hold_auth_config**, bounds + honest refusal, restart scan |
-| B4 | `scripts/workstation/intake-relay/wake.mjs` | coalescing state machine, bounded repeats/backoff, wake-in-progress ≠ failure; **deliver mode only** |
-| B5 | `scripts/workstation/intake-relay/deliverer.mjs` | FIFO loop, §7.5 response classification, bounded backoff of identical bodies, loopback-port singleton, graceful drain |
-| B6 | `scripts/workstation/intake-relay/submit.mjs` | CLI: principal resolution → scope checks pre-retention → durable spool → receipt/refusal exit codes; no wake |
-| B7 | `scripts/workstation/intake-relay/relay.mjs` | service entry + `--status` (per-envelope state incl. hold reasons) + hold-resume command |
-| B8 | `scripts/workstation/intake-relay/README.md` | parameter contract, §5 transport decision + fail-closed, deploy/rollback w/ preimage hashing, HOLD/resume runbook, security notes |
-| B9 | `scripts/workstation/intake-relay/deploy/aif-intake-relay.service.example` | systemd user unit (singleton, restart) |
+| B1 | `scripts/workstation/intake-relay/config.mjs` | validated config: mode (`retain-only` default / `deliver`), endpoint, `intakeCompat` level, principal map path, spool bounds, retry/backoff/wake caps, handover poll budget, writer port/token |
+| B2 | `scripts/workstation/intake-relay/envelope.mjs` | validation (identity bounds §7.4, size, attachments-empty), principal stamping (resolver output authoritative), namespacing, frozen digest (shared vectors) |
+| B3 | `scripts/workstation/intake-relay/spool.mjs` | §9.1 writer-side durability protocol; states pending/retained/admitted/completed/rejected/tombstoned + `hold_auth_config`/`hold_api_compat`/`hold_handover_unconfirmed`; bounds + honest refusal; restart scan |
+| B4 | `scripts/workstation/intake-relay/wake.mjs` | coalescing state machine, bounded repeats/backoff, wake-in-progress ≠ failure; **deliver mode only**; driven by outstanding work (pending ∨ admitted-unconfirmed) |
+| B5 | `scripts/workstation/intake-relay/deliverer.mjs` | singleton + **retention writer** (loopback request protocol, serialized quota+write+fsync+ACK); **compat probe** (§9.3); FIFO delivery loop; §7.5 response classification; **handover watch** (bounded `GET /tasks/:id` polling until pickup evidence, §8.3); graceful drain |
+| B6 | `scripts/workstation/intake-relay/submit.mjs` | CLI: principal resolution → scope checks pre-retention → hand to single writer → relay receipt/refusal exit codes (`retention_unavailable` when writer absent); no spool writes, no wake |
+| B7 | `scripts/workstation/intake-relay/relay.mjs` | service entry + `--status` (per-envelope state incl. admitted/hold reasons) + hold-resume command |
+| B8 | `scripts/workstation/intake-relay/README.md` | parameter contract, §5 transport decision + fail-closed, §8.3 handover contract, deploy/rollback w/ preimage hashing + **fence→drain→swap ordering**, HOLD/resume runbook, security notes |
+| B9 | `scripts/workstation/intake-relay/deploy/aif-intake-relay.service.example` | systemd user unit (singleton deliverer/writer, restart) |
 | B10 | `scripts/workstation/intake-relay/deploy/config.example.env` | placeholders only |
 | B11 | `scripts/workstation/intake-relay/deploy/ssh-forced-command.example` | authorized_keys forced command + ExposeAuthInfo/per-key-env notes |
 | B12 | `scripts/workstation/intake-relay/deploy/principals.example.json` | fingerprint → principalId/allowedProjects/maxRequestBytes |
 | B13 | `scripts/workstation/intake-relay/deploy/pc-reverse-forward.example.service` | PC-side unit template (owner material; D1b dependency) |
 | B14 | `scripts/workstation/intake-relay/test-vectors/digest-vectors.json` | shared pinned digest vectors (consumed by A10 and B15) |
-| B15 | `packages/shared/src/__tests__/workstationIntakeRelay.test.ts` | new — URL-import tests B1–B7 against a stub admission server (`node:http`): §11.3–§11.5 |
+| B15 | `packages/shared/src/__tests__/workstationIntakeRelay.test.ts` | new — URL-import tests B1–B7 against a stub admission server (`node:http`): §11.3–§11.8, §11.10, §11.11, §11.13 |
 
 **Slice C — host-signal integration material (owner-reviewed, BLOCKED D1c):**
 
 | # | File | Purpose |
 |---|---|---|
-| C1 | `scripts/workstation/pc-busy/README.md` | actual contract (§8.1, sanitized), amendment guide, residual-race honesty, exclusion-marker correction |
-| C2 | `scripts/workstation/pc-busy/wsl-report-amendment.example.ps1` | parameterized `aif_pending` emission via the existing readonly query path (pinned SQL), preserving 0/`?` semantics |
+| C1 | `scripts/workstation/pc-busy/README.md` | actual contract (§8.1, sanitized), amendment guide, §8.3 residual-race honesty + sleep-qualification BLOCKED status, exclusion-marker correction |
+| C2 | `scripts/workstation/pc-busy/wsl-report-amendment.example.ps1` | parameterized `aif_pending` emission via the existing readonly query path (**pinned tasks-only SQL**, no intake join), preserving 0/`?` semantics |
 | C3 | `scripts/workstation/pc-busy/sleep-guard-amendment.example.ps1` | parameterized blocker rule + optional suspend-time re-read; optional age-marker immediacy variant |
 
-**Docs:** `docs/api.md` (intake field/codes, `/agent/status` fields), `docs/architecture.md` (wake/intake subsection), `docs/workstation-intake.md` (new sanitized operator runbook: submit, status, HOLD/resume, recovery, rollback).
+**Docs:** `docs/api.md` (intake field/codes + §7.5 ordering + overdue policy, `/agent/status` fields incl. `intakeCompat`), `docs/architecture.md` (wake/intake + handover subsection), `docs/workstation-intake.md` (new sanitized operator runbook: submit, status, HOLD/resume, handover, recovery, rollback).
 
-**Untracked private evidence:** `.ai-factory/evidence/p2-wake-on-work.private.md` — raw host reconciliation (snapshot text, decoded queries, paths/ports), never committed. No other files are modified. Packages' `CHECKLIST.md` items run at completion; husky/lint-staged hooks run as configured.
+**Untracked private evidence:** `.ai-factory/evidence/p2-wake-on-work.private.md` — raw host reconciliation (snapshot text, decoded queries, paths/ports), task/project/profile identifiers, review-hash reconciliation; never committed. No other files are modified. Packages' `CHECKLIST.md` items run at completion; husky/lint-staged hooks run as configured.
 
 ## Discriminating checks (tests:true)
 
 Deterministic, owned, paired negative/positive, run on the PC in this container:
 
 1. **Authenticated intake:** keyed create with participant session → 201 + binding row; participants mode disabled → 422 `intake_principal_unavailable`, task count unchanged, binding count unchanged, no `agent:wake` broadcast (spy); forged principal header/field never becomes binding principal; revoked session → 401 pre-write.
-2. **Atomic durable replay:** identical resubmit and simulated commit-before-ACK-loss (client discards first response) → 200 same task ID; task count stays 1, binding count stays 1; **replay after the task reached `done` → 200, status unchanged, no broadcasts (never restarts a terminal task)**; relay restarted between spool and delivery → envelope survives, delivered once.
-3. **Contention (precision item):** real tmpdir SQLite file, **two independent better-sqlite3 connections** (worker thread importing the data layer) racing the same dedup key → exactly one `created`, other side `replayed`, one task row, one binding row.
-4. **Conflict/tombstone/attachments:** same requestId different title → 409, no new task, no wake; task deleted after accept → 410, never re-admitted; keyed create with non-empty attachments → 422 pre-write at API **and** refusal pre-spool at bridge; legacy attachment flow unchanged (golden test).
+2. **Atomic durable replay:** identical resubmit and simulated commit-before-ACK-loss (client discards first response) → 200 same task ID; task count stays 1, binding count stays 1; replay after the task reached `done` → 200, status unchanged, no broadcasts (never restarts a terminal task); relay restarted between spool and delivery → envelope survives, delivered once.
+3. **Cross-connection contention:** real tmpdir SQLite file, two independent better-sqlite3 connections (worker thread importing the data layer) racing the same dedup key → exactly one `created`, other side `replayed`, one task row, one binding row.
+4. **Conflict/tombstone/attachments:** same requestId different title → 409, no new task, no wake; task deleted after accept → 410, never re-admitted; keyed create with non-empty attachments → 422 pre-write at API and refusal pre-spool at bridge; legacy attachment flow unchanged (golden test).
 5. **Identity bounds (R5):** boundary charset/length matrix at both ends — 128-char client id + 64-char principal accepted (193); 129/65 rejected; `:`/`|`/unicode in client id rejected at bridge and API; namespaced id byte-identical across retries (stub server captures bodies → deep-equal).
-6. **Workload predicate races (R3):** admitted-not-started → `pendingIntake ≥ 1` immediately post-commit (ACK-before-start); future `scheduledAt` → counted until terminal (timed inhibit); reschedule-later/cancel → live re-read reflects new row; in-stage locked **and** in-stage unlocked → `busy:true` (quiet work); paused / human-gated (`plan_ready` autoMode:false / blocked_external) → not protective; old done + new pending → still protected; two consecutive reads with an admission in between → second read protected (no caching).
-7. **Relay honesty:** §9.1 receipt-after-dir-fsync ordering (instrumented); restart scan discards temps / re-pends ambiguous; count+byte bounds → truthful refusal exit, no partial file, accepted work never evicted; wake coalescing (N concurrent submits → 1 window, bounded repeats); **retain-only mode: zero network calls, zero wake** (asserted); singleton: second deliverer exits on `EADDRINUSE`; response-classification matrix incl. 401/403/422 → HOLD with no retry and no wake on subsequent cycles.
-8. **Digest stability:** pinned shared vectors (B14); field-order/whitespace variants → same digest; one-character change → different digest; API and relay computations agree.
+6. **Workload predicate races (R3/M4):** admitted-not-started → `pendingCount ≥ 1` immediately post-commit (ACK-before-start); future `scheduledAt` on a task with **no intake binding** (legacy/UI-style create) → `timedPendingCount ≥ 1` and the pinned C2 SQL returns n ≥ 1 against a real fixture DB (**no binding join**); reschedule-later / cancel / terminal → live re-read reflects the new row; `blocked_external` entry (schedule cleared by `CLEAN_STATE_RESET`) → drops from timed; reopen-after-restart → same result; due catch-up (past `scheduledAt` still `backlog`) → protected as pending until the scheduler fires, then `busy`; paused / `plan_ready`+`autoMode:false` / `manualReviewRequired` → not protective; old done + new pending → still protected; two consecutive reads with an admission in between → second read protected (no caching).
+7. **Relay honesty:** §9.1 receipt-after-dir-fsync ordering (instrumented); restart scan discards temps / re-pends ambiguous; count+byte bounds → truthful refusal exit, no partial file, accepted work never evicted; wake coalescing (N concurrent submits → 1 window, bounded repeats); retain-only mode: zero network calls, zero wake (asserted); singleton: second deliverer exits on `EADDRINUSE`; response-classification matrix incl. 401/403/422 → HOLD with no retry and no wake on subsequent cycles.
+8. **Digest stability (base):** pinned shared vectors (B14); field-order/whitespace variants → same digest; one-character change → different digest; API and relay computations agree.
+9. **M2 — replay/overdue stability:** (a) keyed first delivery with past `scheduledAt` → 201 admitted, normalized value stored, and `listDueScheduledTasks(now)` returns it (existing catch-up fires it; no relay restart/wake); (b) future-scheduled keyed task completed (`done`), identical replay sent after the schedule elapsed → **200 original task, no new task/binding, no broadcasts** (proves lookup precedes time validation); (c) env defaults flipped (`AGENT_USE_SUBAGENTS`, `AGENT_MAX_REVIEW_ITERATIONS`) between create and replay → digest identical → 200 replay, one canonical identity, no restart/wake; (d) route-level defaults varied (project `parallelEnabled` on/off, mode defaults, project-config `planPath`) → same client bytes ⇒ same digest; (e) same requestId different `scheduledAt` → 409 (conflicting schedules rejected without new work); (f) legacy POST without `intake` + past `scheduledAt` → 400 (existing golden, unmodified).
+10. **M1 — handover fencing (relay, stub server):** admit (201) → poll shows `backlog`/unlocked → endpoint drops → wake invoked (stub WoL), envelope stays `admitted` (not `completed`); endpoint returns with task now in-stage+locked → `completed`, no further wake; future-scheduled admission → `completed` at admission, zero polls, zero wake (no wake loop for not-yet-due work); pickup never observed and poll budget exhausted → `hold_handover_unconfirmed`, wake repeats bounded by config then cease, `--status` truthful; retain-only → `retained`, zero polls/network/wake.
+11. **M3 — compat fence (relay, stub server):** stub `/agent/status` without `intakeCompat` → **zero POSTs to `/tasks`** (request counter asserted), envelope/delivery state `hold_api_compat`; matching level → delivers; lower/mismatched level → HOLD; probe recovery after config fix → documented hold-resume path. API test (A14) asserts the field is present at the expected level.
+12. **M4 — bindingless timers:** covered inside check 6 (fixture rows created through the legacy path with no binding); additionally the C2 pinned SQL text is executed against the fixture DB (same expectations as the data-layer predicate, proving the host channel and the source predicate agree on a no-binding scheduled row).
+13. **M5 — distinct-process capacity contention:** N real concurrent `submit.mjs` child processes (`node:child_process`) against a running writer with capacity N−1 (count bound) → exactly N−1 durable receipts + 1 truthful refusal, spool holds N−1 envelopes, no temp/partial remnants, accepted work preserved; byte-bound variant at the last free bytes; writer absent → every submit exits `retention_unavailable`, spool untouched.
 
 **Mandatory validation protocol:** `npm run ai:validate` on the PC against this isolated checkout; every aggregate component (`format:check`, `lint`, `test`, coverage ≥70% touched packages, `build`, `ai:perf`, `ai:load`, `ai:protocol`, `ai:checklist`) recorded as executed/failed/skipped/N-A with fresh output. Known trap: `ai:load` exits 0 when k6 is missing — recorded as its true state (UNVERIFIED/skipped-k6-missing), never PASS. No component removed or weakened; no heavy Mac test battery.
 
@@ -247,37 +288,38 @@ Deterministic, owned, paired negative/positive, run on the PC in this container:
 
 | ID | Item | Owner | Status |
 |---|---|---|---|
-| D1a | PC `PARTICIPANTS_MODE_ENABLED` + relay service participant (existing bootstrap flow, role `member`) + session-token transport to bridge | direction owner (existing routes only) | **BLOCKED** — keyed path HOLDs by design meanwhile |
-| D1b | PC-initiated reverse-forward unit + PC-held forward-only bridge credential (§5); confirm existing or enroll via existing routes | direction owner | **BLOCKED** — relay stays fail-closed `retain-only`; no wake, no delivery |
-| D1c | `wsl-report`/`sleep-guard` amendments (C2/C3) applied to the host scripts | host-script owner via exact-candidate review | **BLOCKED** — material produced, not applied; source predicate + tests land now |
+| D1a | PC `PARTICIPANTS_MODE_ENABLED` + relay service participant (existing bootstrap flow, role `member`, read access on target projects for the §8.3 handover watch) + session-token transport to bridge | direction owner (existing routes only) | **BLOCKED** — keyed path HOLDs by design meanwhile |
+| D1b | PC-initiated reverse-forward unit + PC-held forward-only bridge credential (§5); confirm existing or enroll via existing routes | direction owner | **BLOCKED** — relay stays fail-closed `retain-only`; no wake, no delivery, no handover watch |
+| D1c | `wsl-report`/`sleep-guard` amendments (C2/C3) applied to the host scripts | host-script owner via exact-candidate review | **BLOCKED** — material produced (fail-awake defaults), not applied; **automatic sleep with admitted-but-unpicked work is NOT qualified until this lands** (§8.3) |
 | D2 | Bridge Node ≥20 for the relay (or owner's chosen always-on host) | direction owner | deployment dependency, named |
 | D3 | Internet entry (G2) | operator | BLOCKED, unchanged |
 | D4 | Egress policy (G3) | operator | BLOCKED for provider/pilot cases; irrelevant to this no-model slice |
 | D5 | Real sleep→wake, LAN, Mac-absent, cold-boot acceptance cases | executor after D1* via exact-candidate deployment review | runtime evidence stays fixtures-only; not claimable from source |
-| D6 | getff PR2141 / A1 task `16732164-…` | retained A1 owner | untouched, preserved |
-| D7 | Qualified always-on wake-at-due source for a sleeping PC | — | **N/A-BLOCKED with evidence** (§8.4); inhibit-while-awake fallback implemented canonically |
+| D6 | getff PR2141 / existing A1 task | retained A1 owner (identity in private evidence) | untouched, preserved |
+| D7 | Qualified always-on wake-at-due source for a sleeping PC | — | **N/A-BLOCKED with evidence** (§8.4); inhibit-while-awake fallback implemented canonically; the §8.3 relay wake loop covers mid-handover suspends only, not future-due wakes |
 
 ## Stage gating & stop condition
 
 1. This revised plan lands as a commit on `feature/p2-wake-on-work-5d7f45` (plan only — sanitized; private evidence stays untracked).
-2. Task returns to **plan_ready, `autoMode:false`**; independent bound PlanReview re-runs against brief V2/V3/V4, the kickoff verify list, and R1–R5.
-3. On GO: implementation proceeds phase-wise A → B → C with the commit plan below; on REVISE: plan amended and re-reviewed. Implementation never starts from an unreviewed plan or a successful model turn.
+2. Task returns to **plan_ready, `autoMode:false`**; independent bound PlanReview re-runs against brief V2/V3/V4, the kickoff verify list, R1–R5, and M1–M5.
+3. On GO: implementation proceeds phase-wise A → B → C with the commit plan below; on REVISE: plan amended and re-reviewed (historical rounds retained; no new idea/spec or review campaign). Implementation never starts from an unreviewed plan or a successful model turn.
 4. Whole-feature DONE is **not** claimable by this slice: D1*/D5/D7 remain BLOCKED/UNVERIFIED; the REPORT returns PARTIAL/DONE-per-slice honestly.
 
 ## Commit plan
 
 | Checkpoint | Contents | Message |
 |---|---|---|
-| 0 | this revised plan (sanitized) | `docs(plans): revise p2 wake-on-work plan — R1-R5 reconciliation (plan_ready, autoMode:false)` |
-| 1 | A1–A6, A10–A12, B14 | `feat(shared,data): keyed task intake bindings (migration v29) with atomic replay/conflict/tombstone + workload predicate` |
-| 2 | A7–A9, A13–A14 | `feat(api): authenticated keyed admission on POST /tasks + agent workload status` |
-| 3 | B1–B13, B15 | `feat(workstation): fail-closed bridge intake relay (durable spool, classified redelivery, singleton)` |
+| 0 | this revised plan (sanitized) | `docs(plans): revise p2 wake-on-work plan - R2 M1-M5 reconciliation (plan_ready, autoMode:false)` |
+| 1 | A1–A6, A10–A12, B14 | `feat(shared,data): keyed task intake bindings (migration v29) with frozen-digest replay/conflict/tombstone + binding-agnostic workload predicate` |
+| 2 | A7–A9, A13–A14 | `feat(api): authenticated keyed admission on POST /tasks with time-stable replay + agent workload status` |
+| 3 | B1–B13, B15 | `feat(workstation): fail-closed bridge intake relay (single-writer durable spool, compat fence, handover watch, classified redelivery)` |
 | 4 | C1–C3 + docs | `docs(workstation): host-signal amendment material, intake runbook, api/architecture sync` |
 
 ## Out of scope / preserved (falsifiers)
 
 - A1/getff B/OpenMaus/Hy-Memory untouched; PR2141 review HOLD unchanged; no second A1 executor.
-- Configured role profiles (task `088182b8…`, plan/review `53eca24c…`) unchanged; no provider/bot verification traffic; no API-billed LLM in CI.
+- Configured role profiles unchanged (identity in private evidence); no provider/bot verification traffic; no API-billed LLM in CI.
 - No public exposure of API/MCP/admin ports; no Docker socket mount; no copied keys; no authorized_keys edits (template examples are documentation, not applied config); no force-push/reset/clean/stash/chown; no production image rebuild/restart; no VPN/power/partition change; no main merge; private host values never committed.
 - Host scripts (`wsl-report`/`sleep-guard`) are never modified by this task — only reviewed amendment material is produced (D1c).
+- No new scheduler, no WebSocket dependency for the relay (plain authenticated GET only), no new trust enrollment, no changed legacy task-creation/scheduling contract.
 - If an already-enrolled wake/intake/busy path is discovered during implementation and verifies, it is reconciled and reused instead of the parallel pieces here (Slice B/C shrink; Slice A remains the destination contract).
