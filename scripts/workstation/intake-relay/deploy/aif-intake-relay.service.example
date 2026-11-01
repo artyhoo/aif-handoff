@@ -1,0 +1,70 @@
+# systemd unit for the bridge intake relay (plan p2-wake-on-work, B9).
+#
+# EXAMPLE — parameterized deployment material. Every <placeholder> is filled
+# by the operator at install time; no real host value is committed anywhere.
+#
+# Singleton + restart-recovery contract (R4/C1):
+#   • The UDS bind inside ExecStart is the OS-held singleton latch. The relay
+#     NEVER unlinks or reclaims its socket path itself; a bind that fails for
+#     any reason refuses startup (exit 78, state startup_refused_socket_held).
+#   • Stale-path cleanup is SUPERVISOR-OWNED: this unit's ExecStartPre removes
+#     the socket path, and systemd runs ExecStartPre only AFTER the unit's
+#     previous instance has been killed and reaped (stop job completes before
+#     the start job begins). Cleanup can therefore never race a live
+#     same-unit writer — this ordering IS the lifetime fence behind qualified
+#     restart recovery.
+#   • The socket path below is EXCLUSIVE to this single unit. No other unit or
+#     manual procedure may run the same cleanup against this path: a manual or
+#     cross-unit rival can never steal the path — it can only fail the bind
+#     (fail-closed). Manual cleanup is a runbook step performed ONLY after
+#     independently verifying cessation (unit inactive, no relay process).
+#   • An unsupervised crash (unit stopped without its own stop job — host
+#     crash) leaves the stale path blocking startup until supervisor/owner
+#     cleanup: an honest availability cost that never yields two writers.
+#
+# Credential files (R3/S1): the writer credential, the principal map, and —
+# in deliver mode — the session token and session-bound CSRF token live
+# OUTSIDE this repository, are owned and readable (0600 / 0750 dirs) only by
+# the relay service user, and are installed by the operator through existing
+# routes. This unit only references their parameterized paths.
+
+[Unit]
+Description=AIF intake relay (bridge): authenticated durable task intake
+Documentation=file://<install-dir>/scripts/workstation/intake-relay/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=<relay-service-user>
+Group=<relay-service-group>
+EnvironmentFile=<install-dir>/deploy/config.env
+
+# Supervisor-owned stale-socket cleanup (see contract above): runs only after
+# the previous instance of THIS unit is reaped. `-` ignores a missing path.
+ExecStartPre=-/bin/rm -f <state-dir>/aif-intake-relay/relay.sock
+# The spool and state directories are created by the relay with 0750; assert
+# the expected ownership without ever chown-ing across owners from the unit.
+ExecStartPre=/usr/bin/test -d <state-dir>/aif-intake-relay
+
+ExecStart=<node-bin> <install-dir>/scripts/workstation/intake-relay/relay.mjs
+WorkingDirectory=<install-dir>
+
+Restart=on-failure
+RestartSec=5s
+# Exit 78 (startup_refused_socket_held) is a refused start, not a crash loop
+# trigger: the operator resolves the held path before the next start attempt.
+SuccessExitStatus=78
+
+# Hardening: the relay needs no privileges, no /tmp access, no kernel knobs.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=<state-dir>/aif-intake-relay
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

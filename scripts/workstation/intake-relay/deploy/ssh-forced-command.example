@@ -1,0 +1,62 @@
+# SSH boundary for intake submit (plan p2-wake-on-work, B11).
+#
+# EXAMPLE — parameterized notes for the EXISTING bridge SSH public-key
+# boundary. This task edits no authorized_keys file and enrolls no trust; the
+# operator applies changes through existing owner routes only.
+#
+# Goal: a submit client authenticates at the bridge with its SSH key; the key
+# can ONLY run the submit shim (forced command), and the shim learns the
+# PRINCIPAL from what sshd actually presented — never from client input.
+
+# ---------------------------------------------------------------------------
+# 1. sshd_config (bridge) — expose the presented-key identity to the session
+# ---------------------------------------------------------------------------
+#
+#   ExposeAuthInfo yes
+#
+# With this, every session gets SSH_AUTH_INFO_0=<path> in its environment;
+# the file contains a line like:
+#
+#   publickey SHA256:<base64-fingerprint>
+#
+# submit.mjs prefers this fingerprint (what sshd ACTUALLY presented) and
+# resolves it against the operator-owned principals.json. Reload sshd after
+# changing sshd_config (existing owner procedure).
+
+# ---------------------------------------------------------------------------
+# 2. authorized_keys entry for the submit principal (bridge relay user)
+# ---------------------------------------------------------------------------
+#
+#   restrict,command="<install-dir>/scripts/workstation/intake-relay/submit.mjs" ssh-ed25519 <COMMENT>
+#
+# `restrict` disables pty/agent/X11/port-forwarding; `command=` forces the
+# shim regardless of the client's requested command. The client submits by
+# piping the JSON payload on stdin:
+#
+#   ssh -T <relay-user>@<bridge> < payload.json
+#
+# The shim ignores SSH_ORIGINAL_COMMAND and any client-claimed principal
+# fields; it relays the truthful receipt/refusal JSON on stdout.
+
+# ---------------------------------------------------------------------------
+# 3. Documented FALLBACK: per-key environment variable (weaker trust)
+# ---------------------------------------------------------------------------
+#
+# When ExposeAuthInfo cannot be enabled, a per-key environment variable can
+# carry the principalId. Requires sshd_config:
+#
+#   PermitUserEnvironment yes
+#
+# authorized_keys entry:
+#
+#   restrict,command="…/submit.mjs",environment="AIF_RELAY_PRINCIPAL=<principal-id>" ssh-ed25519 <COMMENT>
+#
+# and config:
+#
+#   AIF_INTAKE_RELAY_PRINCIPAL_ENV_VAR=AIF_RELAY_PRINCIPAL
+#
+# TRUST CAVEAT (R1): the variable is operator-set per key, but it is a claim
+# configured alongside the key — not a proof of the key sshd presented. The
+# ExposeAuthInfo path is preferred; an arbitrary inherited environment
+# variable is never sufficient by itself, and the shim refuses with
+# `principal_unknown` when neither channel resolves a known principal.

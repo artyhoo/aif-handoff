@@ -1,0 +1,38 @@
+# PC-side reverse-forward unit (plan p2-wake-on-work, B13 — owner material).
+#
+# EXAMPLE — parameterized. NOT applied by this task: the PC-held, forward-only
+# bridge credential is the D1b dependency (existence unconfirmed; confirming
+# or enrolling it happens only through existing owner routes).
+#
+# Transport decision (R1/§5): the PC INITIATES the connection — the bridge
+# never holds a PC credential, and the AIF API is never exposed beyond
+# loopback on either host. While this unit runs, PC-local :3009 is reachable
+# on the BRIDGE at 127.0.0.1:<forward-port> only. The relay's deliver mode
+# points at exactly that bridge-loopback URL; when the PC sleeps, the forward
+# disappears — that is the wake-ordering signal the relay relies on
+# (unreachable endpoint ⇒ bounded wake ⇒ PC start ⇒ forward re-establishes).
+
+[Unit]
+Description=AIF PC reverse forward (PC-local API exposed on bridge loopback only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=<pc-service-user>
+# -N: no remote command; -T: no pty; ExitOnForwardFailure: fail loudly if the
+# forward is refused; ServerAliveInterval keeps NAT/tailnet paths honest.
+ExecStart=/usr/bin/ssh -N -T \
+  -o ExitOnForwardFailure=true \
+  -o ServerAliveInterval=30 \
+  -o ServerAliveCountMax=3 \
+  -o StrictHostKeyChecking=yes \
+  -o IdentitiesOnly=yes \
+  -i <pc-credential-path> \
+  -R 127.0.0.1:<forward-port>:127.0.0.1:3009 \
+  <bridge-user>@<bridge-host>
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

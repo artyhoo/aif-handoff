@@ -1,0 +1,11 @@
+{
+  "description": "Operator-owned principal map for the intake relay (plan p2-wake-on-work, B12). EXAMPLE with placeholder values only — the real map is owner-installed outside the repository, readable only by the relay service user (0600 / 0750). The fingerprint is the SSH key fingerprint sshd presents (ExposeAuthInfo, `publickey SHA256:…`). Client-supplied principal fields are always overwritten by the resolver output; these entries are the ONLY source of principal identity, scope, and payload bounds.",
+  "principals": [
+    {
+      "fingerprint": "SHA256:EXAMPLEonlyReplaceWithTheRealKeyFingerprint=",
+      "principalId": "example-submit-principal",
+      "allowedProjects": ["00000000-0000-0000-0000-000000000000"],
+      "maxRequestBytes": 524288
+    }
+  ]
+}
