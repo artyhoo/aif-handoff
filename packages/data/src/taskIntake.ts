@@ -149,8 +149,7 @@ export function prepareTaskCreation(
           .orderBy(asc(participants.displayName), asc(participants.id))
           .all();
   const hasInvalidAssignees =
-    assignees.length !== assigneeIds.length ||
-    assignees.some((participant) => !participant.active);
+    assignees.length !== assigneeIds.length || assignees.some((participant) => !participant.active);
   if (hasInvalidAssignees || (executionOwner === "ai" && assigneeIds.length > 0)) {
     log.warn(
       {
@@ -296,13 +295,28 @@ export type CreateTaskWithIntakeBindingResult =
   | { outcome: "replayed"; task: TaskRow | null; binding: TaskIntakeBindingRow }
   | { outcome: "conflict"; binding: TaskIntakeBindingRow };
 
-/** Structured better-sqlite3 constraint signal — never message matching. */
-function isSqliteConstraintError(error: unknown): boolean {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    (error as { code?: unknown }).code === "SQLITE_CONSTRAINT"
-  );
+/**
+ * Extended better-sqlite3 result codes of the uniqueness-constraint family —
+ * the only failures the cross-connection reconciliation below is for (a
+ * competing writer committed the same unique value first). The installed
+ * driver reports the *extended* code on `error.code`
+ * (`SQLITE_CONSTRAINT_PRIMARYKEY` for the binding primary key,
+ * `SQLITE_CONSTRAINT_UNIQUE` for a unique index, as in `participants.ts`);
+ * the bare base code `SQLITE_CONSTRAINT` is never thrown for a
+ * statement-level failure. Other constraint members (`_NOTNULL`, `_FOREIGNKEY`,
+ * `_CHECK`, `_TRIGGER`, …) are genuine data bugs, not races — they must
+ * propagate, never be reconciled against a binding re-read.
+ */
+const SQLITE_UNIQUE_CONSTRAINT_CODES: ReadonlySet<string> = new Set([
+  "SQLITE_CONSTRAINT_PRIMARYKEY",
+  "SQLITE_CONSTRAINT_UNIQUE",
+]);
+
+/** Structured better-sqlite3 uniqueness-constraint signal — never message matching. */
+export function isSqliteUniqueConstraintError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" && SQLITE_UNIQUE_CONSTRAINT_CODES.has(code);
 }
 
 /**
@@ -314,12 +328,15 @@ function isSqliteConstraintError(error: unknown): boolean {
  * mutable creation-only ownership eligibility check (R3): an assignee who became
  * inactive AFTER admission can never veto the replay/conflict/tombstone
  * resolution of an already-durable request; the full ownership validation still
- * applies to every genuine first admission. A `SQLITE_CONSTRAINT` on the
- * binding primary key (possible when a second connection/process committed the
- * same key between this transaction's read and its write) rolls the transaction
- * back and re-reads, so exactly one canonical task survives a cross-connection
- * race. Returns `undefined` only when ownership validation rejects the insert —
- * the caller answers 409 invalid_ownership and nothing was written.
+ * applies to every genuine first admission. A uniqueness-constraint failure on
+ * the binding insert (`SQLITE_CONSTRAINT_PRIMARYKEY` — the extended result code
+ * the installed better-sqlite3 actually throws for the dedup primary key, never
+ * the bare base code; `SQLITE_CONSTRAINT_UNIQUE` for a unique index — possible
+ * when a second connection/process committed the same key between this
+ * transaction's read and its write) rolls the transaction back and re-reads, so
+ * exactly one canonical task survives a cross-connection race. Returns
+ * `undefined` only when ownership validation rejects the insert — the caller
+ * answers 409 invalid_ownership and nothing was written.
  */
 export function createTaskWithIntakeBinding(
   input: CreateTaskInsertInput,
@@ -351,51 +368,51 @@ export function createTaskWithIntakeBinding(
     // error — the replay/conflict resolution below would never run.
     outcome = db.transaction(
       (tx): TxOutcome => {
-      const existing = tx
-        .select()
-        .from(taskIntakeBindings)
-        .where(eq(taskIntakeBindings.dedupKey, binding.dedupKey))
-        .get();
-      if (existing) {
-        if (existing.payloadDigest !== binding.payloadDigest) {
-          log.warn(
-            { dedupKey: binding.dedupKey, taskId: existing.taskId },
-            "Keyed intake conflict: payload digest mismatch for known request id",
+        const existing = tx
+          .select()
+          .from(taskIntakeBindings)
+          .where(eq(taskIntakeBindings.dedupKey, binding.dedupKey))
+          .get();
+        if (existing) {
+          if (existing.payloadDigest !== binding.payloadDigest) {
+            log.warn(
+              { dedupKey: binding.dedupKey, taskId: existing.taskId },
+              "Keyed intake conflict: payload digest mismatch for known request id",
+            );
+            return { kind: "conflict", binding: existing };
+          }
+          const task = tx.select().from(tasks).where(eq(tasks.id, existing.taskId)).get();
+          log.info(
+            { dedupKey: binding.dedupKey, taskId: existing.taskId, taskPresent: Boolean(task) },
+            "Keyed intake replay resolved to original binding",
           );
-          return { kind: "conflict", binding: existing };
+          return { kind: "replayed", task: task ?? null, binding: existing };
         }
-        const task = tx.select().from(tasks).where(eq(tasks.id, existing.taskId)).get();
-        log.info(
-          { dedupKey: binding.dedupKey, taskId: existing.taskId, taskPresent: Boolean(task) },
-          "Keyed intake replay resolved to original binding",
-        );
-        return { kind: "replayed", task: task ?? null, binding: existing };
-      }
-      // Binding miss — a genuine first admission. Only here does the mutable
-      // creation-only ownership eligibility apply (R3 ordering): the replay/
-      // conflict/tombstone resolution above already returned for every durable
-      // request, so an assignee deactivated after admission is never consulted.
-      const prepared = prepareTaskCreation(input);
-      if (!prepared) return { kind: "ownership_rejected" };
-      insertTaskWithOwnershipRows(tx, input, prepared, auditMetadata);
-      tx.insert(taskIntakeBindings)
-        .values({
-          dedupKey: binding.dedupKey,
-          projectId: binding.projectId,
-          principalKind: binding.principalKind,
-          principalId: binding.principalId,
-          requestId: binding.requestId,
-          payloadDigest: binding.payloadDigest,
-          taskId: prepared.id,
-          source: binding.source,
-        })
-        .run();
-      return { kind: "created", prepared };
+        // Binding miss — a genuine first admission. Only here does the mutable
+        // creation-only ownership eligibility apply (R3 ordering): the replay/
+        // conflict/tombstone resolution above already returned for every durable
+        // request, so an assignee deactivated after admission is never consulted.
+        const prepared = prepareTaskCreation(input);
+        if (!prepared) return { kind: "ownership_rejected" };
+        insertTaskWithOwnershipRows(tx, input, prepared, auditMetadata);
+        tx.insert(taskIntakeBindings)
+          .values({
+            dedupKey: binding.dedupKey,
+            projectId: binding.projectId,
+            principalKind: binding.principalKind,
+            principalId: binding.principalId,
+            requestId: binding.requestId,
+            payloadDigest: binding.payloadDigest,
+            taskId: prepared.id,
+            source: binding.source,
+          })
+          .run();
+        return { kind: "created", prepared };
       },
       { behavior: "immediate" },
     );
   } catch (error) {
-    if (!isSqliteConstraintError(error)) throw error;
+    if (!isSqliteUniqueConstraintError(error)) throw error;
     // A concurrent connection/process committed the same dedup key before this
     // transaction's insert (defense in depth behind BEGIN IMMEDIATE); the
     // transaction (including our partial task insert) rolled back. Re-read the
@@ -413,7 +430,11 @@ export function createTaskWithIntakeBinding(
     if (existing.payloadDigest !== binding.payloadDigest) {
       return { outcome: "conflict", binding: existing };
     }
-    return { outcome: "replayed", task: readTaskRowById(existing.taskId) ?? null, binding: existing };
+    return {
+      outcome: "replayed",
+      task: readTaskRowById(existing.taskId) ?? null,
+      binding: existing,
+    };
   }
 
   switch (outcome.kind) {
