@@ -509,6 +509,7 @@ describe("frozen-digest mirror + pinned vectors (§11.8)", () => {
 
   it("is stable across JSON key order and whitespace variants", () => {
     const base = VECTORS.vectors.find((v) => v.name === "full-payload");
+    if (!base) throw new Error("pinned full-payload vector missing from fixtures");
     const reordered: Record<string, unknown> = {};
     for (const key of Object.keys(base.payload).reverse()) reordered[key] = base.payload[key];
     const variant = JSON.parse(JSON.stringify(reordered, null, 4));
@@ -607,7 +608,7 @@ describe("spool.mjs (§9.1, §11.7)", () => {
       throw new Error("expected refusal");
     } catch (error) {
       expect(error).toBeInstanceOf(SpoolError);
-      expect((error as SpoolError).code).toBe("spool_full_count");
+      expect((error as InstanceType<typeof SpoolError>).code).toBe("spool_full_count");
     }
     const after = spoolStats(config.spoolDir);
     expect(after.count).toBe(before.count);
@@ -635,7 +636,7 @@ describe("spool.mjs (§9.1, §11.7)", () => {
       });
       throw new Error("expected byte-bound refusal");
     } catch (error) {
-      expect((error as SpoolError).code).toBe("spool_full_bytes");
+      expect((error as InstanceType<typeof SpoolError>).code).toBe("spool_full_bytes");
     }
   });
 
@@ -1154,6 +1155,7 @@ describe("handover watch (§11.10 M1)", () => {
       postTasks: {
         status: 201,
         body: { id: "task-2", status: "backlog", scheduledAt: "2030-01-01T00:00:00.000Z" },
+        delayMs: 0,
       },
     });
     const config = baseConfig(dir, { endpoint: stub.url });
@@ -1583,6 +1585,7 @@ describe("distinct-process capacity contention (§11.13 M5)", () => {
       EXIT_CODES.refused_by_writer,
     ]);
     const refused = results.find((r) => r.code === EXIT_CODES.refused_by_writer);
+    if (!refused) throw new Error("expected one refused submit at the byte bound");
     expect(JSON.parse(refused.stdout).code).toBe("spool_full_bytes");
     // Exactly one envelope accepted, no temp/partial remnants (the probe
     // envelope measured `size` from a different spool, so only the count and
