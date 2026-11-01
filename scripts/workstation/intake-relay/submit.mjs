@@ -77,21 +77,59 @@ export function extractPresentedFingerprint(content) {
 }
 
 /**
+ * Incrementally byte-bounded stdin read (R4): the payload is bounded AS BYTES
+ * ARRIVE against the resolved principal's `maxRequestBytes` — the same single
+ * per-principal bound `sealEnvelope` enforces, never a second policy. An
+ * oversized or never-ending stream is cut at the bound without waiting for
+ * EOF: the input stream is destroyed (the feeding pipe gets EPIPE) and the
+ * buffered memory never exceeds the declared bound. No JSON parsing and no
+ * writer contact happen on this path.
+ */
+export async function readBoundedStdin({ maxBytes, stream = process.stdin }) {
+  if (!Number.isInteger(maxBytes) || maxBytes <= 0) {
+    throw new EnvelopeError("payload_too_large", `invalid request bound: ${maxBytes}`);
+  }
+  const chunks = [];
+  let total = 0;
+  for await (const chunk of stream) {
+    const size = chunk.length;
+    if (total + size > maxBytes) {
+      // Stop reading and close the input NOW — refusal is answered from the
+      // bound, not from EOF (R4). Memory held: at most `maxBytes`.
+      stream.destroy();
+      throw new EnvelopeError(
+        "payload_too_large",
+        `input exceeded ${maxBytes} bytes before EOF — stream closed without reading it all`,
+      );
+    }
+    chunks.push(chunk);
+    total += size;
+  }
+  return Buffer.concat(chunks);
+}
+
+/**
  * One submit: read the client payload, resolve the principal, seal the
  * envelope (scope checks pre-retention), hand it to the single writer over
  * the authenticated UDS. Returns `{ exitCode, response }` — the response is
  * the truthful receipt or refusal, relayed verbatim to the caller.
+ * `principal` may be passed pre-resolved (the CLI resolves BEFORE reading
+ * stdin so identity faults refuse without buffering the payload, R4); when
+ * omitted it is resolved here exactly as before.
  */
 export async function submitOnce({
   config,
   principalMap,
   input,
+  principal: preResolvedPrincipal = null,
   env = process.env,
   readFileSync: read = readFileSync,
   connectImpl = connect,
   log = () => {},
 }) {
-  const { principal, via } = resolvePrincipal({ config, principalMap, env, readFileSync: read });
+  const { principal, via } = preResolvedPrincipal
+    ? { principal: preResolvedPrincipal, via: "pre-resolved" }
+    : resolvePrincipal({ config, principalMap, env, readFileSync: read });
   if (!principal) {
     return {
       exitCode: EXIT_CODES.refused_pre_writer,
@@ -204,11 +242,43 @@ async function main() {
   const config = loadConfig();
   const principalMap = loadPrincipalMap(config.principalsPath);
 
-  const stdinChunks = [];
-  for await (const chunk of process.stdin) stdinChunks.push(chunk);
+  // Identity BEFORE payload (R4): the principal comes from the sshd boundary,
+  // never from the stream — an unresolvable principal is refused before a
+  // single stdin byte is buffered.
+  const { principal } = resolvePrincipal({ config, principalMap });
+  if (!principal) {
+    process.stdout.write(
+      `${JSON.stringify({
+        ok: false,
+        code: "principal_unknown",
+        message: "no principal resolved from the presented sshd identity",
+      })}\n`,
+    );
+    process.exitCode = EXIT_CODES.refused_pre_writer;
+    return;
+  }
+
+  // Byte-bounded stdin (R4): bounded incrementally against the SAME
+  // per-principal bound the seal enforces — an oversized or never-ending
+  // stream is closed at the bound, and the truthful refusal is answered
+  // without waiting for EOF, before any JSON parse or writer contact.
+  let raw;
+  try {
+    raw = await readBoundedStdin({ maxBytes: principal.maxRequestBytes });
+  } catch (error) {
+    if (error instanceof EnvelopeError) {
+      process.stdout.write(
+        `${JSON.stringify({ ok: false, code: error.code, message: error.message })}\n`,
+      );
+      process.exitCode = EXIT_CODES.refused_pre_writer;
+      return;
+    }
+    throw error;
+  }
+
   let input;
   try {
-    input = JSON.parse(Buffer.concat(stdinChunks).toString("utf8"));
+    input = JSON.parse(raw.toString("utf8"));
   } catch (error) {
     process.stdout.write(
       `${JSON.stringify({ ok: false, code: "payload_unparseable", message: error.message })}\n`,
@@ -221,6 +291,7 @@ async function main() {
     config,
     principalMap,
     input,
+    principal,
     log: console.error,
   });
   process.stdout.write(`${JSON.stringify(response)}\n`);

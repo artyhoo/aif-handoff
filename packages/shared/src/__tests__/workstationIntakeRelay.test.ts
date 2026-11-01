@@ -19,6 +19,7 @@ import {
   rmSync,
   statSync,
 } from "node:fs";
+import { connect } from "node:net";
 import { createServer as createHttpServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -687,12 +688,16 @@ describe("spool.mjs (§9.1, §11.7)", () => {
     const first = spool.writerReceive(sealTestEnvelope(), { mode: "retain-only" });
     const second = spool.writerReceive(sealTestEnvelope(), { mode: "retain-only" });
     expect(second.id).toBe(first.id);
+    // R4 rework: the replay reuses the already-durable accepted envelope and
+    // receipt VERBATIM — no `retention_replayed` receipt is appended and the
+    // record is not rewritten, so repeated retries cannot grow it.
     expect(
       first.receipts.some((entry: { kind: string }) => entry.kind === "retention_replayed"),
     ).toBe(false);
     expect(
       second.receipts.some((entry: { kind: string }) => entry.kind === "retention_replayed"),
-    ).toBe(true);
+    ).toBe(false);
+    expect(second.receipts.map((entry: { kind: string }) => entry.kind)).toEqual(["retention"]);
     expect(spoolStats(config.spoolDir).count).toBe(1);
   });
 });
@@ -2185,4 +2190,424 @@ describe("fail-closed singleton across distinct processes (§11.16 C1)", () => {
     if (child.child.exitCode === null) child.child.kill("SIGKILL");
     await stub.close();
   }, 60_000);
+});
+
+// ---------------------------------------------------------------------------
+// Bounded intake + truthful duplicate retention (R4 rework)
+// ---------------------------------------------------------------------------
+//
+// Owner source inspection confirmed four bounded-intake defects against the
+// kickoff verify items (bounded storage / conflicting-reuse refusal /
+// preservation of accepted work). These regressions pin the REAL boundaries —
+// actual files, actual sockets, actual CLI child processes — never
+// implementation mirrors:
+//   1. same-digest bridge replay is idempotent in STORAGE (constant bytes and
+//      receipt metadata; bounds never gate the replay of accepted work);
+//   2. same identity + different digest is a truthful refusal with the
+//      original bytes untouched;
+//   3. capacity is enforced against the ACTUAL serialized durable record
+//      (metadata + state + receipts) and preserved quarantine bytes;
+//   4. submit stdin is bounded incrementally in bytes before any full
+//      buffering/parsing/writer contact, including non-terminating streams;
+//   5. the writer closes/destroys an oversized non-terminating peer at the
+//      frame cap with zero record (the writer path holds no wake reference).
+
+describe("bounded intake + truthful duplicate retention (R4 rework)", () => {
+  it("repeated identical submits keep retained bytes, file bytes, and receipt metadata constant — one envelope, no duplicate effect", () => {
+    const dir = makeTmpDir();
+    const config = baseConfig(dir, { mode: "retain-only" });
+    // Count bound 1: a NEW record can never fit — the replay of the accepted
+    // one still must (bounds gate new records only).
+    const spool = createSpool({ dir: config.spoolDir, maxEnvelopes: 1, maxBytes: 1024 * 1024 });
+    const envelope = sealTestEnvelope();
+    const first = spool.writerReceive(envelope, { mode: "retain-only" });
+    const envelopePath = spool.envelopePath(first.id);
+    const bytesAfterFirst = realFs.readFileSync(envelopePath);
+    const statsAfterFirst = spoolStats(config.spoolDir);
+    expect(first.receipts.map((entry: { kind: string }) => entry.kind)).toEqual(["retention"]);
+
+    for (let attempt = 2; attempt <= 6; attempt += 1) {
+      const replay = spool.writerReceive(envelope, { mode: "retain-only" });
+      expect(replay.id).toBe(first.id);
+      expect(replay.digest).toBe(first.digest);
+      // The already-durable accepted envelope/receipt is reused verbatim.
+      expect(replay.receipts.map((entry: { kind: string }) => entry.kind)).toEqual(["retention"]);
+      expect(realFs.readFileSync(envelopePath).equals(bytesAfterFirst)).toBe(true);
+      expect(spoolStats(config.spoolDir)).toEqual(statsAfterFirst);
+    }
+    expect(spoolStats(config.spoolDir).count).toBe(1);
+  });
+
+  it("same request identity with a different digest is refused truthfully, leaving the original bytes untouched", async () => {
+    const dir = makeTmpDir();
+    const config = baseConfig(dir, { mode: "retain-only" });
+    const spool = createSpool({ dir: config.spoolDir, maxEnvelopes: 10, maxBytes: 1024 * 1024 });
+    const original = spool.writerReceive(
+      sealTestEnvelope({ clientRequestId: "dup-1", title: "original title" }),
+      { mode: "retain-only" },
+    );
+    const originalPath = spool.envelopePath(original.id);
+    const originalBytes = realFs.readFileSync(originalPath);
+    const statsBefore = spoolStats(config.spoolDir);
+
+    // Same dedup key (same principal/project/request id), different immutable
+    // digest: a truthful refusal — never the old ok:true retention receipt,
+    // which pretended the changed body was accepted.
+    const conflicting = sealTestEnvelope({ clientRequestId: "dup-1", title: "different content" });
+    expect(conflicting.dedupKey).toBe(original.dedupKey);
+    expect(conflicting.digest).not.toBe(original.digest);
+    let error: unknown = null;
+    try {
+      spool.writerReceive(conflicting, { mode: "retain-only" });
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(SpoolError);
+    expect((error as InstanceType<typeof SpoolError>).code).toBe("intake_conflict");
+
+    // Unchanged existing bytes; zero new retention effects; no temps.
+    expect(realFs.readFileSync(originalPath).equals(originalBytes)).toBe(true);
+    expect(spoolStats(config.spoolDir)).toEqual(statsBefore);
+    expect(spool.list().length).toBe(1);
+
+    // Through the writer IPC the refusal is explicit — the API binding stays
+    // the canonical task authority, the bridge never acknowledges the changed
+    // envelope as retained.
+    const response = await handleWriterRequest({
+      request: { credential: CREDENTIAL, envelope: conflicting },
+      config,
+      spool,
+      principalMap: PRINCIPAL_MAP,
+      credential: CREDENTIAL,
+    });
+    expect(response.ok).toBe(false);
+    expect(response.code).toBe("intake_conflict");
+    expect(spoolStats(config.spoolDir)).toEqual(statsBefore);
+  });
+
+  it("digest-conflict refusal is a nonzero submit outcome with zero new retention (real shim against a live writer)", async () => {
+    const dir = makeTmpDir();
+    const config = baseConfig(dir, { mode: "retain-only" });
+    const spool = createSpool({ dir: config.spoolDir, maxEnvelopes: 10, maxBytes: 1024 * 1024 });
+    const writer = await startWriter(config, spool);
+    const original = spool.writerReceive(
+      sealTestEnvelope({ clientRequestId: "dup-2", title: "kept" }),
+      { mode: "retain-only" },
+    );
+    const statsBefore = spoolStats(config.spoolDir);
+
+    const identityFile = join(dir, "authinfo");
+    realFs.writeFileSync(identityFile, "publickey SHA256:test-fingerprint\n");
+    const credentialFile = join(dir, "cred");
+    realFs.writeFileSync(credentialFile, CREDENTIAL);
+    const { exitCode, response } = await submitOnce({
+      config: { ...config, sshAuthInfoPath: identityFile, writerCredentialPath: credentialFile },
+      principalMap: PRINCIPAL_MAP,
+      input: clientInput({ clientRequestId: "dup-2", title: "changed body" }),
+      readFileSync: realFs.readFileSync,
+    });
+    expect(exitCode).not.toBe(0);
+    expect(exitCode).toBe(EXIT_CODES.refused_by_writer);
+    expect(response.ok).toBe(false);
+    expect(response.code).toBe("intake_conflict");
+    // Zero new retention/admission/wake: byte-for-byte unchanged spool, one
+    // envelope, the ORIGINAL digest still the only one on record.
+    expect(spoolStats(config.spoolDir)).toEqual(statsBefore);
+    expect(spool.list().length).toBe(1);
+    expect(spool.list()[0].digest).toBe(original.digest);
+    writer.close();
+  });
+
+  it("quota measures the actual serialized durable record, not the nominal payload estimate", () => {
+    const dir = makeTmpDir();
+    const config = baseConfig(dir, { mode: "retain-only" });
+    const envelope = sealTestEnvelope({ clientRequestId: "quota-probe" });
+    // The retired estimator: the raw incoming envelope JSON. The record that
+    // was actually stored carried state/id/ownership metadata and the
+    // retention receipt — strictly larger, so the old check overflowed the
+    // declared bound on every admission near capacity.
+    const envelopeEstimateBytes = Buffer.byteLength(
+      `${JSON.stringify(envelope, null, 2)}\n`,
+      "utf8",
+    );
+    const spool = createSpool({
+      dir: config.spoolDir,
+      maxEnvelopes: 10,
+      maxBytes: envelopeEstimateBytes,
+    });
+    let error: unknown = null;
+    try {
+      spool.writerReceive(envelope, { mode: "retain-only" });
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(SpoolError);
+    expect((error as InstanceType<typeof SpoolError>).code).toBe("spool_full_bytes");
+    // Nothing was written: no record, no temp — the declared bound held.
+    expect(spoolStats(config.spoolDir)).toEqual({ count: 0, bytes: 0, temps: 0 });
+  });
+
+  it("with adequate capacity the stored record fits the declared byte bound (bound truthful in both directions)", () => {
+    const dir = makeTmpDir();
+    const config = baseConfig(dir, { mode: "retain-only" });
+    const envelope = sealTestEnvelope({ clientRequestId: "quota-fits" });
+    const envelopeEstimateBytes = Buffer.byteLength(
+      `${JSON.stringify(envelope, null, 2)}\n`,
+      "utf8",
+    );
+    const spool = createSpool({
+      dir: config.spoolDir,
+      maxEnvelopes: 10,
+      maxBytes: envelopeEstimateBytes + 4096,
+    });
+    const record = spool.writerReceive(envelope, { mode: "retain-only" });
+    expect(record.id).toBeTruthy();
+    const stored = spoolStats(config.spoolDir);
+    expect(stored.count).toBe(1);
+    // The bound counts the REAL durable representation — the stored record
+    // (with its retention receipt) fits, and an identical second copy is the
+    // idempotent replay, not a second record.
+    expect(stored.bytes).toBeLessThanOrEqual(envelopeEstimateBytes + 4096);
+    expect(spool.writerReceive(envelope, { mode: "retain-only" }).id).toBe(record.id);
+    expect(spoolStats(config.spoolDir).count).toBe(1);
+  });
+
+  it("state growth at the byte bound refuses truthfully with exact prior bytes preserved", () => {
+    const dir = makeTmpDir();
+    const config = baseConfig(dir, { mode: "retain-only" });
+    const loose = createSpool({ dir: config.spoolDir, maxEnvelopes: 10, maxBytes: 1024 * 1024 });
+    const record = loose.writerReceive(sealTestEnvelope(), { mode: "retain-only" });
+    const path = loose.envelopePath(record.id);
+    const totalBytes = spoolStats(config.spoolDir).bytes;
+    const tight = createSpool({ dir: config.spoolDir, maxEnvelopes: 10, maxBytes: totalBytes });
+    const before = realFs.readFileSync(path);
+
+    let error: unknown = null;
+    try {
+      tight.updateState(record.id, {
+        state: "admitted",
+        receipts: [...record.receipts, { kind: "admitted", at: "2026-11-01T10:00:01.000Z" }],
+      });
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(SpoolError);
+    expect((error as InstanceType<typeof SpoolError>).code).toBe("spool_full_bytes");
+    // The prior record survived byte-for-byte; no temp/partial file; the
+    // durable state is exactly what it was before the refused write.
+    expect(realFs.readFileSync(path).equals(before)).toBe(true);
+    expect(spoolStats(config.spoolDir).temps).toBe(0);
+    expect(tight.get(record.id).state).toBe("retained");
+  });
+
+  it("preserved quarantine bytes occupy retained capacity (the byte bound counts them)", () => {
+    const dir = makeTmpDir();
+    const config = baseConfig(dir, { mode: "retain-only" });
+    const spool = createSpool({ dir: config.spoolDir, maxEnvelopes: 10, maxBytes: 1024 * 1024 });
+    // Quarantine bytes well above the incoming envelope's own size: the
+    // retired estimator (incoming envelope JSON only) would admit, the real
+    // retained-capacity total must refuse.
+    const corruptBytes = `{"corrupt":"${"x".repeat(4096)}"`;
+    realFs.writeFileSync(join(config.spoolDir, "crash.json"), corruptBytes);
+    expect(spool.restartScan().corrupted).toEqual(["crash.json"]);
+    const quarantinePath = join(config.spoolDir, "crash.json.corrupt");
+    const quarantineBytes = realFs.statSync(quarantinePath).size;
+    const incomingEstimateBytes = Buffer.byteLength(
+      `${JSON.stringify(sealTestEnvelope({ clientRequestId: "after-quarantine" }), null, 2)}\n`,
+      "utf8",
+    );
+    expect(quarantineBytes).toBeGreaterThan(incomingEstimateBytes);
+
+    // Capacity barely exceeding the quarantine bytes: a NEW record does not
+    // fit and is refused truthfully — the forensic bytes are never evicted to
+    // make room.
+    const tight = createSpool({
+      dir: config.spoolDir,
+      maxEnvelopes: 10,
+      maxBytes: quarantineBytes + 16,
+    });
+    let error: unknown = null;
+    try {
+      tight.writerReceive(sealTestEnvelope({ clientRequestId: "after-quarantine" }), {
+        mode: "retain-only",
+      });
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(SpoolError);
+    expect((error as InstanceType<typeof SpoolError>).code).toBe("spool_full_bytes");
+    expect(realFs.readFileSync(quarantinePath, "utf8")).toBe(corruptBytes);
+    expect(spoolStats(config.spoolDir)).toEqual({ count: 0, bytes: 0, temps: 0 });
+  });
+
+  it("restart re-pend at the byte bound is refused truthfully without mutating the admitted record", () => {
+    const dir = makeTmpDir();
+    const config = baseConfig(dir, { mode: "deliver" });
+    const loose = createSpool({ dir: config.spoolDir, maxEnvelopes: 10, maxBytes: 1024 * 1024 });
+    const record = loose.writerReceive(sealTestEnvelope(), { mode: "deliver" });
+    loose.updateState(record.id, { state: "admitted" });
+
+    const totalBytes = spoolStats(config.spoolDir).bytes;
+    const tight = createSpool({ dir: config.spoolDir, maxEnvelopes: 10, maxBytes: totalBytes });
+    const path = loose.envelopePath(record.id);
+    const before = realFs.readFileSync(path);
+    const scan = tight.restartScan();
+    // The re-pend receipt would grow the record past the bound: refused
+    // truthfully, the uncertain `admitted` state is preserved as-is (HOLD,
+    // never corruption), and startup is not blocked.
+    expect(scan.boundRefused).toEqual([record.id]);
+    expect(realFs.readFileSync(path).equals(before)).toBe(true);
+    expect(tight.get(record.id).state).toBe("admitted");
+  });
+
+  it("submit CLI refuses an over-limit stdin stream before the writer is contacted, without waiting for EOF", async () => {
+    const dir = makeTmpDir();
+    const env = childSubmitEnv(dir);
+    const child = spawn(process.execPath, [RELAY_FILE("submit.mjs")], {
+      env: { ...process.env, ...env },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => (stdout += chunk));
+    child.stderr.on("data", (chunk) => (stderr += chunk));
+    let stdinErrored = false;
+    child.stdin.on("error", () => {
+      // EPIPE once the child stopped reading — the point of the bound.
+      stdinErrored = true;
+    });
+
+    // Well past the per-principal bound (65_536) and NEVER ended: the pre-fix
+    // shim buffered all of stdin before any bound or JSON parse.
+    const chunk = Buffer.alloc(64 * 1024, 0x78);
+    let offered = 0;
+    const maxChunks = 20; // 1.25 MiB offered
+    const pump = () => {
+      while (offered < maxChunks) {
+        offered += 1;
+        if (!child.stdin.write(chunk)) {
+          child.stdin.once("drain", pump);
+          return;
+        }
+      }
+      // Offered enough — deliberately never end() (non-terminating stream).
+    };
+    pump();
+
+    const result: ChildResult = await new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        child.kill("SIGKILL");
+        resolve({ code: null, stdout, stderr: `${stderr}timeout` });
+      }, 10_000);
+      child.on("close", (code) => {
+        clearTimeout(timer);
+        resolve({ code, stdout, stderr });
+      });
+    });
+
+    expect(result.code).toBe(EXIT_CODES.refused_pre_writer);
+    const response = JSON.parse(result.stdout);
+    expect(response.ok).toBe(false);
+    expect(response.code).toBe("payload_too_large");
+    // No writer was running: any writer contact would have produced exit 4
+    // (`retention_unavailable`) — exit 3 proves the refusal happened BEFORE
+    // writer contact. Zero retention: the spool was never created.
+    expect(existsSync(join(dir, "spool"))).toBe(false);
+    expect(stdinErrored || offered === maxChunks).toBe(true);
+  }, 30_000);
+
+  it("submit CLI refuses an unknown principal without consuming the never-ending stdin stream", async () => {
+    const dir = makeTmpDir();
+    const env = childSubmitEnv(dir);
+    delete env.AIF_TEST_PRINCIPAL; // no identity file, no env fallback: no principal
+    const child = spawn(process.execPath, [RELAY_FILE("submit.mjs")], {
+      env: { ...process.env, ...env },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = "";
+    child.stdout.on("data", (chunk) => (stdout += chunk));
+    child.stdin.on("error", () => {
+      /* EPIPE after the child stopped reading — expected */
+    });
+
+    const chunk = Buffer.alloc(64 * 1024, 0x78);
+    let offered = 0;
+    const pump = () => {
+      while (offered < 20) {
+        offered += 1;
+        if (!child.stdin.write(chunk)) {
+          child.stdin.once("drain", pump);
+          return;
+        }
+      }
+    };
+    pump();
+
+    const result: ChildResult = await new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        child.kill("SIGKILL");
+        resolve({ code: null, stdout, stderr: "timeout" });
+      }, 10_000);
+      child.on("close", (code) => {
+        clearTimeout(timer);
+        resolve({ code, stdout, stderr: "" });
+      });
+    });
+
+    // Identity comes from the sshd boundary, never from the payload: the
+    // refusal happens before a single stdin byte is buffered.
+    expect(result.code).toBe(EXIT_CODES.refused_pre_writer);
+    expect(JSON.parse(result.stdout).code).toBe("principal_unknown");
+    expect(existsSync(join(dir, "spool"))).toBe(false);
+  }, 30_000);
+
+  it("writer closes an oversized non-terminating stream at the frame cap with zero record and zero wake", async () => {
+    const dir = makeTmpDir();
+    const config = baseConfig(dir, { mode: "retain-only" });
+    const spool = createSpool({ dir: config.spoolDir, maxEnvelopes: 10, maxBytes: 1024 * 1024 });
+    const writer = await startWriter(config, spool);
+
+    // allowHalfOpen on the CLIENT: the pre-fix writer answered
+    // request_too_large and half-closed while STILL appending every later
+    // chunk until peer EOF — a compliant client would auto-close on the FIN
+    // and mask that defect. A half-open client that keeps streaming exposes
+    // it: only a writer that stops accumulating and destroys the peer bounds
+    // the stream.
+    const client = connect({ path: config.socketPath, allowHalfOpen: true });
+    let reply = "";
+    let closed = false;
+    client.on("data", (chunk) => (reply += chunk.toString("utf8")));
+    client.once("close", () => (closed = true));
+    client.on("error", () => {
+      /* EPIPE once the writer destroyed the peer — the close assertion carries
+         the contract */
+    });
+
+    // Non-terminating oversized stream: 64 KiB chunks far past the 4 MiB frame
+    // cap, never ended. 400 chunks = 25 MiB offered; the writer must END the
+    // stream, not wait it out (its own idle timeout is 30 s — longer than this
+    // probe).
+    const chunk = Buffer.alloc(64 * 1024, 0x78);
+    let sent = 0;
+    const pump = () => {
+      while (sent < 400 && !closed) {
+        sent += 1;
+        if (!client.write(chunk)) {
+          client.once("drain", pump);
+          return;
+        }
+      }
+    };
+    client.on("connect", pump);
+
+    const closedInTime = await waitFor(() => closed, 15_000, 50);
+    expect(closedInTime).toBe(true);
+    // The refusal is answered before the peer is closed; a live reader sees it.
+    expect(reply).toContain("request_too_large");
+    // Zero record, zero temp — the partial frame can never become a record.
+    // Zero wake: the writer/retention path holds no wake reference at all.
+    expect(spoolStats(config.spoolDir)).toEqual({ count: 0, bytes: 0, temps: 0 });
+    client.destroy();
+    writer.close();
+  }, 30_000);
 });

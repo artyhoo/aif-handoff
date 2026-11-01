@@ -73,6 +73,14 @@ in this design; this task grants no trust and enrolls no credential.
   of the operator map, identity bounds, size vs the principal bound, project
   scope, attachments-empty, frozen-digest re-computation) **before** any quota
   reservation.
+- The transport frame cap (`MAX_FRAME_BYTES`, 4 MiB) is an **actual** bound:
+  past it the writer stops accumulating, answers `request_too_large`, and
+  destroys the peer once the refusal is on the wire — an oversized or
+  non-terminating stream can neither grow the writer's memory without bound
+  nor hold the connection open past the cap, and no record or wake can arise
+  from a refused frame (R4). The submit shim bounds stdin incrementally
+  against the same per-principal `maxRequestBytes` and refuses an oversized
+  stream before any parse or writer contact.
 - Missing/invalid credential or unreachable socket ⇒ truthful refusal
   (`writer_unauthenticated` / `retention_unavailable`), zero quota, zero write,
   zero wake.
@@ -92,9 +100,23 @@ boundary per envelope: quota reservation (count+bytes) → temp file (`O_EXCL`)
 → `fsync(file)` → `rename` → `fsync(parent dir)` → **receipt**. Concurrent
 submitters are serialized by the writer; there is no check-then-write race.
 Restart scan discards receipt-less temps and re-pends ambiguous entries to
-`pending` (redelivery is idempotent by binding). Bounds refuse new work
+`pending` (redelivery is idempotent by binding). Bounds refuse work
 truthfully (`spool_full_count` / `spool_full_bytes`) and never evict accepted
 work; `ENOSPC`-class failures surface as refusal, never silent loss.
+
+The byte bound is enforced against the **actual serialized durable record** —
+the record with its metadata, state, ownership fields and receipts, plus
+preserved quarantine bytes (they occupy real retained capacity) — never a
+nominal payload estimate (R4). An identical replay of an already-retained
+envelope is idempotent **in storage**: the durable record and its receipt are
+reused verbatim (no receipt is appended, no bytes rewritten), so retry loops
+cannot grow one accepted envelope or the total spool size. The same request
+identity with a **different** digest is refused truthfully
+(`intake_conflict`, exit `2` at the shim) with the original bytes untouched —
+the bridge never acknowledges a changed body as retained; the API binding
+stays the canonical task authority. A restart re-pend that would grow a
+record past the bound is refused and reported as `boundRefused` (the
+uncertain on-disk state is preserved as-is and reconciled idempotently).
 
 ## Envelope states
 
@@ -197,4 +219,5 @@ Before ANY incompatible API swap:
 - Refusal classes are truthful and distinct: `principal_unknown`,
   `project_not_allowed`, `payload_too_large`, `attachments_unavailable`,
   `request_id_invalid`, `writer_unauthenticated`, `retention_unavailable`,
-  `spool_full_count`, `spool_full_bytes`, `startup_refused_socket_held`.
+  `intake_conflict`, `spool_full_count`, `spool_full_bytes`,
+  `startup_refused_socket_held`.

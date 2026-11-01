@@ -111,19 +111,66 @@ export function createSpool({
 
   function writeEnvelope(record) {
     record.updatedAt = now();
+    enforceRecordCapacity(record);
     writeFileDurable(envelopePath(record.id), `${JSON.stringify(record, null, 2)}\n`);
     return record;
   }
 
+  function recordDurableBytes(record) {
+    return Buffer.byteLength(`${JSON.stringify(record, null, 2)}\n`, "utf8");
+  }
+
+  /**
+   * Byte bound enforced against the ACTUAL serialized durable representation of
+   * the record (metadata, state, ownership fields, receipts — never a payload
+   * estimate), including the quarantine bytes already occupying retained
+   * capacity. Every persistence path that grows accepted state funnels through
+   * here, so a full spool refuses truthfully and the previous durable bytes
+   * survive exactly (the write below only ever renames a fully-written temp
+   * over the path AFTER this check passed).
+   *
+   * The projected total is the retained bytes of everything ELSE plus the
+   * record's ENTIRE new durable size — exactly what the directory will hold
+   * after the rename (the record's own previous bytes are replaced, not
+   * additive, so they enter the sum only through the new representation).
+   */
+  function enforceRecordCapacity(record) {
+    const projectedTotal = retainedBytes(envelopePath(record.id)) + recordDurableBytes(record);
+    if (projectedTotal > maxBytes) {
+      throw new SpoolError("spool_full_bytes", `spool would exceed ${maxBytes} bytes`);
+    }
+  }
+
   function stats() {
+    return { count: envelopeCount(), bytes: retainedBytes(null) };
+  }
+
+  function envelopeCount() {
     let count = 0;
+    for (const entry of readdirSync(dir)) {
+      if (entry.endsWith(".json")) count += 1;
+    }
+    return count;
+  }
+
+  /**
+   * Total bytes of durable retained state in the spool directory: envelope
+   * records (.json) PLUS preserved quarantine bytes (.json.corrupt[.n]) —
+   * quarantine occupies real retained capacity and is never evicted to admit
+   * new work (R4).
+   */
+  function retainedBytes(excludePath) {
     let bytes = 0;
     for (const entry of readdirSync(dir)) {
-      if (!entry.endsWith(".json")) continue;
-      count += 1;
-      bytes += statSync(join(dir, entry)).size;
+      const path = join(dir, entry);
+      if (entry.endsWith(".json")) {
+        if (path === excludePath) continue;
+        bytes += statSync(path).size;
+      } else if (entry.includes(".corrupt")) {
+        bytes += statSync(path).size;
+      }
     }
-    return { count, bytes };
+    return bytes;
   }
 
   /**
@@ -131,17 +178,26 @@ export function createSpool({
    * on quota exhaustion — never evicts accepted work, never leaves a partial
    * file behind.
    *
-   * Bridge-level replay: a record for the same dedup key already in the spool
-   * (commit-before-ACK-loss retry, concurrent duplicate submit) returns the
-   * EXISTING record with a `retention_replayed` receipt — no second record, no
-   * quota consumption, no double delivery (the API binding stays the canonical
-   * replay authority, §7.2).
+   * Bridge-level replay (R4): a record for the same dedup key already in the
+   * spool is resolved BEFORE any quota or write.
+   *   • SAME digest → idempotent in storage: the already-durable accepted
+   *     envelope and its retention receipt are reused VERBATIM — no receipt
+   *     appended, no rewrite, no growth. (Previously every duplicate appended
+   *     a receipt and rewrote the record before any quota check, so an
+   *     ordinary retry loop grew one accepted envelope past maxBytes.)
+   *   • DIFFERENT digest → truthful refusal (`intake_conflict`, mirroring the
+   *     API's 409 class). The bridge never acknowledges the changed envelope
+   *     as retained — the canonical API binding stays the task authority.
    */
   function writerReceive(envelope, { mode }) {
     const existing = list().find((record) => record.dedupKey === envelope.dedupKey);
     if (existing) {
-      existing.receipts.push({ kind: "retention_replayed", at: now() });
-      writeEnvelope(existing);
+      if (existing.digest !== envelope.digest) {
+        throw new SpoolError(
+          "intake_conflict",
+          `request identity already retained with a different digest (${existing.digest.slice(0, 12)}…) — refusing the conflicting body`,
+        );
+      }
       return existing;
     }
 
@@ -152,18 +208,15 @@ export function createSpool({
         `spool holds ${count} envelopes (limit ${maxEnvelopes})`,
       );
     }
-    const incomingBytes = Buffer.byteLength(`${JSON.stringify(envelope, null, 2)}\n`, "utf8");
-    if (bytes + incomingBytes > maxBytes) {
-      throw new SpoolError("spool_full_bytes", `spool would exceed ${maxBytes} bytes`);
-    }
 
+    const state = mode === "deliver" ? "pending" : "retained";
     const record = {
       // Spool-local record id: digest prefix + random suffix, so two envelopes
       // sealed in the same millisecond can never collide on a filename.
       id: `${envelope.sealedAt.replace(/[:.]/g, "-")}-${envelope.digest.slice(0, 12)}-${randomBytes(4).toString("hex")}`,
       createdAt: envelope.sealedAt,
       updatedAt: envelope.sealedAt,
-      state: mode === "deliver" ? "pending" : "retained",
+      state,
       deliveryPending: mode !== "deliver",
       dedupKey: envelope.dedupKey,
       projectId: envelope.projectId,
@@ -177,18 +230,28 @@ export function createSpool({
       attempts: 0,
       holdReason: null,
     };
-    writeFileDurable(envelopePath(record.id), `${JSON.stringify(record, null, 2)}\n`);
-    // The receipt is issued only after the parent-directory fsync inside
-    // writeFileDurable — the file is durable before this line runs.
-    record.receipts.push({
+    // The receipt is appended only after the first write is durable (§9.1),
+    // but the quota decision must account for the FINAL durable
+    // representation — the record with its metadata, state and retention
+    // receipt — not the nominal incoming-envelope JSON (R4).
+    const retentionReceipt = {
       kind: "retention",
       at: now(),
-      state: record.state,
+      state,
       note:
         mode === "deliver"
           ? "retained (delivery queued)"
           : "retained (delivery pending: transport not configured)",
-    });
+    };
+    const finalBytes = recordDurableBytes({ ...record, receipts: [retentionReceipt] });
+    if (bytes + finalBytes > maxBytes) {
+      throw new SpoolError("spool_full_bytes", `spool would exceed ${maxBytes} bytes`);
+    }
+
+    writeFileDurable(envelopePath(record.id), `${JSON.stringify(record, null, 2)}\n`);
+    // The receipt is issued only after the parent-directory fsync inside
+    // writeFileDurable — the file is durable before this line runs.
+    record.receipts.push(retentionReceipt);
     writeEnvelope(record);
     return record;
   }
@@ -228,11 +291,19 @@ export function createSpool({
    * its bytes are preserved by renaming the file to `<name>.corrupt` and the
    * scan reports it truthfully (same tolerance as `list()`; independent-review
    * repair — the unguarded parse used to fail the whole deliverer startup).
+   *
+   * A re-pend that would grow the record past the declared byte bound is
+   * refused truthfully (R4): the uncertain on-disk state is preserved AS-IS —
+   * an `admitted` envelope stays `admitted`, which is the safe direction (its
+   * admission POST is never replayed from this state; the handover watch and
+   * operator resume reconcile it idempotently) — no receipt is invented, no
+   * bytes are corrupted, and startup is never blocked by a full spool.
    */
   function restartScan() {
     const discardedTemps = [];
     const rePended = [];
     const corrupted = [];
+    const boundRefused = [];
     for (const entry of readdirSync(dir)) {
       if (entry.startsWith(TEMP_PREFIX)) {
         unlinkSync(join(dir, entry));
@@ -264,11 +335,22 @@ export function createSpool({
         // is an uncertain effect → back to pending (idempotent by binding).
         record.state = "pending";
         record.receipts.push({ kind: "restart_repended", at: now() });
-        writeEnvelope(record);
-        rePended.push(record.id);
+        try {
+          writeEnvelope(record);
+          rePended.push(record.id);
+        } catch (error) {
+          if (error instanceof SpoolError && error.code === "spool_full_bytes") {
+            // Capacity prevents recording the reconciliation — the uncertain
+            // `admitted` state stays durable exactly as it was (R4: never
+            // corrupt or evict accepted work to record bookkeeping).
+            boundRefused.push(record.id);
+            continue;
+          }
+          throw error;
+        }
       }
     }
-    return { discardedTemps, rePended, corrupted };
+    return { discardedTemps, rePended, corrupted, boundRefused };
   }
 
   return { dir, writerReceive, list, get, updateState, restartScan, stats, envelopePath };

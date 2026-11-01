@@ -57,15 +57,21 @@ Payload fields are the ordinary `POST /tasks` create fields **plus**
 key). `projectId` must be in the submitting principal's allowed set;
 attachments must be absent/empty (keyed intake rejects them by design).
 
+The shim resolves the principal from the SSH boundary **before** reading the
+payload and bounds stdin incrementally against the principal's
+`maxRequestBytes`: an oversized or never-ending stream is closed at the bound
+and refused without waiting for EOF, before any parse or writer contact — the
+bridge never buffers an unbounded input.
+
 Receipts are distinct and truthful:
 
-| Exit                       | Meaning                                                                                                                                      |
-| -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| `0` + `retention` receipt  | durably retained (deliver mode: queued; retain-only: `delivery pending: transport not configured`)                                           |
-| `0` + `retention_replayed` | same dedup key already in the spool — no second record, no quota consumed                                                                    |
-| `2` + code                 | refused by the writer (`spool_full_count`, `spool_full_bytes`, envelope invariant, `writer_unauthenticated`)                                 |
-| `3` + code                 | refused before the writer (`principal_unknown`, `project_not_allowed`, `payload_too_large`, `attachments_unavailable`, `request_id_invalid`) |
-| `4`                        | `retention_unavailable` — writer down/unreachable; retry later (the supervisor restarts it)                                                  |
+| Exit                      | Meaning                                                                                                                                          |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `0` + `retention` receipt | durably retained (deliver mode: queued; retain-only: `delivery pending: transport not configured`)                                               |
+| `0` + same receipt again  | identical replay of an already-retained envelope — reused **verbatim** from storage (same record, same receipt, same bytes; nothing is appended) |
+| `2` + code                | refused by the writer (`spool_full_count`, `spool_full_bytes`, `intake_conflict`, envelope invariant, `writer_unauthenticated`)                  |
+| `3` + code                | refused before the writer (`principal_unknown`, `project_not_allowed`, `payload_too_large`, `attachments_unavailable`, `request_id_invalid`)     |
+| `4`                       | `retention_unavailable` — writer down/unreachable; retry later (the supervisor restarts it)                                                      |
 
 ## Deduplication and replay
 
@@ -76,9 +82,15 @@ inside the admission transaction. Consequences:
 
 - **Identical resubmit** — same body, any time, even after restart or after
   the first response was lost — returns the **original task** (`200`), never a
-  duplicate, never a restart. Terminal tasks are not re-run.
-- **Changed content** under the same request ID → `409 intake_conflict`,
-  rejected without new work or wake.
+  duplicate, never a restart. Terminal tasks are not re-run. At the bridge the
+  same-digest replay is idempotent in storage: the already-durable envelope
+  and its receipt are reused verbatim, so retry loops cannot grow retained
+  bytes no matter how many times they repeat.
+- **Changed content** under the same request ID → the bridge refuses it before
+  any retention (`2` + `intake_conflict`, original bytes untouched) and the
+  API rejects it with `409 intake_conflict` — the changed body is never
+  acknowledged as retained, and the API binding stays the canonical task
+  authority.
 - **Deleted original** → `410 intake_tombstone`; the request is never
   re-admitted.
 - `scheduledAt` is included in the digest (normalized to UTC-Z): rescheduling
@@ -130,8 +142,15 @@ Envelope lifecycle and HOLD semantics:
   never deleted: it is quarantined as `<name>.json.corrupt` (or
   `<name>.json.corrupt.<n>` when that destination already exists — earlier
   forensic bytes are never overwritten) and reported by the restart scan.
-- Storage bounds (count + bytes) refuse new work truthfully; accepted work is
-  never evicted.
+- Storage bounds (count + bytes) refuse work truthfully; accepted work is
+  never evicted. The byte bound is measured against the **actual serialized
+  durable record** — metadata, state, ownership fields and receipts, plus the
+  preserved quarantine bytes, which occupy real retained capacity — never a
+  nominal payload estimate. A restart re-pend that would grow a record past
+  the bound is refused and reported (`boundRefused`): the uncertain on-disk
+  state is preserved as-is (an `admitted` envelope stays `admitted` and is
+  reconciled by the handover watch or operator resume), and startup is never
+  blocked by a full spool.
 - **Singleton is fail-closed:** the Unix socket bind is the latch. If the path
   exists — live listener or stale file — startup refuses (exit 78,
   `startup_refused_socket_held`). The relay never unlinks its own socket path.

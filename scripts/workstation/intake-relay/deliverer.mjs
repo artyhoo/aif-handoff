@@ -284,11 +284,27 @@ export function handleControlRequest({ request, spool, log = () => {}, now = () 
 }
 
 /**
+ * Transport-level frame cap for one writer request (R4): the writer never
+ * buffers more than this per connection, regardless of what the peer streams.
+ * The per-principal payload bound is a separate, post-parse check
+ * (`revalidateSealedEnvelope`); this cap is the memory/connection bound.
+ */
+export const MAX_FRAME_BYTES = 4 * 1024 * 1024;
+
+/**
  * Create the retention-writer server (raw net server on the singleton UDS).
  * The retention boundary (quota reservation → temp write → fsync → rename →
  * directory fsync → receipt) runs synchronously inside this single process —
  * concurrent submitters are serialized by the event loop, which IS the M5
  * single-writer contract.
+ *
+ * The frame cap is an ACTUAL bound (R4): past it the writer stops
+ * accumulating (releases the partial frame), answers the truthful
+ * `request_too_large` refusal, and destroys the peer once the refusal is on
+ * the wire — an active non-terminating stream can no longer keep the
+ * connection (and the memory) alive past the cap, and no record or wake can
+ * ever arise from a refused frame (the writer path holds no wake reference
+ * at all). Credential verification stays mandatory on every processed frame.
  */
 export function createWriterServer({
   config,
@@ -315,9 +331,27 @@ export function createWriterServer({
     };
     socket.setTimeout(30_000, () => socket.destroy());
     socket.on("data", (chunk) => {
+      if (answered) return; // refused frame — never accumulate another byte
       buffered += chunk.toString("utf8");
-      if (buffered.length > 4 * 1024 * 1024) {
-        answer({ ok: false, code: "request_too_large" });
+      if (Buffer.byteLength(buffered, "utf8") > MAX_FRAME_BYTES) {
+        log(
+          { code: "request_too_large", bytes: Buffer.byteLength(buffered, "utf8") },
+          "writer frame cap exceeded — refusing and closing the peer",
+        );
+        buffered = ""; // release the oversized frame from memory immediately
+        answered = true;
+        try {
+          socket.end(`${JSON.stringify({ ok: false, code: "request_too_large" })}\n`, () => {
+            // Refusal flushed — now end the unbounded stream for good. destroy()
+            // closes BOTH directions, so a peer that never sends FIN cannot
+            // hold the connection open (the idle timeout alone would not fire
+            // on an active stream).
+            socket.destroy();
+          });
+        } catch {
+          socket.destroy();
+        }
+        return;
       }
     });
     socket.on("end", () => {
@@ -337,7 +371,8 @@ export function createWriterServer({
         });
     });
     socket.on("error", () => {
-      /* client vanished mid-request */
+      /* client vanished mid-request — release the socket either way */
+      socket.destroy();
     });
   });
 }
