@@ -1,5 +1,11 @@
 import { z } from "zod";
-import { TASK_EVENTS, TASK_STATUSES, getEnv } from "@aif/shared";
+import {
+  INTAKE_NAMESPACED_REQUEST_ID_MAX,
+  INTAKE_NAMESPACED_REQUEST_ID_PATTERN,
+  TASK_EVENTS,
+  TASK_STATUSES,
+  getEnv,
+} from "@aif/shared";
 
 export const participantLoginSchema = z.object({
   username: z.string().trim().min(1).max(200),
@@ -180,6 +186,58 @@ export const createTaskSchema = z.object({
   roadmapAlias: z.string().max(200).optional(),
   tags: z.array(z.string().max(100)).max(50).default([]),
   scheduledAt: scheduledAtSchema,
+});
+
+/**
+ * Format-level `scheduledAt` normalization for the keyed intake path (§7.5 step
+ * 3, round-2 M2): identical transform to `scheduledAtSchema` but WITHOUT the
+ * past-rejection — a binding hit must resolve the original task regardless of
+ * elapsed time, and a keyed first delivery may legitimately carry a past
+ * `scheduledAt` (delayed admission, caught up by the existing scheduler). The
+ * legacy schema keeps its future-only rule unchanged.
+ */
+export const keyedScheduledAtSchema = z
+  .string()
+  .datetime({ offset: true, message: "scheduledAt must be ISO-8601" })
+  .transform((s) => new Date(s).toISOString())
+  .nullable()
+  .optional();
+
+/**
+ * Keyed intake identity (§7.4/§7.5). The request ID is already namespaced by
+ * the trusted relay shim (`pid:cid`, one encoding enforced by `@aif/shared`).
+ * `.strict()` rejects client-supplied digest/principal fields — the server
+ * computes the digest and derives the principal from the authenticated
+ * session, never from the body.
+ */
+export const intakeSchema = z
+  .object({
+    requestId: z
+      .string()
+      .regex(INTAKE_NAMESPACED_REQUEST_ID_PATTERN, "intake.requestId must be namespaced 'pid:cid'")
+      .max(INTAKE_NAMESPACED_REQUEST_ID_MAX),
+  })
+  .strict();
+
+/**
+ * Structural/static validation for the keyed intake branch (§7.5 step 3).
+ * Identical bounds to `createTaskSchema` except exactly the three deltas the
+ * keyed contract requires:
+ *  1. `scheduledAt` uses `keyedScheduledAtSchema` — format + UTC-Z only, no
+ *     past judgment (which is time-moving input);
+ *  2. `useSubagents`/`maxReviewIterations` are `.optional()` — the env-derived
+ *     `getEnv()` defaults must never enter the keyed digest or the pre-lookup
+ *     path (M2). The creation call applies the same env defaults AFTER the
+ *     binding lookup, so a stored created task is byte-identical to legacy;
+ *  3. the optional `intake` identity block.
+ * Every other field keeps the legacy schema's static default — static
+ * constants cannot move between create and replay, so they are digest-safe.
+ */
+export const keyedCreateTaskSchema = createTaskSchema.extend({
+  scheduledAt: keyedScheduledAtSchema,
+  useSubagents: z.boolean().optional(),
+  maxReviewIterations: z.number().int().min(1).max(50).optional(),
+  intake: intakeSchema.optional(),
 });
 
 export const updateTaskSchema = z.object({

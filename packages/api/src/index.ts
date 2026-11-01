@@ -1,6 +1,11 @@
 import { Hono } from "hono";
-import { getEnv, logger } from "@aif/shared";
-import { listProjects, listStaleInProgressTasks, resetStaleQaRuns } from "@aif/data";
+import { INTAKE_COMPAT_LEVEL, getEnv, logger } from "@aif/shared";
+import {
+  getAiWorkloadState,
+  listProjects,
+  listStaleInProgressTasks,
+  resetStaleQaRuns,
+} from "@aif/data";
 import { projectsRouter } from "./routes/projects.js";
 import { tasksRouter } from "./routes/tasks.js";
 import { chatRouter } from "./routes/chat.js";
@@ -65,11 +70,22 @@ app.get("/agent/status", (c) => {
     };
   });
 
+  // Canonical AI-workload snapshot (plan §8.2): admitted-not-started, in-stage
+  // (locked or not — quiet model waiting is busy), and timed obligations from
+  // ANY entry path. Binding-agnostic; the host sleep-guard consumes the pinned
+  // SQL amendment of the same predicate. Existing stale-detector fields above
+  // are unchanged.
+  const workload = getAiWorkloadState();
+
   return c.json({
     uptime: Math.floor((Date.now() - startTime) / 1000),
     activeTasks,
     activeTaskCount: activeTasks.length,
     staleTasks: activeTasks.filter((t) => t.heartbeatStale).length,
+    workload,
+    // Keyed-intake contract level (§9.3): the bridge relay probes this before
+    // any keyed delivery; a mismatch parks delivery as `hold_api_compat`.
+    intakeCompat: INTAKE_COMPAT_LEVEL,
     checkedAt: new Date().toISOString(),
   });
 });

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { Hono } from "hono";
-import { projects, tasks } from "@aif/shared";
+import { INTAKE_COMPAT_LEVEL, projects, tasks } from "@aif/shared";
 import { createTestDb } from "@aif/shared/server";
 
 const testDb = { current: createTestDb() };
@@ -13,7 +13,7 @@ vi.mock("@aif/shared/server", async (importOriginal) => {
   };
 });
 
-const { listStaleInProgressTasks } = await import("@aif/data");
+const { listStaleInProgressTasks, getAiWorkloadState } = await import("@aif/data");
 
 function createApp() {
   const startTime = Date.now();
@@ -37,11 +37,17 @@ function createApp() {
       };
     });
 
+    // Mirrors packages/api/src/index.ts — the canonical workload snapshot and
+    // the keyed-intake compat level the bridge relay probes (§8.2/§9.3).
+    const workload = getAiWorkloadState();
+
     return c.json({
       uptime: Math.floor((Date.now() - startTime) / 1000),
       activeTasks,
       activeTaskCount: activeTasks.length,
       staleTasks: activeTasks.filter((t) => t.heartbeatStale).length,
+      workload,
+      intakeCompat: INTAKE_COMPAT_LEVEL,
       checkedAt: new Date().toISOString(),
     });
   });
@@ -113,5 +119,38 @@ describe("GET /agent/status", () => {
 
     expect(body.activeTasks[0].heartbeatStale).toBe(true);
     expect(body.staleTasks).toBe(1);
+  });
+
+  it("reports the binding-agnostic workload snapshot and the keyed-intake compat level", async () => {
+    // Admitted-not-started backlog row (no intake binding required — the
+    // predicate is binding-agnostic) plus a future-scheduled obligation.
+    testDb.current
+      .insert(tasks)
+      .values({ id: "t3", projectId: "p1", title: "Admitted", executionOwner: "ai" })
+      .run();
+    const future = new Date(Date.now() + 3_600_000).toISOString();
+    testDb.current
+      .insert(tasks)
+      .values({
+        id: "t4",
+        projectId: "p1",
+        title: "Timed",
+        executionOwner: "ai",
+        scheduledAt: future,
+      })
+      .run();
+
+    const res = await app.request("/agent/status");
+    const body = await res.json();
+
+    expect(body.intakeCompat).toBe(INTAKE_COMPAT_LEVEL);
+    expect(body.workload).toEqual({
+      busy: 0,
+      pendingCount: 2,
+      timedPendingCount: 1,
+      earliestScheduledAt: future,
+    });
+    // Legacy stale-detector fields remain untouched by the workload addition.
+    expect(body.activeTaskCount).toBe(0);
   });
 });
