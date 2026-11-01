@@ -2,7 +2,15 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Hono } from "hono";
 import { eq } from "drizzle-orm";
 import { fileURLToPath } from "node:url";
-import { auditEvents, projects, taskIntakeBindings, tasks } from "@aif/shared";
+import {
+  auditEvents,
+  participants,
+  projects,
+  taskAssignments,
+  taskExecutorHistory,
+  taskIntakeBindings,
+  tasks,
+} from "@aif/shared";
 import { createTestDb } from "@aif/shared/server";
 import type { ParticipantApiEnv } from "../middleware/participantAuth.js";
 
@@ -684,5 +692,245 @@ describe("POST /tasks keyed ordering stability (M2, §7.5)", () => {
     expect(res.status).toBe(404);
     expect(countTasks()).toBe(0);
     expect(countBindings()).toBe(0);
+  });
+});
+
+describe("POST /tasks keyed replay after mutable ownership change (R3)", () => {
+  // Kickoff verify3: identical replay resolves the ORIGINAL canonical task even
+  // after completion — for human-owned keyed tasks too. Assignee liveness is
+  // mutable creation-only eligibility; deactivating ONLY the assignee (while
+  // the principal and project authorization stay valid) must never veto the
+  // replay, its conflict, or its tombstone resolution.
+  async function createAssignee() {
+    const result = await createParticipant({
+      username: `assignee-${crypto.randomUUID()}`,
+      displayName: "Assignee",
+      password: "a sufficiently safe password",
+      role: "member",
+    });
+    if (!result.ok) throw new Error("participant creation failed");
+    return result.participant;
+  }
+
+  function deactivateAssignee(id: string): void {
+    testDb.current
+      .update(participants)
+      .set({ active: false, deactivatedAt: new Date().toISOString() })
+      .where(eq(participants.id, id))
+      .run();
+  }
+
+  function humanKeyedBody(assigneeId: string, requestId = "relay-svc:p2-human-replay-1") {
+    return keyedBody({
+      intake: { requestId },
+      executionOwner: "human",
+      assigneeIds: [assigneeId],
+    });
+  }
+
+  it("replays the identical human-owned request to the original task after only the assignee was deactivated", async () => {
+    const admin = await createAuthenticatedParticipant("admin");
+    const assignee = await createAssignee();
+    const app = createApp();
+    const payload = JSON.stringify(humanKeyedBody(assignee.id));
+
+    const first = await app.request("/tasks", {
+      method: "POST",
+      headers: authHeaders(admin.session, true),
+      body: payload,
+    });
+    expect(first.status).toBe(201);
+    const created = (await first.json()) as { id: string; intake: { digest: string } };
+    // A human-owned creation wakes nobody; one task:created only.
+    expect(broadcastsOfType("task:created")).toHaveLength(1);
+    expect(broadcastsOfType("agent:wake")).toHaveLength(0);
+
+    deactivateAssignee(assignee.id);
+
+    const replay = await app.request("/tasks", {
+      method: "POST",
+      headers: authHeaders(admin.session, true),
+      body: payload,
+    });
+
+    expect(replay.status).toBe(200);
+    const body = (await replay.json()) as {
+      id: string;
+      executionOwner: string;
+      intake: { replayed: boolean };
+    };
+    expect(body.id).toBe(created.id);
+    expect(body.intake.replayed).toBe(true);
+    expect(body.executionOwner).toBe("human");
+    // The durable binding still carries the exact original digest.
+    const binding = testDb.current.select().from(taskIntakeBindings).all()[0];
+    expect(binding.taskId).toBe(created.id);
+    expect(binding.payloadDigest).toBe(created.intake.digest);
+
+    // One task + one binding total; no restart broadcast; no new ownership mutation.
+    expect(countTasks()).toBe(1);
+    expect(countBindings()).toBe(1);
+    expect(broadcastsOfType("task:created")).toHaveLength(1);
+    expect(broadcastsOfType("agent:wake")).toHaveLength(0);
+    const assignments = testDb.current.select().from(taskAssignments).all();
+    expect(assignments).toHaveLength(1);
+    expect(assignments[0]?.participantId).toBe(assignee.id);
+    expect(testDb.current.select().from(taskExecutorHistory).all()).toHaveLength(1);
+  });
+
+  it("replays the terminal human-owned task after its assignee was deactivated", async () => {
+    const admin = await createAuthenticatedParticipant("admin");
+    const assignee = await createAssignee();
+    const app = createApp();
+    const payload = JSON.stringify(humanKeyedBody(assignee.id));
+
+    const first = await app.request("/tasks", {
+      method: "POST",
+      headers: authHeaders(admin.session, true),
+      body: payload,
+    });
+    expect(first.status).toBe(201);
+    const created = (await first.json()) as { id: string };
+    deactivateAssignee(assignee.id);
+    testDb.current.update(tasks).set({ status: "done" }).where(eq(tasks.id, created.id)).run();
+    mockBroadcast.mockClear();
+
+    const replay = await app.request("/tasks", {
+      method: "POST",
+      headers: authHeaders(admin.session, true),
+      body: payload,
+    });
+
+    expect(replay.status).toBe(200);
+    const body = (await replay.json()) as { id: string; status: string };
+    expect(body.id).toBe(created.id);
+    expect(body.status).toBe("done");
+    expect(countTasks()).toBe(1);
+    expect(countBindings()).toBe(1);
+    expect(mockBroadcast).not.toHaveBeenCalled();
+  });
+
+  it("returns the retained tombstone after the assignee was deactivated and never re-admits", async () => {
+    const admin = await createAuthenticatedParticipant("admin");
+    const assignee = await createAssignee();
+    const app = createApp();
+    const payload = JSON.stringify(humanKeyedBody(assignee.id));
+
+    const first = await app.request("/tasks", {
+      method: "POST",
+      headers: authHeaders(admin.session, true),
+      body: payload,
+    });
+    expect(first.status).toBe(201);
+    const created = (await first.json()) as { id: string };
+    deactivateAssignee(assignee.id);
+    testDb.current.delete(tasks).where(eq(tasks.id, created.id)).run();
+    mockBroadcast.mockClear();
+
+    const replay = await app.request("/tasks", {
+      method: "POST",
+      headers: authHeaders(admin.session, true),
+      body: payload,
+    });
+
+    expect(replay.status).toBe(410);
+    const body = (await replay.json()) as { code: string };
+    expect(body.code).toBe("intake_tombstone");
+    expect(countTasks()).toBe(0);
+    expect(countBindings()).toBe(1);
+    expect(mockBroadcast).not.toHaveBeenCalled();
+  });
+
+  it("still rejects a NEW request ID with the now-inactive assignee and creates zero side effects", async () => {
+    const admin = await createAuthenticatedParticipant("admin");
+    const assignee = await createAssignee();
+    const app = createApp();
+
+    const first = await app.request("/tasks", {
+      method: "POST",
+      headers: authHeaders(admin.session, true),
+      body: JSON.stringify(humanKeyedBody(assignee.id)),
+    });
+    expect(first.status).toBe(201);
+    deactivateAssignee(assignee.id);
+    mockBroadcast.mockClear();
+    const auditsBefore = testDb.current.select().from(auditEvents).all().length;
+
+    const rejected = await app.request("/tasks", {
+      method: "POST",
+      headers: authHeaders(admin.session, true),
+      body: JSON.stringify(humanKeyedBody(assignee.id, "relay-svc:p2-human-after-deactivation-1")),
+    });
+
+    expect(rejected.status).toBe(409);
+    const body = (await rejected.json()) as { code: string };
+    expect(body.code).toBe("invalid_ownership");
+    expect(countTasks()).toBe(1);
+    expect(countBindings()).toBe(1);
+    expect(testDb.current.select().from(auditEvents).all().length).toBe(auditsBefore);
+    expect(mockBroadcast).not.toHaveBeenCalled();
+  });
+
+  it("resolves a digest conflict for the known request ID even after the assignee was deactivated", async () => {
+    const admin = await createAuthenticatedParticipant("admin");
+    const assignee = await createAssignee();
+    const app = createApp();
+
+    const first = await app.request("/tasks", {
+      method: "POST",
+      headers: authHeaders(admin.session, true),
+      body: JSON.stringify(humanKeyedBody(assignee.id)),
+    });
+    expect(first.status).toBe(201);
+    deactivateAssignee(assignee.id);
+    mockBroadcast.mockClear();
+
+    const conflict = await app.request("/tasks", {
+      method: "POST",
+      headers: authHeaders(admin.session, true),
+      body: JSON.stringify(
+        keyedBody({
+          intake: { requestId: "relay-svc:p2-human-replay-1" },
+          executionOwner: "human",
+          assigneeIds: [assignee.id],
+          title: "Different content entirely",
+        }),
+      ),
+    });
+
+    expect(conflict.status).toBe(409);
+    const body = (await conflict.json()) as { code: string };
+    expect(body.code).toBe("intake_conflict");
+    expect(countTasks()).toBe(1);
+    expect(countBindings()).toBe(1);
+    expect(mockBroadcast).not.toHaveBeenCalled();
+  });
+
+  it("never grants replay access to a revoked session", async () => {
+    const admin = await createAuthenticatedParticipant("admin");
+    const app = createApp();
+    const payload = JSON.stringify(keyedBody());
+
+    const first = await app.request("/tasks", {
+      method: "POST",
+      headers: authHeaders(admin.session, true),
+      body: payload,
+    });
+    expect(first.status).toBe(201);
+    revokeParticipantSession(admin.session.token);
+    mockBroadcast.mockClear();
+    const auditsBefore = testDb.current.select().from(auditEvents).all().length;
+
+    const replay = await app.request("/tasks", {
+      method: "POST",
+      headers: authHeaders(admin.session, true),
+      body: payload,
+    });
+
+    expect(replay.status).toBe(401);
+    expect(countTasks()).toBe(1);
+    expect(countBindings()).toBe(1);
+    expect(testDb.current.select().from(auditEvents).all().length).toBe(auditsBefore);
+    expect(mockBroadcast).not.toHaveBeenCalled();
   });
 });

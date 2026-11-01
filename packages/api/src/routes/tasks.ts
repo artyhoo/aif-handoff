@@ -608,21 +608,23 @@ tasksRouter.post("/", postTaskBodyValidator(), async (c) => {
       403,
     );
   }
+  // Deterministic on the frozen client content (both fields are inside the
+  // digest), so it can never diverge between creation and an identical replay.
   if (parsedBody.executionOwner === "ai" && parsedBody.assigneeIds.length > 0) {
     return c.json(
       { error: "AI-owned tasks cannot have participant assignees", code: "invalid_ownership" },
       409,
     );
   }
-  for (const participantId of parsedBody.assigneeIds) {
-    const participant = findParticipantById(participantId);
-    if (!participant?.active) {
-      return c.json(
-        { error: "One or more assignees are inactive or missing", code: "inactive_assignee" },
-        409,
-      );
-    }
-  }
+  // NOTE (R3): assignee LIVENESS is deliberately not checked here. It is
+  // mutable creation-only eligibility — checking it before the binding lookup
+  // would let an assignee deactivated AFTER admission veto the identical
+  // replay (and its conflict/tombstone resolution) with 409 instead of
+  // resolving the original task, breaking the canonical-replay promise for
+  // human-owned keyed tasks. `createTaskWithIntakeBinding` enforces the same
+  // validation on the genuine first-admission path only (its
+  // `undefined` → 409 invalid_ownership below, zero writes). The member rule
+  // above stays pre-lookup: it is authorization, keyed on the verified role.
 
   // Step 4 — runtime-profile validation and project existence (400/404, no writes).
   const runtimeValidation = validateProjectScopedRuntimeProfileSelections({

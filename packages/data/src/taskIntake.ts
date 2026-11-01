@@ -94,6 +94,8 @@ interface PreparedTaskCreation {
  * Ownership/planPath/position preparation shared by legacy and keyed creation.
  * Returns `undefined` when ownership validation rejects the insert — the legacy
  * `createTask` contract (`undefined` → caller answers 409 invalid_ownership).
+ * This validation is INSERT-only eligibility (R3): the keyed path defers it to
+ * the binding-miss path so it can never veto an already-durable replay.
  */
 export function prepareTaskCreation(
   input: CreateTaskInsertInput,
@@ -308,7 +310,11 @@ function isSqliteConstraintError(error: unknown): boolean {
  * that either (a) resolves an existing binding — digest match → the original task
  * live (any status, terminal included: replay never restarts it) or a tombstone
  * when the task row is gone, digest mismatch → conflict with zero writes — or
- * (b) inserts the task and the binding together. A `SQLITE_CONSTRAINT` on the
+ * (b) inserts the task and the binding together. Binding resolution precedes the
+ * mutable creation-only ownership eligibility check (R3): an assignee who became
+ * inactive AFTER admission can never veto the replay/conflict/tombstone
+ * resolution of an already-durable request; the full ownership validation still
+ * applies to every genuine first admission. A `SQLITE_CONSTRAINT` on the
  * binding primary key (possible when a second connection/process committed the
  * same key between this transaction's read and its write) rolls the transaction
  * back and re-reads, so exactly one canonical task survives a cross-connection
@@ -319,8 +325,6 @@ export function createTaskWithIntakeBinding(
   input: CreateTaskInsertInput,
   binding: TaskIntakeBindingInput,
 ): CreateTaskWithIntakeBindingResult | undefined {
-  const prepared = prepareTaskCreation(input);
-  if (!prepared) return undefined;
   const db = getDb();
   const auditMetadata = {
     ownershipRevision: 0,
@@ -332,7 +336,8 @@ export function createTaskWithIntakeBinding(
   };
 
   type TxOutcome =
-    | { kind: "created" }
+    | { kind: "created"; prepared: PreparedTaskCreation }
+    | { kind: "ownership_rejected" }
     | { kind: "conflict"; binding: TaskIntakeBindingRow }
     | { kind: "replayed"; task: TaskRow | null; binding: TaskIntakeBindingRow };
 
@@ -366,6 +371,12 @@ export function createTaskWithIntakeBinding(
         );
         return { kind: "replayed", task: task ?? null, binding: existing };
       }
+      // Binding miss — a genuine first admission. Only here does the mutable
+      // creation-only ownership eligibility apply (R3 ordering): the replay/
+      // conflict/tombstone resolution above already returned for every durable
+      // request, so an assignee deactivated after admission is never consulted.
+      const prepared = prepareTaskCreation(input);
+      if (!prepared) return { kind: "ownership_rejected" };
       insertTaskWithOwnershipRows(tx, input, prepared, auditMetadata);
       tx.insert(taskIntakeBindings)
         .values({
@@ -379,7 +390,7 @@ export function createTaskWithIntakeBinding(
           source: binding.source,
         })
         .run();
-      return { kind: "created" };
+      return { kind: "created", prepared };
       },
       { behavior: "immediate" },
     );
@@ -410,11 +421,13 @@ export function createTaskWithIntakeBinding(
       return { outcome: "conflict", binding: outcome.binding };
     case "replayed":
       return { outcome: "replayed", task: outcome.task, binding: outcome.binding };
+    case "ownership_rejected":
+      return undefined;
     case "created": {
-      const task = readTaskRowById(prepared.id);
+      const task = readTaskRowById(outcome.prepared.id);
       if (!task) {
         throw new Error(
-          `Keyed intake admission committed task ${prepared.id} but the row is unreadable`,
+          `Keyed intake admission committed task ${outcome.prepared.id} but the row is unreadable`,
         );
       }
       return { outcome: "created", task };

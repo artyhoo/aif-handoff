@@ -1028,6 +1028,15 @@ intake_attachments_unavailable` before any write (attachments are not
 | Conflict  | dedup-key hit + different digest (e.g. changed title or `scheduledAt`)                                                | `409 intake_conflict` — no new task, no wake                                                                                                           |
 | Created   | no binding for the key                                                                                                | `201` with the new task + `intake: { replayed: false, requestId, digest }`; broadcasts as usual (`task:created`, plus `agent:wake` for AI-owned tasks) |
 
+Binding resolution precedes **mutable creation-only eligibility**: an assignee
+who became inactive (or missing) _after_ admission never vetoes the
+replay/tombstone/conflict resolution of the identical request — the canonical
+replay promise covers human-owned keyed tasks too. The assignee-liveness rule
+still applies to every genuine first admission (no binding for the key): such
+requests are rejected `409 invalid_ownership` with zero writes. Session
+authentication, project authorization, and structural validation are always
+required — a revoked or unauthorized caller gains no replay access.
+
 **Keyed overdue policy:** because lookup precedes time validation, a first
 keyed delivery whose `scheduledAt` is already in the past is **admitted**
 (stored normalized UTC-Z) and caught up by the existing scheduler
@@ -1044,7 +1053,8 @@ as `200`).
 
 - `400` — structural/validation failure (including legacy past-`scheduledAt`)
 - `401` / `403` — unauthenticated / unauthorized session (pre-write)
-- `409` — `intake_conflict`
+- `409` — `intake_conflict`; `invalid_ownership` when the (binding-miss) first
+  admission fails creation-time ownership validation
 - `410` — `intake_tombstone`
 - `422` — `intake_principal_unavailable` / `intake_attachments_unavailable`
   (pre-write)

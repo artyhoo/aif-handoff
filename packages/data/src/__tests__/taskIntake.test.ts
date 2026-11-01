@@ -7,7 +7,14 @@ import { fileURLToPath } from "node:url";
 import { eq } from "drizzle-orm";
 import Database from "better-sqlite3";
 import { closeDb, getDb } from "@aif/shared/server";
-import { projects, taskIntakeBindings, tasks, type NewTaskRow } from "@aif/shared";
+import {
+  participants,
+  projects,
+  taskAssignments,
+  taskIntakeBindings,
+  tasks,
+  type NewTaskRow,
+} from "@aif/shared";
 
 const {
   createTaskWithIntakeBinding,
@@ -194,6 +201,124 @@ describe("createTaskWithIntakeBinding (keyed admission, §7.2)", () => {
     expect(rejected).toBeUndefined();
     expect(countTasks(db)).toBe(0);
     expect(countBindings(db)).toBe(0);
+  });
+
+  // R3: assignee liveness is MUTABLE creation-only eligibility. Once a binding
+  // is durable, deactivating the assignee must never veto the resolution of an
+  // identical replay (or its conflict/tombstone variants) — the replay promise
+  // covers human-owned keyed tasks too.
+  describe("replay after mutable ownership change (R3)", () => {
+    function participantRow(overrides: Record<string, unknown> = {}) {
+      const id = crypto.randomUUID();
+      return {
+        id,
+        username: `assignee-${id.slice(0, 8)}`,
+        normalizedUsername: `assignee-${id}`,
+        displayName: "Assignee",
+        passwordHash: "test-hash",
+        role: "member" as const,
+        active: true,
+        ...overrides,
+      };
+    }
+
+    function admitHumanOwnedFor(assigneeId: string, dedupKey = DEDUP_KEY) {
+      const input = creationInput({ executionOwner: "human", assigneeIds: [assigneeId] });
+      const first = createTaskWithIntakeBinding(input, bindingInput(DIGEST_A, dedupKey));
+      if (first?.outcome !== "created") throw new Error("expected created");
+      return { input, first };
+    }
+
+    function deactivate(id: string): void {
+      db.update(participants)
+        .set({ active: false, deactivatedAt: new Date().toISOString() })
+        .where(eq(participants.id, id))
+        .run();
+    }
+
+    it("resolves the identical replay of a human-owned task after its assignee was deactivated", () => {
+      const assignee = participantRow();
+      db.insert(participants).values(assignee).run();
+      const { input, first } = admitHumanOwnedFor(assignee.id);
+
+      // ONLY the assignee changes; the binding is already durable.
+      deactivate(assignee.id);
+
+      const replay = createTaskWithIntakeBinding(input, bindingInput(DIGEST_A));
+      expect(replay?.outcome).toBe("replayed");
+      if (replay?.outcome !== "replayed") throw new Error("expected replayed");
+      expect(replay.task?.id).toBe(first.task.id);
+      expect(replay.task?.executionOwner).toBe("human");
+      expect(countTasks(db)).toBe(1);
+      expect(countBindings(db)).toBe(1);
+      // Ownership rows were neither duplicated nor mutated.
+      const assignments = db.select().from(taskAssignments).all();
+      expect(assignments).toHaveLength(1);
+      expect(assignments[0]?.participantId).toBe(assignee.id);
+    });
+
+    it("replays the terminal human-owned task after its assignee was deactivated", () => {
+      const assignee = participantRow();
+      db.insert(participants).values(assignee).run();
+      const { input, first } = admitHumanOwnedFor(assignee.id);
+      deactivate(assignee.id);
+      db.update(tasks).set({ status: "done" }).where(eq(tasks.id, first.task.id)).run();
+
+      const replay = createTaskWithIntakeBinding(input, bindingInput(DIGEST_A));
+      expect(replay?.outcome).toBe("replayed");
+      if (replay?.outcome !== "replayed") throw new Error("expected replayed");
+      expect(replay.task?.id).toBe(first.task.id);
+      expect(replay.task?.status).toBe("done");
+      expect(countTasks(db)).toBe(1);
+      expect(countBindings(db)).toBe(1);
+    });
+
+    it("returns the retained tombstone, not an ownership rejection, after the assignee was deactivated", () => {
+      const assignee = participantRow();
+      db.insert(participants).values(assignee).run();
+      const { input, first } = admitHumanOwnedFor(assignee.id);
+      deactivate(assignee.id);
+      db.delete(tasks).where(eq(tasks.id, first.task.id)).run();
+
+      const replay = createTaskWithIntakeBinding(input, bindingInput(DIGEST_A));
+      expect(replay?.outcome).toBe("replayed");
+      if (replay?.outcome !== "replayed") throw new Error("expected replayed");
+      expect(replay.task).toBeNull();
+      expect(replay.binding.taskId).toBe(first.task.id);
+      expect(countTasks(db)).toBe(0);
+      expect(countBindings(db)).toBe(1);
+    });
+
+    it("resolves a conflict for a known request id even when the assignee has been deactivated", () => {
+      const assignee = participantRow();
+      db.insert(participants).values(assignee).run();
+      const { first } = admitHumanOwnedFor(assignee.id);
+      deactivate(assignee.id);
+
+      const conflict = createTaskWithIntakeBinding(
+        creationInput({ executionOwner: "human", assigneeIds: [assignee.id], title: "Changed" }),
+        bindingInput(DIGEST_B),
+      );
+      expect(conflict?.outcome).toBe("conflict");
+      if (conflict?.outcome !== "conflict") throw new Error("expected conflict");
+      expect(conflict.binding.taskId).toBe(first.task.id);
+      expect(conflict.binding.payloadDigest).toBe(DIGEST_A);
+      expect(countTasks(db)).toBe(1);
+      expect(countBindings(db)).toBe(1);
+    });
+
+    it("still rejects a first admission whose assignee is inactive (creation-only eligibility retained)", () => {
+      const assignee = participantRow({ active: false });
+      db.insert(participants).values(assignee).run();
+
+      const rejected = createTaskWithIntakeBinding(
+        creationInput({ executionOwner: "human", assigneeIds: [assignee.id] }),
+        bindingInput(DIGEST_A, "participant|relay-svc|proj-intake|relay-svc:fresh-1"),
+      );
+      expect(rejected).toBeUndefined();
+      expect(countTasks(db)).toBe(0);
+      expect(countBindings(db)).toBe(0);
+    });
   });
 
   it("resolves exactly one created outcome under a distinct-process race on the same dedup key", async () => {
