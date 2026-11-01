@@ -1,10 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { eq } from "drizzle-orm";
+import Database from "better-sqlite3";
 import { closeDb, getDb } from "@aif/shared/server";
 import { projects, taskIntakeBindings, tasks, type NewTaskRow } from "@aif/shared";
 
@@ -419,5 +420,143 @@ describe("getAiWorkloadState (binding-agnostic workload predicate, §8.2)", () =
     const laterClock = future(2);
     const state = getAiWorkloadState(laterClock);
     expect(state.timedPendingCount).toBe(0);
+  });
+});
+
+describe("pinned host SQL mirror (C2 amendment, §11.12)", () => {
+  // The C2 host amendment (`scripts/workstation/pc-busy/wsl-report-amendment.example.ps1`)
+  // must stay a faithful mirror of the source predicate: this executes the
+  // PINNED SQL TEXT from the amendment file against the same fixture DB over
+  // a separate READONLY better-sqlite3 connection — the exact modality the
+  // host writer uses — and proves it agrees with `getAiWorkloadState()`
+  // (binding-agnostic: no `task_intake_bindings` join anywhere, M4).
+  let workDir: string;
+  let db: Db;
+  let dbPath: string;
+  let nowIso: string;
+
+  beforeEach(() => {
+    closeDb();
+    workDir = mkdtempSync(join(tmpdir(), "aif-workload-sql-"));
+    dbPath = join(workDir, "workload.sqlite");
+    db = getDb(dbPath);
+    db.insert(projects)
+      .values({ id: PROJECT_ID, name: "Workload SQL", rootPath: join(workDir, "root") })
+      .run();
+    nowIso = "2026-11-05T12:00:00.000Z";
+  });
+
+  afterEach(() => {
+    closeDb();
+    rmSync(workDir, { recursive: true, force: true });
+  });
+
+  function rawTask(overrides: Partial<NewTaskRow> = {}): void {
+    db.insert(tasks)
+      .values({
+        projectId: PROJECT_ID,
+        title: "workload sql fixture",
+        executionOwner: "ai",
+        ...overrides,
+        id: crypto.randomUUID(),
+      })
+      .run();
+  }
+
+  function offsetIso(hours: number): string {
+    return new Date(new Date(nowIso).getTime() + hours * 3_600_000).toISOString();
+  }
+
+  function loadPinnedSql(): string {
+    const ps1 = readFileSync(
+      fileURLToPath(
+        new URL(
+          "../../../../scripts/workstation/pc-busy/wsl-report-amendment.example.ps1",
+          import.meta.url,
+        ),
+      ),
+      "utf8",
+    );
+    const match = /\$aifPendingSql = @"\n([\s\S]*?)\n"@/.exec(ps1);
+    expect(match, "pinned SQL here-string not found in the C2 amendment").toBeTruthy();
+    return match![1];
+  }
+
+  /** The host modality: a SEPARATE readonly connection running the raw SQL. */
+  function runPinnedSql(sql: string): number {
+    const readonly = new Database(dbPath, { readonly: true });
+    try {
+      const row = readonly.prepare(sql).get(nowIso, nowIso) as { n: number };
+      return row.n;
+    } finally {
+      readonly.close();
+    }
+  }
+
+  it("agrees with the source predicate over a mixed fixture, with no intake join (M4)", () => {
+    const sql = loadPinnedSql();
+    expect(sql.toUpperCase()).toContain("SELECT COUNT(*)");
+    // Binding-agnostic by construction — the host channel never reads bindings.
+    expect(sql).not.toContain("task_intake_bindings");
+
+    rawTask({ status: "backlog" }); // pending only (admitted-not-started, no binding)
+    rawTask({ status: "backlog", scheduledAt: offsetIso(2) }); // pending ∩ timed (counted once)
+    rawTask({ status: "planning", lockedBy: "coordinator", lockedUntil: offsetIso(1) }); // busy only
+    rawTask({ status: "implementing", lockedBy: null, lockedUntil: null }); // busy + pending
+    rawTask({ status: "plan_ready", autoMode: true }); // pending (auto-start)
+    // Gated rows — the human/external gates the guard excludes.
+    rawTask({ status: "plan_ready", autoMode: false });
+    rawTask({ status: "backlog", paused: true });
+    rawTask({ status: "blocked_external", scheduledAt: offsetIso(1) });
+    rawTask({ status: "plan_ready", autoMode: true, manualReviewRequired: true });
+    rawTask({ status: "implementing", executionOwner: "human" });
+    rawTask({ status: "done", scheduledAt: offsetIso(1) });
+    rawTask({ status: "verified" });
+    rawTask({ status: "backlog", scheduledAt: offsetIso(-1) }); // pending, not timed (due catch-up)
+
+    const state = getAiWorkloadState(nowIso);
+    expect(state.busy).toBe(2);
+    expect(state.pendingCount).toBe(5);
+    expect(state.timedPendingCount).toBe(1);
+    // Exactly one deliberate overlap row (backlog + future schedule):
+    const expectedUnion = state.pendingCount + state.timedPendingCount - 1;
+    expect(expectedUnion).toBe(5);
+
+    // The host channel (separate readonly connection, pinned SQL text)
+    // returns the same protection count as the source predicate.
+    expect(runPinnedSql(sql)).toBe(expectedUnion);
+  });
+
+  it("stays in agreement after a live schedule fires (row leaves both classes)", () => {
+    const sql = loadPinnedSql();
+    rawTask({ status: "backlog" });
+    const fired = crypto.randomUUID();
+    db.insert(tasks)
+      .values({
+        projectId: PROJECT_ID,
+        title: "fired obligation",
+        executionOwner: "ai",
+        status: "backlog",
+        scheduledAt: offsetIso(2),
+        id: fired,
+      })
+      .run();
+
+    let state = getAiWorkloadState(nowIso);
+    expect(state.pendingCount).toBe(2);
+    expect(state.timedPendingCount).toBe(1);
+    expect(runPinnedSql(sql)).toBe(2); // union = 2 + 1 − 1 overlap
+
+    // The scheduler fires it: leaves backlog, holds a live lock, clears the
+    // schedule — drops out of pending AND timed, still busy.
+    db.update(tasks)
+      .set({ status: "planning", lockedBy: "coordinator", lockedUntil: offsetIso(1), scheduledAt: null })
+      .where(eq(tasks.id, fired))
+      .run();
+    state = getAiWorkloadState(nowIso);
+    expect(state.busy).toBe(1);
+    expect(state.pendingCount).toBe(1);
+    expect(state.timedPendingCount).toBe(0);
+    expect(runPinnedSql(sql)).toBe(1);
   });
 });

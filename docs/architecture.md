@@ -327,9 +327,11 @@ poll cycle the coordinator calls `processDueScheduledTasks()` which:
 3. Appends a `[scheduler]` entry to the task activity log.
 4. Broadcasts `task:scheduled_fired` via WebSocket.
 
-Past timestamps are rejected at the API layer with `400`; `null` clears a
-previous schedule. Scheduled firing is one-shot — the task never re-fires
-automatically after `scheduledAt` is cleared.
+Past timestamps are rejected at the API layer with `400` on the legacy path;
+`null` clears a previous schedule. Scheduled firing is one-shot — the task
+never re-fires automatically after `scheduledAt` is cleared. (Keyed intake
+first delivery is the exception — a delayed delivery is admitted and caught
+up; see [Workstation Intake](#workstation-intake-and-handover-pc-wake-on-work).)
 
 ### Auto-Queue Mode
 
@@ -417,6 +419,68 @@ in-flight and reduces how many slots auto-queue still needs to fill. Both
 passes use the same atomic `claimBacklogTaskForAdvance` write so a row is moved
 out of `backlog` exactly once even when both passes target the same task in the
 same cycle.
+
+## Workstation Intake and Handover (PC wake-on-work)
+
+An always-on workstation bridge can retain incoming task requests while the
+PC sleeps and deliver them to the canonical task authority exactly once.
+The bridge-side engine lives in
+[`scripts/workstation/intake-relay/`](../scripts/workstation/intake-relay/)
+(dependency-free Node ESM; operator runbook in
+[workstation-intake.md](workstation-intake.md)). It is a transport/admission
+integration — not a planner, coordinator, or second task store.
+
+**Destination transaction boundary.** A keyed create carries
+`intake: { requestId }`; the API-verified session principal, the project, the
+namespaced request ID, and a server-computed digest of the client content are
+committed with the task in **one** transaction into `task_intake_bindings`
+(migration v29; append-only — bindings and tombstones are the anti-replay
+memory). Replay of identical content returns the original task at any later
+status (never restarts it); conflicting content is rejected (`409`); a deleted
+original resolves to an explicit tombstone (`410`, never re-admitted). The
+frozen digest canonicalizes only client-supplied fields, so changed
+environment defaults, project config, or elapsed time can never turn a replay
+into a new task.
+
+**Fail-closed retention on the bridge.** Submissions authenticate at the
+existing SSH boundary (forced-command shim resolving the principal from the
+key sshd presented) and again at the single-writer IPC (Unix socket, `0600`,
+mandatory per-instance credential, timing-safe compare — no unauthenticated
+mode exists). One writer process owns the whole spool: quota → temp file →
+file fsync → rename → directory fsync → receipt; bounds refuse new work
+truthfully and never evict accepted work. The singleton latch is the socket
+bind itself, fail-closed: any bind failure refuses startup and the relay never
+unlinks/reclaims its own socket path (stale-path cleanup belongs to the
+supervisor after verified cessation).
+
+**Delivery, wake, and handover.** Default mode is retain-only (zero network
+calls, zero wake). In deliver mode the relay probes `GET /agent/status` →
+`intakeCompat` before any keyed POST (missing/mismatched ⇒ `hold_api_compat`,
+zero POSTs), classifies admission responses (terminal 409/410; retained HOLD
+on 401/403/422/400/404; bounded byte-identical retry on network/5xx), and
+treats an unreachable endpoint as "PC may be asleep": a bounded, coalescing
+wake fires, the PC-initiated reverse forward re-establishes, and delivery
+proceeds. Admission is not completion: immediately-eligible envelopes are
+watched by authenticated `GET /tasks/:id` polling until pickup evidence (task
+left `backlog`, holds a live lock, or reached a terminal status); a future
+`scheduledAt` completes the envelope at admission. Exhausted budgets park the
+envelope as `hold_handover_unconfirmed` — truthful, never an infinite wake
+storm. A durable operator fence (`relay.mjs fence`) plus the conjunctive
+rollback guard order any incompatible API swap (fence → verified cessation →
+drain → guard PERMIT → swap).
+
+**Awake/sleep ownership.** `GET /agent/status` exposes `workload`
+(`getAiWorkloadState()`) — a binding-agnostic count of AI-owned obligations
+(admitted-not-started, unlocked in-stage, `plan_ready` auto-start, future
+`scheduledAt`) from any entry path. The host sleep guard consumes the pinned
+SQL amendment of the same predicate (owner-reviewed material in
+[`scripts/workstation/pc-busy/`](../scripts/workstation/pc-busy/README.md)),
+so an awake PC stays awake while canonical work exists — including the
+ACK-before-start window and timed obligations, from intake or legacy UI
+alike. The relay owns no due-time timers; waking a sleeping PC at a future
+`scheduledAt` is not provided by this slice. Until the host amendments are
+applied and qualified, automatic sleep with admitted-but-unpicked keyed work
+is explicitly NOT qualified — the material defaults fail-awake.
 
 ## Roadmap Import
 
@@ -507,6 +571,7 @@ Key tables:
 - **codex_limit_heads / codex_limit_history** — latest and recent normalized Codex limit snapshots keyed by account fingerprint/project scope/limit id
 - **codex_index_cursors** — per-indexer progress/watermark state for incremental reconcile
 - **task_comments** — human/agent comments with optional attachments
+- **task_intake_bindings** — keyed-intake replay bindings (dedup key `principal|principal|project|namespaced requestId` → task id + server-computed payload digest), append-only; tombstones survive task deletion (no FK) for the supported replay lifetime
 
 ### Indexes
 
@@ -518,6 +583,7 @@ Runtime index bootstrap creates the following indexes via `CREATE INDEX IF NOT E
 - `idx_tasks_status_retry` — composite for coordinator retry queries
 - `idx_tasks_project_status` — composite for ordered task-list queries
 - `idx_task_comments_task_id` — comment lookups by task
+- `idx_task_intake_bindings_task` — keyed-intake binding lookup by task id
 - `idx_tasks_locked` — parallel execution: find unlocked or stale-locked tasks
 - `idx_codex_sessions_project_root_updated` / `idx_codex_sessions_file_path` — local Codex session listing and session-id/file-path lookup
 - `idx_codex_limit_heads_lookup` — account/project/limit scoped head overlay queries
@@ -527,3 +593,4 @@ Runtime index bootstrap creates the following indexes via `CREATE INDEX IF NOT E
 
 - [Getting Started](getting-started.md) — installation and setup
 - [API Reference](api.md) — REST endpoints and WebSocket protocol
+- [Workstation Intake](workstation-intake.md) — bridge relay runbook (PC wake-on-work)
