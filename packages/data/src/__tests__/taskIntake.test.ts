@@ -349,6 +349,25 @@ describe("getAiWorkloadState (binding-agnostic workload predicate, §8.2)", () =
     expect(state.pendingCount).toBe(1);
   });
 
+  it("excludes a human-gated plan_ready row from the timed obligation count too (§8.2)", () => {
+    // A plan parked for manual decision with a future scheduledAt must not
+    // hold the PC awake indefinitely — the human gate wins over the timer.
+    rawTask({ status: "plan_ready", autoMode: false, scheduledAt: future(3) });
+    const state = getAiWorkloadState(nowIso);
+    expect(state.timedPendingCount).toBe(0);
+    expect(state.earliestScheduledAt).toBeNull();
+    expect(state.pendingCount).toBe(0);
+    expect(state.busy).toBe(0);
+
+    // The auto-start counterpart with the same schedule stays protective.
+    rawTask({ status: "plan_ready", autoMode: true, scheduledAt: future(4) });
+    const after = getAiWorkloadState(nowIso);
+    expect(after.timedPendingCount).toBe(1);
+    expect(after.earliestScheduledAt).toBe(future(4));
+    // Counted once for the row, in both classes.
+    expect(after.pendingCount).toBe(1);
+  });
+
   it("excludes human gates and terminal rows from every counter", () => {
     rawTask({ status: "backlog", paused: true });
     rawTask({ status: "blocked_external", scheduledAt: future(1) });
@@ -504,8 +523,11 @@ describe("pinned host SQL mirror (C2 amendment, §11.12)", () => {
     rawTask({ status: "planning", lockedBy: "coordinator", lockedUntil: offsetIso(1) }); // busy only
     rawTask({ status: "implementing", lockedBy: null, lockedUntil: null }); // busy + pending
     rawTask({ status: "plan_ready", autoMode: true }); // pending (auto-start)
-    // Gated rows — the human/external gates the guard excludes.
-    rawTask({ status: "plan_ready", autoMode: false });
+    // Gated rows — the human/external gates the guard excludes. The
+    // human-gated row below carries a future schedule on purpose: the gate
+    // must win over the timed branch in BOTH mirrors (review finding — the
+    // timed branch used to count it and keep the PC awake indefinitely).
+    rawTask({ status: "plan_ready", autoMode: false, scheduledAt: offsetIso(3) });
     rawTask({ status: "backlog", paused: true });
     rawTask({ status: "blocked_external", scheduledAt: offsetIso(1) });
     rawTask({ status: "plan_ready", autoMode: true, manualReviewRequired: true });

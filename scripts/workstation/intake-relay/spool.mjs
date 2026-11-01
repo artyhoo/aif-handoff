@@ -90,8 +90,16 @@ function dirnameOf(filePath) {
   return idx <= 0 ? "/" : filePath.slice(0, idx);
 }
 
-export function createSpool({ dir, maxEnvelopes, maxBytes, now = () => new Date().toISOString() }) {
-  mkdirSync(dir, { recursive: true });
+export function createSpool({
+  dir,
+  maxEnvelopes,
+  maxBytes,
+  now = () => new Date().toISOString(),
+  create = true,
+}) {
+  // Read-only consumers (`--status`) pass `create:false`: observing the spool
+  // must never create it on a fresh host (independent-review repair).
+  if (create) mkdirSync(dir, { recursive: true });
 
   function envelopePath(id) {
     return join(dir, `${id}.json`);
@@ -215,11 +223,16 @@ export function createSpool({ dir, maxEnvelopes, maxBytes, now = () => new Date(
    * Restart scan (§9.1): receipt-less temp files are discarded (no receipt was
    * ever issued for them; resubmit is idempotent at the API by binding);
    * every parsed envelope is conservatively re-pended to `pending` when its
-   * state is delivery-capable (redelivery is idempotent by binding).
+   * state is delivery-capable (redelivery is idempotent by binding). A record
+   * that cannot be parsed never blocks startup and is never silently deleted:
+   * its bytes are preserved by renaming the file to `<name>.corrupt` and the
+   * scan reports it truthfully (same tolerance as `list()`; independent-review
+   * repair — the unguarded parse used to fail the whole deliverer startup).
    */
   function restartScan() {
     const discardedTemps = [];
     const rePended = [];
+    const corrupted = [];
     for (const entry of readdirSync(dir)) {
       if (entry.startsWith(TEMP_PREFIX)) {
         unlinkSync(join(dir, entry));
@@ -227,7 +240,25 @@ export function createSpool({ dir, maxEnvelopes, maxBytes, now = () => new Date(
         continue;
       }
       if (!entry.endsWith(".json")) continue;
-      const record = JSON.parse(readFileSync(join(dir, entry), "utf8"));
+      let record = null;
+      try {
+        record = JSON.parse(readFileSync(join(dir, entry), "utf8"));
+      } catch {
+        // Preserve the bytes; surface the corruption; keep starting. The
+        // quarantine destination never overwrites earlier forensic bytes: when
+        // `<name>.json.corrupt` already exists, a numbered sibling is used
+        // (independent-review repair — a plain rename would atomically replace
+        // the earlier corrupt file and destroy its evidence).
+        let corruptTarget = join(dir, `${entry}.corrupt`);
+        let suffix = 0;
+        while (existsSync(corruptTarget)) {
+          suffix += 1;
+          corruptTarget = join(dir, `${entry}.corrupt.${suffix}`);
+        }
+        renameSync(join(dir, entry), corruptTarget);
+        corrupted.push(entry);
+        continue;
+      }
       if (record.state === "admitted") {
         // An in-flight admission attempt without a recorded terminal response
         // is an uncertain effect → back to pending (idempotent by binding).
@@ -237,7 +268,7 @@ export function createSpool({ dir, maxEnvelopes, maxBytes, now = () => new Date(
         rePended.push(record.id);
       }
     }
-    return { discardedTemps, rePended };
+    return { discardedTemps, rePended, corrupted };
   }
 
   return { dir, writerReceive, list, get, updateState, restartScan, stats, envelopePath };

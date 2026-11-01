@@ -89,6 +89,28 @@ const DIGEST_FIELDS = [
 
 const SORT_TOLERANT_ARRAY_FIELDS = new Set(["assigneeIds", "tags"]);
 
+// Static-constant defaults the intake schema injects for absent fields —
+// byte-identical mirror of `INTAKE_STATIC_DEFAULTS` in
+// `packages/shared/src/intakeDigest.ts`. Filling them here keeps this mirror
+// equal to the API's digest for sparse bodies too: the API digests its
+// schema-parsed body, which already contains exactly these constants. ONLY
+// static constants may appear here — never an env-derived, route-derived,
+// forced, or mode-driven default (those must stay excluded so they cannot
+// move a digest over time, round-2 M2).
+const STATIC_DEFAULTS = Object.freeze({
+  assigneeIds: [],
+  autoMode: true,
+  description: "",
+  executionOwner: "ai",
+  isFix: false,
+  paused: false,
+  plannerMode: "fast",
+  runPlanImprove: false,
+  runPostVerify: false,
+  tags: [],
+  priority: 0,
+});
+
 function normalizeIsoToUtcZ(value) {
   const parsed = Date.parse(value);
   return Number.isNaN(parsed) ? value : new Date(parsed).toISOString();
@@ -121,7 +143,14 @@ function canonicalizeValue(field, value) {
 export function canonicalizeIntakePayload(payload) {
   const canonical = {};
   for (const field of DIGEST_FIELDS) {
-    canonical[field] = canonicalizeValue(field, payload?.[field]);
+    let value = payload?.[field];
+    if (value === undefined && field in STATIC_DEFAULTS) {
+      // Copy array defaults so no shared mutable instance leaks into the
+      // canonical form (JSON.stringify would observe later mutations).
+      const fallback = STATIC_DEFAULTS[field];
+      value = Array.isArray(fallback) ? [...fallback] : fallback;
+    }
+    canonical[field] = canonicalizeValue(field, value);
   }
   return JSON.stringify(canonical);
 }
@@ -259,7 +288,14 @@ export function revalidateSealedEnvelope(envelope, principalMap, defaults) {
   if (envelope.dedupKey !== recomputedDedupKey) {
     throw new EnvelopeError("dedup_key_invalid", "dedup key does not match the identity fields");
   }
-  if (envelope.bodyBytes > principal.maxRequestBytes) {
+  // The per-principal size bound is enforced against the ACTUAL body, never
+  // the client-supplied `bodyBytes` claim (independent-review repair): the
+  // claim is informational only and a forged envelope could understate it.
+  // The digest check below would catch tampering, but ordering this size
+  // check first against the recomputed bytes keeps a forged low-claim/high-
+  // size envelope on the truthful size refusal.
+  const actualBodyBytes = Buffer.byteLength(JSON.stringify(envelope.body ?? null), "utf8");
+  if (actualBodyBytes > principal.maxRequestBytes) {
     throw new EnvelopeError("payload_too_large", "payload exceeds the principal bound");
   }
   if (!principal.allowedProjects.includes(envelope.projectId)) {

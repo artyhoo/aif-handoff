@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Hono } from "hono";
 import { eq } from "drizzle-orm";
+import { fileURLToPath } from "node:url";
 import { auditEvents, projects, taskIntakeBindings, tasks } from "@aif/shared";
 import { createTestDb } from "@aif/shared/server";
 import type { ParticipantApiEnv } from "../middleware/participantAuth.js";
@@ -156,6 +157,44 @@ describe("POST /tasks keyed intake admission (§7.5)", () => {
     expect(broadcastsOfType("agent:wake")).toHaveLength(1);
   });
 
+  it("binds a digest equal to the bridge relay mirror's digest of the same sparse raw body", async () => {
+    // The API digests the schema-PARSED body; the relay digests the RAW client
+    // body. For sparse bodies the two only agree because the canonicalization
+    // fills the schema's static-constant defaults on both sides (independent
+    // -review repair). This test is the live cross-boundary proof: a real
+    // keyed admission through HTTP, compared against the dependency-free .mjs
+    // mirror over the same bytes.
+    const envelopeModule = (await import(
+      fileURLToPath(
+        new URL("../../../../scripts/workstation/intake-relay/envelope.mjs", import.meta.url),
+      )
+    )) as { computeIntakePayloadDigest: (payload: Record<string, unknown>) => string };
+
+    const admin = await createAuthenticatedParticipant("admin");
+    const app = createApp();
+    const rawBody = {
+      projectId: PROJECT_ID,
+      title: "Sparse intake task",
+      intake: { requestId: REQUEST_ID },
+    };
+
+    const res = await app.request("/tasks", {
+      method: "POST",
+      headers: authHeaders(admin.session, true),
+      body: JSON.stringify(rawBody),
+    });
+
+    expect(res.status).toBe(201);
+    const { intake } = (await res.json()) as { intake: { digest: string } };
+    const binding = testDb.current.select().from(taskIntakeBindings).all()[0];
+    expect(countBindings()).toBe(1);
+
+    const { intake: _excluded, ...clientContent } = rawBody;
+    const mirrorDigest = envelopeModule.computeIntakePayloadDigest(clientContent);
+    expect(binding.payloadDigest).toBe(mirrorDigest);
+    expect(intake.digest).toBe(mirrorDigest);
+  });
+
   it("returns 422 intake_principal_unavailable with zero writes when participants mode is disabled", async () => {
     envOverrides.PARTICIPANTS_MODE_ENABLED = false;
     const admin = await createAuthenticatedParticipant("admin");
@@ -229,6 +268,57 @@ describe("POST /tasks keyed intake admission (§7.5)", () => {
     expect(countTasks()).toBe(0);
     expect(countBindings()).toBe(0);
     expect(mockBroadcast).not.toHaveBeenCalled();
+  });
+
+  it("mirrors the legacy member self-assignment rule: a member cannot key a human task to someone else (403)", async () => {
+    // Parity with the legacy branch (independent-review repair): the keyed
+    // path must not become a trust bypass around the member authorization
+    // rule. 403 = auth/config condition → relay hold_auth_config, no retry.
+    const member = await createAuthenticatedParticipant("member");
+    const other = await createAuthenticatedParticipant("admin");
+    const app = createApp();
+
+    const res = await app.request("/tasks", {
+      method: "POST",
+      headers: authHeaders(member.session, true),
+      body: JSON.stringify(
+        keyedBody({
+          requestId: "relay-svc:p2-member-bypass-1",
+          executionOwner: "human",
+          assigneeIds: [other.participant.id],
+        }),
+      ),
+    });
+
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { code: string };
+    expect(body.code).toBe("forbidden");
+    expect(countTasks()).toBe(0);
+    expect(countBindings()).toBe(0);
+    expect(mockBroadcast).not.toHaveBeenCalled();
+  });
+
+  it("still lets a member key a human task assigned to themselves (positive parity)", async () => {
+    const member = await createAuthenticatedParticipant("member");
+    const app = createApp();
+
+    const res = await app.request("/tasks", {
+      method: "POST",
+      headers: authHeaders(member.session, true),
+      body: JSON.stringify(
+        keyedBody({
+          requestId: "relay-svc:p2-member-self-1",
+          executionOwner: "human",
+          assigneeIds: [member.participant.id],
+        }),
+      ),
+    });
+
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as { id: string; executionOwner: string };
+    expect(body.executionOwner).toBe("human");
+    expect(countTasks()).toBe(1);
+    expect(countBindings()).toBe(1);
   });
 
   it("rejects request IDs outside the §7.4 identity bounds", async () => {
@@ -480,6 +570,45 @@ describe("POST /tasks keyed ordering stability (M2, §7.5)", () => {
     expect(countBindings()).toBe(1);
     // The created row still carries the env defaults that were live at admission.
     expect(created.useSubagents).toBe(false);
+  });
+
+  it("keeps the digest identical when the project's parallelEnabled flips between create and replay", async () => {
+    // Route-level forcing (§7.5 step 3, M2): `parallelEnabled → plannerMode
+    // "full"` happens AFTER the digest is frozen, so flipping the project
+    // between create and replay must resolve a replay, never a conflict.
+    const admin = await createAuthenticatedParticipant("admin");
+    const app = createApp();
+    const payload = JSON.stringify(keyedBody({ requestId: "relay-svc:p2-parallel-flip-1" }));
+
+    const first = await app.request("/tasks", {
+      method: "POST",
+      headers: authHeaders(admin.session, true),
+      body: payload,
+    });
+    expect(first.status).toBe(201);
+    const created = (await first.json()) as { id: string; plannerMode: string };
+    expect(created.plannerMode).toBe("fast");
+
+    testDb.current
+      .update(projects)
+      .set({ parallelEnabled: true })
+      .where(eq(projects.id, PROJECT_ID))
+      .run();
+
+    const replay = await app.request("/tasks", {
+      method: "POST",
+      headers: authHeaders(admin.session, true),
+      body: payload,
+    });
+
+    expect(replay.status).toBe(200);
+    const body = (await replay.json()) as { id: string; task?: { plannerMode?: string } };
+    expect(body.id).toBe(created.id);
+    expect(countTasks()).toBe(1);
+    expect(countBindings()).toBe(1);
+    // The original row keeps the plannerMode frozen at admission time.
+    const stored = testDb.current.select().from(tasks).all()[0];
+    expect(stored.plannerMode).toBe("fast");
   });
 
   it("rejects the same request ID with a different scheduledAt as a conflict", async () => {

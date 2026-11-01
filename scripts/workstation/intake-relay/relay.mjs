@@ -12,7 +12,7 @@
 // the deliverer is stopped or hung. Envelope mutations, by contrast, always go
 // through the writer IPC — there is no second spool writer.
 
-import { readFileSync, realpathSync, statSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -31,15 +31,23 @@ function printStatus(config) {
   let spool = null;
   let envelopes = [];
   let spoolError = null;
-  try {
-    spool = createSpool({
-      dir: config.spoolDir,
-      maxEnvelopes: config.maxEnvelopes,
-      maxBytes: config.maxBytes,
-    });
-    envelopes = spool.list();
-  } catch (error) {
-    spoolError = String(error?.message ?? error);
+  // Read-only observation: report an absent spool truthfully instead of
+  // creating it (independent-review repair).
+  let spoolNote = null;
+  if (!existsSync(config.spoolDir)) {
+    spoolNote = "absent (nothing retained yet)";
+  } else {
+    try {
+      spool = createSpool({
+        dir: config.spoolDir,
+        maxEnvelopes: config.maxEnvelopes,
+        maxBytes: config.maxBytes,
+        create: false,
+      });
+      envelopes = spool.list();
+    } catch (error) {
+      spoolError = String(error?.message ?? error);
+    }
   }
   const summary = {
     mode: config.mode,
@@ -50,6 +58,7 @@ function printStatus(config) {
     spool: spool
       ? { count: envelopes.length, maxEnvelopes: config.maxEnvelopes, maxBytes: config.maxBytes }
       : null,
+    spoolNote,
     spoolError,
     envelopes: envelopes.map((record) => ({
       id: record.id,

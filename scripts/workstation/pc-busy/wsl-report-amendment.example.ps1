@@ -32,6 +32,7 @@ WHERE execution_owner = 'ai'
   AND paused = 0
   AND status <> 'blocked_external'
   AND manual_review_required = 0
+  AND NOT (status = 'plan_ready' AND auto_mode = 0)
   AND status NOT IN ('done', 'verified')
   AND (
         status = 'backlog'

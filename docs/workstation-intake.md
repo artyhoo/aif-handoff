@@ -126,7 +126,10 @@ Envelope lifecycle and HOLD semantics:
 - The spool is crash-safe: the retention receipt is issued only after the
   envelope file **and its parent directory** are fsynced. A restart discards
   receipt-less temp files and re-pends ambiguous entries (redelivery is
-  idempotent by binding).
+  idempotent by binding). An unparseable record never blocks startup and is
+  never deleted: it is quarantined as `<name>.json.corrupt` (or
+  `<name>.json.corrupt.<n>` when that destination already exists — earlier
+  forensic bytes are never overwritten) and reported by the restart scan.
 - Storage bounds (count + bytes) refuse new work truthfully; accepted work is
   never evicted.
 - **Singleton is fail-closed:** the Unix socket bind is the latch. If the path
@@ -139,6 +142,23 @@ Envelope lifecycle and HOLD semantics:
 - Bridge spool + bindings live on bridge disk, separately from the canonical
   D-backed PC storage. Bindings are append-only and are the anti-replay memory
   for the supported replay lifetime.
+
+## First-deployment preconditions
+
+- **Frozen-digest canonicalization is deployment-fresh.** The digest
+  canonicalization changed before any deployment: absent optional fields now
+  fill the eleven static schema defaults instead of the earlier null sentinel.
+  No environment had live intake state under the older canonicalization
+  (deployment is still gated behind the exact-candidate review), so nothing
+  needed migrating — and **no upgrade proof or replay compatibility across the
+  canonicalization change is claimed or provided**.
+- **Precondition for any first deployment:** the target database must hold no
+  pre-existing `task_intake_bindings` rows and the bridge spool no
+  pre-existing envelopes that were written under a different canonicalization.
+  A binding or sealed envelope computed under the old canonicalization would
+  turn byte-identical replays into `intake_conflict` (409) responses after the
+  change. If such state is ever found, stop and reconcile with the direction
+  owner — do not re-seal, re-bind, or "upgrade" it in place.
 
 ## Rollback / API swap (bridge)
 

@@ -42,7 +42,7 @@
       "expectedDigest": "b72e8795fdd7a1c64bf88cc66d86b52618bc2aec43844cc168d707c5c7ff06f9"
     },
     {
-      "name": "absent-optionals-are-null",
+      "name": "absent-optionals-sentinel-or-static-default",
       "description": "Only the required trio present; every absent optional canonicalizes to the null sentinel (never an env/route default).",
       "payload": {
         "projectId": "proj-1",
@@ -50,8 +50,8 @@
         "description": "Deliver the nightly intake bundle",
         "priority": 2
       },
-      "expectedCanonicalJson": "{\"assigneeIds\":null,\"autoMode\":null,\"autoQa\":null,\"description\":\"Deliver the nightly intake bundle\",\"executionOwner\":null,\"isFix\":null,\"maxReviewIterations\":null,\"modelOverride\":null,\"paused\":null,\"planDocs\":null,\"planPath\":null,\"planTests\":null,\"plannerMode\":null,\"priority\":2,\"projectId\":\"proj-1\",\"roadmapAlias\":null,\"runPlanImprove\":null,\"runPostVerify\":null,\"runtimeOptions\":null,\"runtimeProfileId\":null,\"scheduledAt\":null,\"skipReview\":null,\"tags\":null,\"title\":\"Wake the PC and file the intake report\",\"useSubagents\":null}",
-      "expectedDigest": "1e57f99e14b6cdefa96695007e46f67dda908f02b3eb13da6dcd1836e1b05ae6"
+      "expectedCanonicalJson": "{\"assigneeIds\":[],\"autoMode\":true,\"autoQa\":null,\"description\":\"Deliver the nightly intake bundle\",\"executionOwner\":\"ai\",\"isFix\":false,\"maxReviewIterations\":null,\"modelOverride\":null,\"paused\":false,\"planDocs\":null,\"planPath\":null,\"planTests\":null,\"plannerMode\":\"fast\",\"priority\":2,\"projectId\":\"proj-1\",\"roadmapAlias\":null,\"runPlanImprove\":false,\"runPostVerify\":false,\"runtimeOptions\":null,\"runtimeProfileId\":null,\"scheduledAt\":null,\"skipReview\":null,\"tags\":[],\"title\":\"Wake the PC and file the intake report\",\"useSubagents\":null}",
+      "expectedDigest": "5c0113829cf135cd878f5639750471be207e71cd724558b66d2068f163683458"
     },
     {
       "name": "scheduledat-offset-variant-a",
@@ -63,8 +63,8 @@
         "priority": 2,
         "scheduledAt": "2026-11-05T09:30:00+02:00"
       },
-      "expectedCanonicalJson": "{\"assigneeIds\":null,\"autoMode\":null,\"autoQa\":null,\"description\":\"Deliver the nightly intake bundle\",\"executionOwner\":null,\"isFix\":null,\"maxReviewIterations\":null,\"modelOverride\":null,\"paused\":null,\"planDocs\":null,\"planPath\":null,\"planTests\":null,\"plannerMode\":null,\"priority\":2,\"projectId\":\"proj-1\",\"roadmapAlias\":null,\"runPlanImprove\":null,\"runPostVerify\":null,\"runtimeOptions\":null,\"runtimeProfileId\":null,\"scheduledAt\":\"2026-11-05T07:30:00.000Z\",\"skipReview\":null,\"tags\":null,\"title\":\"Wake the PC and file the intake report\",\"useSubagents\":null}",
-      "expectedDigest": "1a5262ea8a61e518bc226a6dd0bf7e6b2cb061042a5f76bd30fef38920f07d38"
+      "expectedCanonicalJson": "{\"assigneeIds\":[],\"autoMode\":true,\"autoQa\":null,\"description\":\"Deliver the nightly intake bundle\",\"executionOwner\":\"ai\",\"isFix\":false,\"maxReviewIterations\":null,\"modelOverride\":null,\"paused\":false,\"planDocs\":null,\"planPath\":null,\"planTests\":null,\"plannerMode\":\"fast\",\"priority\":2,\"projectId\":\"proj-1\",\"roadmapAlias\":null,\"runPlanImprove\":false,\"runPostVerify\":false,\"runtimeOptions\":null,\"runtimeProfileId\":null,\"scheduledAt\":\"2026-11-05T07:30:00.000Z\",\"skipReview\":null,\"tags\":[],\"title\":\"Wake the PC and file the intake report\",\"useSubagents\":null}",
+      "expectedDigest": "8fe3ac01230f014809d37777630ab8f2814f4bbb2fabaef5998f1261d1cd8ea8"
     },
     {
       "name": "scheduledat-offset-variant-b",
@@ -76,8 +76,8 @@
         "priority": 2,
         "scheduledAt": "2026-11-05T07:30:00.000Z"
       },
-      "expectedCanonicalJson": "{\"assigneeIds\":null,\"autoMode\":null,\"autoQa\":null,\"description\":\"Deliver the nightly intake bundle\",\"executionOwner\":null,\"isFix\":null,\"maxReviewIterations\":null,\"modelOverride\":null,\"paused\":null,\"planDocs\":null,\"planPath\":null,\"planTests\":null,\"plannerMode\":null,\"priority\":2,\"projectId\":\"proj-1\",\"roadmapAlias\":null,\"runPlanImprove\":null,\"runPostVerify\":null,\"runtimeOptions\":null,\"runtimeProfileId\":null,\"scheduledAt\":\"2026-11-05T07:30:00.000Z\",\"skipReview\":null,\"tags\":null,\"title\":\"Wake the PC and file the intake report\",\"useSubagents\":null}",
-      "expectedDigest": "1a5262ea8a61e518bc226a6dd0bf7e6b2cb061042a5f76bd30fef38920f07d38"
+      "expectedCanonicalJson": "{\"assigneeIds\":[],\"autoMode\":true,\"autoQa\":null,\"description\":\"Deliver the nightly intake bundle\",\"executionOwner\":\"ai\",\"isFix\":false,\"maxReviewIterations\":null,\"modelOverride\":null,\"paused\":false,\"planDocs\":null,\"planPath\":null,\"planTests\":null,\"plannerMode\":\"fast\",\"priority\":2,\"projectId\":\"proj-1\",\"roadmapAlias\":null,\"runPlanImprove\":false,\"runPostVerify\":false,\"runtimeOptions\":null,\"runtimeProfileId\":null,\"scheduledAt\":\"2026-11-05T07:30:00.000Z\",\"skipReview\":null,\"tags\":[],\"title\":\"Wake the PC and file the intake report\",\"useSubagents\":null}",
+      "expectedDigest": "8fe3ac01230f014809d37777630ab8f2814f4bbb2fabaef5998f1261d1cd8ea8"
     },
     {
       "name": "scheduledat-different-instant",
@@ -89,8 +89,8 @@
         "priority": 2,
         "scheduledAt": "2026-11-05T07:31:00.000Z"
       },
-      "expectedCanonicalJson": "{\"assigneeIds\":null,\"autoMode\":null,\"autoQa\":null,\"description\":\"Deliver the nightly intake bundle\",\"executionOwner\":null,\"isFix\":null,\"maxReviewIterations\":null,\"modelOverride\":null,\"paused\":null,\"planDocs\":null,\"planPath\":null,\"planTests\":null,\"plannerMode\":null,\"priority\":2,\"projectId\":\"proj-1\",\"roadmapAlias\":null,\"runPlanImprove\":null,\"runPostVerify\":null,\"runtimeOptions\":null,\"runtimeProfileId\":null,\"scheduledAt\":\"2026-11-05T07:31:00.000Z\",\"skipReview\":null,\"tags\":null,\"title\":\"Wake the PC and file the intake report\",\"useSubagents\":null}",
-      "expectedDigest": "41e831c062a11f1a9dd311dcbc2a1a02251abde773bfdc0f10b2c84d1d4f4e96"
+      "expectedCanonicalJson": "{\"assigneeIds\":[],\"autoMode\":true,\"autoQa\":null,\"description\":\"Deliver the nightly intake bundle\",\"executionOwner\":\"ai\",\"isFix\":false,\"maxReviewIterations\":null,\"modelOverride\":null,\"paused\":false,\"planDocs\":null,\"planPath\":null,\"planTests\":null,\"plannerMode\":\"fast\",\"priority\":2,\"projectId\":\"proj-1\",\"roadmapAlias\":null,\"runPlanImprove\":false,\"runPostVerify\":false,\"runtimeOptions\":null,\"runtimeProfileId\":null,\"scheduledAt\":\"2026-11-05T07:31:00.000Z\",\"skipReview\":null,\"tags\":[],\"title\":\"Wake the PC and file the intake report\",\"useSubagents\":null}",
+      "expectedDigest": "74c2aee21d41f79fe7777020a7e29e184708898b2072ba6ba5183004c015f008"
     },
     {
       "name": "sort-tolerant-arrays-order-a",
@@ -103,8 +103,8 @@
         "assigneeIds": ["p-b", "p-a"],
         "tags": ["wake", "intake"]
       },
-      "expectedCanonicalJson": "{\"assigneeIds\":[\"p-a\",\"p-b\"],\"autoMode\":null,\"autoQa\":null,\"description\":\"Deliver the nightly intake bundle\",\"executionOwner\":null,\"isFix\":null,\"maxReviewIterations\":null,\"modelOverride\":null,\"paused\":null,\"planDocs\":null,\"planPath\":null,\"planTests\":null,\"plannerMode\":null,\"priority\":2,\"projectId\":\"proj-1\",\"roadmapAlias\":null,\"runPlanImprove\":null,\"runPostVerify\":null,\"runtimeOptions\":null,\"runtimeProfileId\":null,\"scheduledAt\":null,\"skipReview\":null,\"tags\":[\"intake\",\"wake\"],\"title\":\"Wake the PC and file the intake report\",\"useSubagents\":null}",
-      "expectedDigest": "668fccdb55e0a59ac31b7d07b931b191b054c4b883ac76a7fef5aa95f57578f2"
+      "expectedCanonicalJson": "{\"assigneeIds\":[\"p-a\",\"p-b\"],\"autoMode\":true,\"autoQa\":null,\"description\":\"Deliver the nightly intake bundle\",\"executionOwner\":\"ai\",\"isFix\":false,\"maxReviewIterations\":null,\"modelOverride\":null,\"paused\":false,\"planDocs\":null,\"planPath\":null,\"planTests\":null,\"plannerMode\":\"fast\",\"priority\":2,\"projectId\":\"proj-1\",\"roadmapAlias\":null,\"runPlanImprove\":false,\"runPostVerify\":false,\"runtimeOptions\":null,\"runtimeProfileId\":null,\"scheduledAt\":null,\"skipReview\":null,\"tags\":[\"intake\",\"wake\"],\"title\":\"Wake the PC and file the intake report\",\"useSubagents\":null}",
+      "expectedDigest": "9ccc0342c8dc29b979cc1fb9e3fbf173f3caa384ada4f045cc675f6dd7bda66e"
     },
     {
       "name": "sort-tolerant-arrays-order-b",
@@ -117,8 +117,8 @@
         "assigneeIds": ["p-a", "p-b"],
         "tags": ["intake", "wake"]
       },
-      "expectedCanonicalJson": "{\"assigneeIds\":[\"p-a\",\"p-b\"],\"autoMode\":null,\"autoQa\":null,\"description\":\"Deliver the nightly intake bundle\",\"executionOwner\":null,\"isFix\":null,\"maxReviewIterations\":null,\"modelOverride\":null,\"paused\":null,\"planDocs\":null,\"planPath\":null,\"planTests\":null,\"plannerMode\":null,\"priority\":2,\"projectId\":\"proj-1\",\"roadmapAlias\":null,\"runPlanImprove\":null,\"runPostVerify\":null,\"runtimeOptions\":null,\"runtimeProfileId\":null,\"scheduledAt\":null,\"skipReview\":null,\"tags\":[\"intake\",\"wake\"],\"title\":\"Wake the PC and file the intake report\",\"useSubagents\":null}",
-      "expectedDigest": "668fccdb55e0a59ac31b7d07b931b191b054c4b883ac76a7fef5aa95f57578f2"
+      "expectedCanonicalJson": "{\"assigneeIds\":[\"p-a\",\"p-b\"],\"autoMode\":true,\"autoQa\":null,\"description\":\"Deliver the nightly intake bundle\",\"executionOwner\":\"ai\",\"isFix\":false,\"maxReviewIterations\":null,\"modelOverride\":null,\"paused\":false,\"planDocs\":null,\"planPath\":null,\"planTests\":null,\"plannerMode\":\"fast\",\"priority\":2,\"projectId\":\"proj-1\",\"roadmapAlias\":null,\"runPlanImprove\":false,\"runPostVerify\":false,\"runtimeOptions\":null,\"runtimeProfileId\":null,\"scheduledAt\":null,\"skipReview\":null,\"tags\":[\"intake\",\"wake\"],\"title\":\"Wake the PC and file the intake report\",\"useSubagents\":null}",
+      "expectedDigest": "9ccc0342c8dc29b979cc1fb9e3fbf173f3caa384ada4f045cc675f6dd7bda66e"
     },
     {
       "name": "array-element-change",
@@ -130,8 +130,8 @@
         "priority": 2,
         "assigneeIds": ["p-b", "p-c"]
       },
-      "expectedCanonicalJson": "{\"assigneeIds\":[\"p-b\",\"p-c\"],\"autoMode\":null,\"autoQa\":null,\"description\":\"Deliver the nightly intake bundle\",\"executionOwner\":null,\"isFix\":null,\"maxReviewIterations\":null,\"modelOverride\":null,\"paused\":null,\"planDocs\":null,\"planPath\":null,\"planTests\":null,\"plannerMode\":null,\"priority\":2,\"projectId\":\"proj-1\",\"roadmapAlias\":null,\"runPlanImprove\":null,\"runPostVerify\":null,\"runtimeOptions\":null,\"runtimeProfileId\":null,\"scheduledAt\":null,\"skipReview\":null,\"tags\":null,\"title\":\"Wake the PC and file the intake report\",\"useSubagents\":null}",
-      "expectedDigest": "69badcffb3df92c4ef89c99156b72b30fbe40957b998dae8ae607cb8de378bf8"
+      "expectedCanonicalJson": "{\"assigneeIds\":[\"p-b\",\"p-c\"],\"autoMode\":true,\"autoQa\":null,\"description\":\"Deliver the nightly intake bundle\",\"executionOwner\":\"ai\",\"isFix\":false,\"maxReviewIterations\":null,\"modelOverride\":null,\"paused\":false,\"planDocs\":null,\"planPath\":null,\"planTests\":null,\"plannerMode\":\"fast\",\"priority\":2,\"projectId\":\"proj-1\",\"roadmapAlias\":null,\"runPlanImprove\":false,\"runPostVerify\":false,\"runtimeOptions\":null,\"runtimeProfileId\":null,\"scheduledAt\":null,\"skipReview\":null,\"tags\":[],\"title\":\"Wake the PC and file the intake report\",\"useSubagents\":null}",
+      "expectedDigest": "ab31066b80713410d2624db68ecc8247b10d6ccdbf56a868b1825d3bd1b83e52"
     },
     {
       "name": "nested-object-key-order-a",
@@ -149,8 +149,8 @@
           }
         }
       },
-      "expectedCanonicalJson": "{\"assigneeIds\":null,\"autoMode\":null,\"autoQa\":null,\"description\":\"Deliver the nightly intake bundle\",\"executionOwner\":null,\"isFix\":null,\"maxReviewIterations\":null,\"modelOverride\":null,\"paused\":null,\"planDocs\":null,\"planPath\":null,\"planTests\":null,\"plannerMode\":null,\"priority\":2,\"projectId\":\"proj-1\",\"roadmapAlias\":null,\"runPlanImprove\":null,\"runPostVerify\":null,\"runtimeOptions\":{\"a\":{\"x\":3,\"y\":2},\"z\":1},\"runtimeProfileId\":null,\"scheduledAt\":null,\"skipReview\":null,\"tags\":null,\"title\":\"Wake the PC and file the intake report\",\"useSubagents\":null}",
-      "expectedDigest": "930f2cb710dfdd0efaeff53d076df82fe455a47931a385ec344ba390dc29d035"
+      "expectedCanonicalJson": "{\"assigneeIds\":[],\"autoMode\":true,\"autoQa\":null,\"description\":\"Deliver the nightly intake bundle\",\"executionOwner\":\"ai\",\"isFix\":false,\"maxReviewIterations\":null,\"modelOverride\":null,\"paused\":false,\"planDocs\":null,\"planPath\":null,\"planTests\":null,\"plannerMode\":\"fast\",\"priority\":2,\"projectId\":\"proj-1\",\"roadmapAlias\":null,\"runPlanImprove\":false,\"runPostVerify\":false,\"runtimeOptions\":{\"a\":{\"x\":3,\"y\":2},\"z\":1},\"runtimeProfileId\":null,\"scheduledAt\":null,\"skipReview\":null,\"tags\":[],\"title\":\"Wake the PC and file the intake report\",\"useSubagents\":null}",
+      "expectedDigest": "ad7a0ea2545f2346d97ace28b42457000710e401a911f39dbba7287bcebdeed6"
     },
     {
       "name": "nested-object-key-order-b",
@@ -168,8 +168,8 @@
           "z": 1
         }
       },
-      "expectedCanonicalJson": "{\"assigneeIds\":null,\"autoMode\":null,\"autoQa\":null,\"description\":\"Deliver the nightly intake bundle\",\"executionOwner\":null,\"isFix\":null,\"maxReviewIterations\":null,\"modelOverride\":null,\"paused\":null,\"planDocs\":null,\"planPath\":null,\"planTests\":null,\"plannerMode\":null,\"priority\":2,\"projectId\":\"proj-1\",\"roadmapAlias\":null,\"runPlanImprove\":null,\"runPostVerify\":null,\"runtimeOptions\":{\"a\":{\"x\":3,\"y\":2},\"z\":1},\"runtimeProfileId\":null,\"scheduledAt\":null,\"skipReview\":null,\"tags\":null,\"title\":\"Wake the PC and file the intake report\",\"useSubagents\":null}",
-      "expectedDigest": "930f2cb710dfdd0efaeff53d076df82fe455a47931a385ec344ba390dc29d035"
+      "expectedCanonicalJson": "{\"assigneeIds\":[],\"autoMode\":true,\"autoQa\":null,\"description\":\"Deliver the nightly intake bundle\",\"executionOwner\":\"ai\",\"isFix\":false,\"maxReviewIterations\":null,\"modelOverride\":null,\"paused\":false,\"planDocs\":null,\"planPath\":null,\"planTests\":null,\"plannerMode\":\"fast\",\"priority\":2,\"projectId\":\"proj-1\",\"roadmapAlias\":null,\"runPlanImprove\":false,\"runPostVerify\":false,\"runtimeOptions\":{\"a\":{\"x\":3,\"y\":2},\"z\":1},\"runtimeProfileId\":null,\"scheduledAt\":null,\"skipReview\":null,\"tags\":[],\"title\":\"Wake the PC and file the intake report\",\"useSubagents\":null}",
+      "expectedDigest": "ad7a0ea2545f2346d97ace28b42457000710e401a911f39dbba7287bcebdeed6"
     },
     {
       "name": "one-char-title-change",
@@ -180,8 +180,18 @@
         "description": "Deliver the nightly intake bundle",
         "priority": 2
       },
-      "expectedCanonicalJson": "{\"assigneeIds\":null,\"autoMode\":null,\"autoQa\":null,\"description\":\"Deliver the nightly intake bundle\",\"executionOwner\":null,\"isFix\":null,\"maxReviewIterations\":null,\"modelOverride\":null,\"paused\":null,\"planDocs\":null,\"planPath\":null,\"planTests\":null,\"plannerMode\":null,\"priority\":2,\"projectId\":\"proj-1\",\"roadmapAlias\":null,\"runPlanImprove\":null,\"runPostVerify\":null,\"runtimeOptions\":null,\"runtimeProfileId\":null,\"scheduledAt\":null,\"skipReview\":null,\"tags\":null,\"title\":\"Wake the PC and file the intake reporT\",\"useSubagents\":null}",
-      "expectedDigest": "614cfd3d126b9821f37d334ac314792bfb5e7ce147df1aef28f10bd3381b6541"
+      "expectedCanonicalJson": "{\"assigneeIds\":[],\"autoMode\":true,\"autoQa\":null,\"description\":\"Deliver the nightly intake bundle\",\"executionOwner\":\"ai\",\"isFix\":false,\"maxReviewIterations\":null,\"modelOverride\":null,\"paused\":false,\"planDocs\":null,\"planPath\":null,\"planTests\":null,\"plannerMode\":\"fast\",\"priority\":2,\"projectId\":\"proj-1\",\"roadmapAlias\":null,\"runPlanImprove\":false,\"runPostVerify\":false,\"runtimeOptions\":null,\"runtimeProfileId\":null,\"scheduledAt\":null,\"skipReview\":null,\"tags\":[],\"title\":\"Wake the PC and file the intake reporT\",\"useSubagents\":null}",
+      "expectedDigest": "df9ea927e717f6c63e86c513227b6b79750770c5aff8a9536f8e4f8a03079d95"
+    },
+    {
+      "name": "sparse-body-static-defaults",
+      "description": "Only the required fields present; the eleven schema static-constant defaults are filled by BOTH the API parsed-body path and this canonicalization, so raw and parsed bodies digest identically (independent-review repair).",
+      "payload": {
+        "projectId": "proj-1",
+        "title": "Sparse intake task"
+      },
+      "expectedCanonicalJson": "{\"assigneeIds\":[],\"autoMode\":true,\"autoQa\":null,\"description\":\"\",\"executionOwner\":\"ai\",\"isFix\":false,\"maxReviewIterations\":null,\"modelOverride\":null,\"paused\":false,\"planDocs\":null,\"planPath\":null,\"planTests\":null,\"plannerMode\":\"fast\",\"priority\":0,\"projectId\":\"proj-1\",\"roadmapAlias\":null,\"runPlanImprove\":false,\"runPostVerify\":false,\"runtimeOptions\":null,\"runtimeProfileId\":null,\"scheduledAt\":null,\"skipReview\":null,\"tags\":[],\"title\":\"Sparse intake task\",\"useSubagents\":null}",
+      "expectedDigest": "f78e5e8862ebd2282238e741d4b63c75895e35101dd48e3e8c3f5e2575bda25a"
     }
   ]
 }

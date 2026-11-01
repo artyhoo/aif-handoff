@@ -2583,6 +2583,10 @@ export function getAiWorkloadState(nowIso: string = new Date().toISOString()): A
       row.paused ||
       row.status === "blocked_external" ||
       row.manualReviewRequired ||
+      // Human gate (§8.2): a plan parked for manual decision is not
+      // protective — including for its future scheduledAt, otherwise a
+      // human-gated task would hold the PC awake indefinitely.
+      (row.status === "plan_ready" && !row.autoMode) ||
       (AI_TERMINAL_STATUSES as readonly string[]).includes(row.status);
 
     if (!gated && (AI_ACTIVE_STATUSES as readonly string[]).includes(row.status)) {

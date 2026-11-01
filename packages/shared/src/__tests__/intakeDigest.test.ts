@@ -111,12 +111,15 @@ describe("intakeDigest frozen client-content digest", () => {
   });
 
   it("keeps route/project-derived fields out of the digest (planPath absent stays null)", () => {
-    // The route derives planPath from project config and forces plannerMode for
-    // parallelEnabled projects (§7.5 step 3); a project-config change between
-    // create and replay must not change the digest of identical client bytes.
+    // The route derives planPath from project config and forces plannerMode
+    // ("full") for parallelEnabled projects POST-digest (§7.5 step 3); a
+    // project-config change between create and replay must not change the
+    // digest of identical client bytes. plannerMode's absent value is the
+    // schema's STATIC "fast" default (never the forced/route value).
     const payload = { projectId: "proj-1", title: "Route-stable", description: "d" };
     expect(canonicalizeIntakePayload(payload)).toContain('"planPath":null');
-    expect(canonicalizeIntakePayload(payload)).toContain('"plannerMode":null');
+    expect(canonicalizeIntakePayload(payload)).toContain('"plannerMode":"fast"');
+    expect(canonicalizeIntakePayload(payload)).not.toContain('"full"');
 
     const withExplicitPlanPath = { ...payload, planPath: ".ai-factory/plans/explicit.md" };
     expect(computeIntakePayloadDigest(withExplicitPlanPath)).not.toBe(
@@ -148,9 +151,41 @@ describe("intakeDigest frozen client-content digest", () => {
     expect(canonicalizeIntakePayload(base)).not.toContain("attachments");
   });
 
-  it("handles null/undefined payloads as the all-null canonical form", () => {
+  it("handles null/undefined payloads identically (static defaults filled, rest null)", () => {
     expect(canonicalizeIntakePayload(null)).toBe(canonicalizeIntakePayload(undefined));
     expect(canonicalizeIntakePayload(null)).toContain('"title":null');
+    // Absent static-default fields fill with the schema's constants; the
+    // env-derived ones stay the null sentinel.
+    expect(canonicalizeIntakePayload(null)).toContain('"priority":0');
+    expect(canonicalizeIntakePayload(null)).toContain('"useSubagents":null');
+  });
+
+  it("digests a sparse raw body exactly like its schema-parsed form (API/relay agreement)", () => {
+    // The API digests the schema-PARSED body; the relay mirror digests the raw
+    // client body. The static-default fill makes the two canonicalizations
+    // equal for sparse bodies (independent-review repair) — the dense-vector
+    // case alone could never catch this divergence.
+    const rawSparse = { projectId: "proj-1", title: "Sparse task" };
+    const parsedEquivalent = {
+      projectId: "proj-1",
+      title: "Sparse task",
+      description: "",
+      attachments: [],
+      priority: 0,
+      autoMode: true,
+      executionOwner: "ai",
+      assigneeIds: [],
+      isFix: false,
+      plannerMode: "fast",
+      runPlanImprove: false,
+      runPostVerify: false,
+      paused: false,
+      tags: [],
+    };
+    expect(canonicalizeIntakePayload(rawSparse)).toBe(canonicalizeIntakePayload(parsedEquivalent));
+    expect(computeIntakePayloadDigest(rawSparse)).toBe(
+      computeIntakePayloadDigest(parsedEquivalent),
+    );
   });
 });
 

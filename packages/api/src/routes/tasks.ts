@@ -587,7 +587,27 @@ tasksRouter.post("/", postTaskBodyValidator(), async (c) => {
     );
   }
 
-  // Step 4 (route-level checks mirrored from the legacy flow) — ownership rules.
+  // Step 4 (route-level checks mirrored from the legacy flow) — authorization
+  // and ownership rules. The member self-assignment rule is mirrored from the
+  // legacy branch verbatim: the keyed path must not become a trust bypass for
+  // a member-role principal to create human-owned tasks assigned to someone
+  // else (independent-review finding). 403 = auth/config condition → the
+  // relay classifies it hold_auth_config (no retry, no wake).
+  if (
+    actionContext.participantsModeEnabled &&
+    actionContext.participantRole === "member" &&
+    parsedBody.executionOwner === "human" &&
+    (parsedBody.assigneeIds.length > 1 ||
+      (parsedBody.assigneeIds.length === 1 && parsedBody.assigneeIds[0] !== actor.id))
+  ) {
+    return c.json(
+      {
+        error: "Members may create human tasks only unassigned or assigned to themselves",
+        code: "forbidden",
+      },
+      403,
+    );
+  }
   if (parsedBody.executionOwner === "ai" && parsedBody.assigneeIds.length > 0) {
     return c.json(
       { error: "AI-owned tasks cannot have participant assignees", code: "invalid_ownership" },

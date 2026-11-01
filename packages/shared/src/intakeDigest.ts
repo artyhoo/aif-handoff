@@ -16,6 +16,13 @@ import { createHash } from "node:crypto";
  *    config), forced values (`parallelEnabled → plannerMode`), or mode-driven
  *    flag defaults — so a changed environment, project config, or route default
  *    can never change the digest of identical original bytes (round-2 M2).
+ *    Exception, pinned by `INTAKE_STATIC_DEFAULTS` below: the eleven fields for
+ *    which the intake schema itself injects a *static constant* default are
+ *    canonicalized to that same constant when absent, so the digest of a raw
+ *    client body equals the digest of the API's schema-parsed body — the API
+ *    digests its parsed body, and without this fill the two canonicalizations
+ *    would diverge on sparse payloads (independent-review finding; static
+ *    constants cannot move between create and replay, so M2 is preserved).
  *
  * The bridge relay ships a dependency-free mirror of `canonicalizeIntakePayload`
  * (`scripts/workstation/intake-relay/envelope.mjs`); the pinned vectors in
@@ -122,6 +129,32 @@ const INTAKE_DIGEST_FIELDS = [
 /** Arrays whose element order is not identity-bearing; sorted before digest. */
 const INTAKE_SORT_TOLERANT_ARRAY_FIELDS: ReadonlySet<string> = new Set(["assigneeIds", "tags"]);
 
+/**
+ * Static-constant defaults the intake schema (`createTaskSchema` and its keyed
+ * extension) injects for absent fields. Mirroring them here keeps one encoding
+ * everywhere: `canonicalizeIntakePayload(rawBody)` ===
+ * `canonicalizeIntakePayload(keyedCreateTaskSchema.parse(rawBody))` for every
+ * body, sparse or dense. ONLY static constants belong here — never an
+ * env-derived (`useSubagents`, `maxReviewIterations`), route-derived
+ * (`planPath`), forced (`parallelEnabled → plannerMode`), or mode-driven
+ * default; those stay excluded so they cannot move a digest over time (M2).
+ * Keep byte-identically mirrored in
+ * `scripts/workstation/intake-relay/envelope.mjs`.
+ */
+const INTAKE_STATIC_DEFAULTS: Readonly<Record<string, unknown>> = Object.freeze({
+  assigneeIds: [],
+  autoMode: true,
+  description: "",
+  executionOwner: "ai",
+  isFix: false,
+  paused: false,
+  plannerMode: "fast",
+  runPlanImprove: false,
+  runPostVerify: false,
+  tags: [],
+  priority: 0,
+});
+
 /** Format-level ISO-8601 normalization to UTC `Z` — no past/future judgment here. */
 function normalizeIsoToUtcZ(value: string): string {
   const parsed = Date.parse(value);
@@ -160,17 +193,26 @@ function canonicalizeValue(
 
 /**
  * Canonical JSON over the client-supplied create-payload fields (§7.3): absent
- * optional fields become the pinned `null` sentinel, `scheduledAt` is included
- * in normalized UTC-Z form when present, and the declared sort-tolerant arrays
- * (`assigneeIds`, `tags`) are sorted. Deterministic across key order and
- * whitespace variants of the client JSON.
+ * fields become the schema's static-constant default where one exists
+ * (`INTAKE_STATIC_DEFAULTS`) and the pinned `null` sentinel elsewhere,
+ * `scheduledAt` is included in normalized UTC-Z form when present, and the
+ * declared sort-tolerant arrays (`assigneeIds`, `tags`) are sorted.
+ * Deterministic across key order and whitespace variants of the client JSON,
+ * and equal for the raw body and the API's schema-parsed body.
  */
 export function canonicalizeIntakePayload(
   payload: Record<string, unknown> | null | undefined,
 ): string {
   const canonical: Record<string, unknown> = {};
   for (const field of INTAKE_DIGEST_FIELDS) {
-    canonical[field] = canonicalizeValue(field, payload?.[field]);
+    let value = payload?.[field];
+    if (value === undefined && field in INTAKE_STATIC_DEFAULTS) {
+      // Copy array defaults: a shared mutable instance must never leak into
+      // the canonical form (JSON.stringify would observe mutations).
+      const fallback = INTAKE_STATIC_DEFAULTS[field];
+      value = Array.isArray(fallback) ? [...fallback] : fallback;
+    }
+    canonical[field] = canonicalizeValue(field, value);
   }
   return JSON.stringify(canonical);
 }

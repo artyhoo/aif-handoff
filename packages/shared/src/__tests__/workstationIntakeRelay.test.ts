@@ -1,5 +1,7 @@
 // Bridge intake relay engine tests (plan p2-wake-on-work, B15 — §11.4–11.8,
-// §11.10, §11.11, §11.13–§11.16).
+// §11.10, §11.11, §11.13–§11.16, plus the R1-rework boundaries: start()-driven
+// crash recovery with corrupt quarantine, non-200 / unreachable watch-poll
+// handling through the deliverer, and the read-only --status console).
 //
 // The relay modules are dependency-free ESM under scripts/workstation/ and are
 // URL-imported from package tests (same precedent as
@@ -58,6 +60,7 @@ const {
   clearFence,
   createDeliverer,
   createWriterServer,
+  handleControlRequest,
   handleWriterRequest,
   probeCompat,
   readFence,
@@ -596,6 +599,55 @@ describe("spool.mjs (§9.1, §11.7)", () => {
     expect(spool.get(record.id).state).toBe("rejected");
   });
 
+  it("quarantines corrupt records as real .corrupt files without deleting their bytes (R1 rework)", () => {
+    const dir = makeTmpDir();
+    const config = baseConfig(dir, { mode: "deliver" });
+    const spool = createSpool({ dir: config.spoolDir, maxEnvelopes: 10, maxBytes: 1024 * 1024 });
+    const corruptBytes = '{"truncated":"bytes";';
+    realFs.writeFileSync(join(config.spoolDir, "crashed-write.json"), corruptBytes);
+
+    const scan = spool.restartScan();
+    expect(scan.corrupted).toEqual(["crashed-write.json"]);
+    // The original file is gone, but its bytes survive in the quarantine file.
+    expect(existsSync(join(config.spoolDir, "crashed-write.json"))).toBe(false);
+    expect(realFs.readFileSync(join(config.spoolDir, "crashed-write.json.corrupt"), "utf8")).toBe(
+      corruptBytes,
+    );
+  });
+
+  it("never overwrites pre-existing corrupt forensic bytes at the quarantine destination (R1 rework)", () => {
+    const dir = makeTmpDir();
+    const config = baseConfig(dir, { mode: "deliver" });
+    const spool = createSpool({ dir: config.spoolDir, maxEnvelopes: 10, maxBytes: 1024 * 1024 });
+    const olderBytes = '{"older":"crash"'; // unterminated → unparseable
+    realFs.writeFileSync(join(config.spoolDir, "older-crash.json"), olderBytes);
+    expect(spool.restartScan().corrupted).toEqual(["older-crash.json"]);
+    const firstQuarantine = join(config.spoolDir, "older-crash.json.corrupt");
+    expect(realFs.readFileSync(firstQuarantine, "utf8")).toBe(olderBytes);
+
+    // A second crash under the SAME name must not replace the earlier
+    // quarantine: a plain rename would atomically overwrite it and destroy
+    // the earlier forensic bytes.
+    const againBytes = '{"same-name":"second-crash"';
+    realFs.writeFileSync(join(config.spoolDir, "older-crash.json"), againBytes);
+    expect(spool.restartScan().corrupted).toEqual(["older-crash.json"]);
+    expect(realFs.readFileSync(firstQuarantine, "utf8")).toBe(olderBytes);
+    expect(realFs.readFileSync(join(config.spoolDir, "older-crash.json.corrupt.1"), "utf8")).toBe(
+      againBytes,
+    );
+
+    // A different corrupt file also lands beside — not on top of — the
+    // existing quarantine of another record.
+    const otherBytes = '{"other":"crash"';
+    realFs.writeFileSync(join(config.spoolDir, "other-crash.json"), otherBytes);
+    realFs.writeFileSync(firstQuarantine + ".sibling-guard", "untouched");
+    expect(spool.restartScan().corrupted).toEqual(["other-crash.json"]);
+    expect(realFs.readFileSync(join(config.spoolDir, "other-crash.json.corrupt"), "utf8")).toBe(
+      otherBytes,
+    );
+    expect(realFs.readFileSync(firstQuarantine, "utf8")).toBe(olderBytes);
+  });
+
   it("refuses new work at the count bound truthfully, leaving no partial file", () => {
     const dir = makeTmpDir();
     const config = baseConfig(dir, { mode: "retain-only" });
@@ -931,6 +983,67 @@ describe("authenticated writer IPC (§11.14 S1)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// R1 rework — advisory repairs pinned: per-principal size from the ACTUAL
+// body (never the client bodyBytes claim) + injected clock on control receipts
+// ---------------------------------------------------------------------------
+
+describe("writer-side revalidation repairs (R1 rework)", () => {
+  it("enforces the per-principal size bound on the ACTUAL body, not the client bodyBytes claim", async () => {
+    const dir = makeTmpDir();
+    const config = baseConfig(dir, { mode: "deliver" });
+    const spool = createSpool({ dir: config.spoolDir, maxEnvelopes: 10, maxBytes: 1024 * 1024 });
+    // Forged envelope: an understated bodyBytes claim with a body that really
+    // exceeds the principal bound. The recompute must refuse it as oversized
+    // (the old claim-only check let it through to a less truthful refusal).
+    const forged = JSON.parse(JSON.stringify(sealTestEnvelope()));
+    forged.body.description = "x".repeat(PRINCIPAL.maxRequestBytes + 1);
+    forged.bodyBytes = 10;
+    const response = await handleWriterRequest({
+      request: { credential: CREDENTIAL, envelope: forged },
+      config,
+      spool,
+      principalMap: PRINCIPAL_MAP,
+      credential: CREDENTIAL,
+    });
+    expect(response).toMatchObject({ ok: false, code: "payload_too_large" });
+    // Zero quota consumed, zero partial writes.
+    expect(spoolStats(config.spoolDir)).toEqual({ count: 0, bytes: 0, temps: 0 });
+  });
+
+  it("stamps operator-resume receipts from the injected clock (deterministic under test)", () => {
+    const dir = makeTmpDir();
+    const config = baseConfig(dir, { mode: "deliver" });
+    const spool = createSpool({ dir: config.spoolDir, maxEnvelopes: 10, maxBytes: 1024 * 1024 });
+    spool.writerReceive(sealTestEnvelope(), { mode: "deliver" });
+    const record = spool.list()[0];
+    spool.updateState(record.id, { state: "hold_auth_config" });
+
+    const result = handleControlRequest({
+      request: { op: "resume" },
+      spool,
+      now: () => new Date(Date.parse("2026-11-01T12:34:56.789Z")),
+    });
+    expect(result.ok).toBe(true);
+    expect(result.resumed).toEqual([record.id]);
+    const resumed = spool.get(record.id);
+    expect(resumed.state).toBe("pending");
+    const receipt = resumed.receipts.find(
+      (entry: { kind: string }) => entry.kind === "resumed_by_operator",
+    );
+    expect(receipt.at).toBe("2026-11-01T12:34:56.789Z");
+    expect(receipt.note).toBe("resumed from hold_auth_config");
+
+    // Default behavior (no injected clock) still produces a real timestamp.
+    const resultDefault = handleControlRequest({
+      request: { op: "resume", id: record.id },
+      spool,
+    });
+    expect(resultDefault.ok).toBe(true);
+    expect(Number.isNaN(Date.parse(spool.get(record.id).receipts.at(-1).at))).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // §11.7 — delivery response classification (§7.5) + retain-only honesty
 // ---------------------------------------------------------------------------
 
@@ -1190,6 +1303,309 @@ describe("handover watch (§11.10 M1)", () => {
     expect(stub.counters.getTask).toBe(2);
     expect(wake.state.fired).toBe(0); // pickup polling kept the endpoint healthy
     await stub.close();
+  });
+
+  it("non-200 watch polls consume the bounded budget, respect backoff, and reach truthful HOLD (R1 rework)", async () => {
+    const dir = makeTmpDir();
+    const stub = await createStubServer({
+      postTasks: {
+        status: 201,
+        body: { id: "task-err", status: "backlog", executionOwner: "ai" },
+        delayMs: 0,
+      },
+      getTask: { status: 200, body: { id: "task-err", status: "backlog" }, delayMs: 0 },
+    });
+    const config = baseConfig(dir, {
+      endpoint: stub.url,
+      handoverPollMax: 3,
+      handoverPollBackoffMs: 10,
+    });
+    const spool = createSpool({ dir: config.spoolDir, maxEnvelopes: 10, maxBytes: 1024 * 1024 });
+    const wake = stubWake();
+    // Injected clock: cadence advances without any real sleeping.
+    const clockMs = { value: Date.parse("2026-11-01T10:00:00.000Z") };
+    const deliverer = createDeliverer({
+      config,
+      spool,
+      wake,
+      fetchImpl: fetch,
+      now: () => new Date(clockMs.value),
+    });
+    spool.writerReceive(sealTestEnvelope({ clientRequestId: "err-watch" }), { mode: "deliver" });
+
+    // Cycle 1: admit + first successful poll (still backlog → attempt 1).
+    await deliverer.runCycle();
+    expect(spool.list()[0].state).toBe("admitted");
+    expect(stub.counters.getTask).toBe(1);
+
+    // The endpoint starts REACHABLY answering non-200. Backoff is respected:
+    // a cycle run immediately after a poll must NOT poll again.
+    stub.config.getTask.status = 500;
+    await deliverer.runCycle();
+    expect(stub.counters.getTask).toBe(1); // waiting out the backoff, no poll
+
+    // Each backoff-elapsed cycle performs exactly one error poll that consumes
+    // the bounded pickup budget and advances the cadence marker.
+    clockMs.value += 100;
+    await deliverer.runCycle();
+    expect(stub.counters.getTask).toBe(2);
+    expect(spool.list()[0].watchAttempts).toBe(2);
+    expect(spool.list()[0].receipts.at(-1).kind).toBe("watch_poll_error");
+
+    clockMs.value += 100;
+    await deliverer.runCycle();
+    expect(stub.counters.getTask).toBe(3);
+    expect(spool.list()[0].watchAttempts).toBe(3);
+
+    // Budget exhausted at the next cycle → truthful hold. The endpoint was
+    // reached and answered, so nothing ever woke; the envelope is never
+    // re-POSTed and never silently dropped.
+    clockMs.value += 100;
+    await deliverer.runCycle();
+    const record = spool.list()[0];
+    expect(record.state).toBe("hold_handover_unconfirmed");
+    expect(record.holdReason).toContain("poll budget exhausted");
+    expect(stub.counters.getTask).toBe(3);
+    expect(stub.counters.postTasks).toBe(1);
+    expect(wake.state.fired).toBe(0);
+    expect(
+      record.receipts
+        .filter((entry: { kind: string }) => entry.kind === "watch_poll_error")
+        .map((entry: { note: string }) => entry.note),
+    ).toEqual(["GET /tasks status 500 (poll 2/3)", "GET /tasks status 500 (poll 3/3)"]);
+    await stub.close();
+  });
+
+  it("unreachable mid-handover polls advance cadence, preserve the pickup budget, and wake boundedly+coalesced (R1 rework)", async () => {
+    const dir = makeTmpDir();
+    const stub = await createStubServer({
+      postTasks: {
+        status: 201,
+        body: { id: "task-mid", status: "backlog", executionOwner: "ai" },
+        delayMs: 0,
+      },
+      getTask: { status: 200, body: { id: "task-mid", status: "backlog" }, delayMs: 0 },
+    });
+    const config = baseConfig(dir, {
+      endpoint: stub.url,
+      handoverPollMax: 50,
+      handoverPollBackoffMs: 5,
+    });
+    const spool = createSpool({ dir: config.spoolDir, maxEnvelopes: 10, maxBytes: 1024 * 1024 });
+    // A REAL wake engine with injected clock/exec so actual wake-command fires
+    // are countable (a trigger is not a fire).
+    const fires: string[] = [];
+    let wakeClock = 1_000_000;
+    const wake = createWakeEngine({
+      command: "/bin/true",
+      maxRepeats: 2,
+      backoffMs: 100,
+      windowMs: 500,
+      now: () => wakeClock,
+      sleep: async () => {},
+      exec: (_cmd: string, _args: string[], _opts: unknown, cb: (e?: Error) => void) => {
+        fires.push("fired");
+        cb();
+      },
+    });
+    const clockMs = { value: Date.parse("2026-11-01T10:00:00.000Z") };
+    // Mid-handover suspend variant: the compat probe and the admission POST
+    // succeed, only the handover task GET is unreachable (deliverer.mjs
+    // watchOne catch branch — endpoint-unreachable POLLING, not a probe drop).
+    // The outage begins AFTER the first successful poll (the suspend happens
+    // while the handover watch is already running).
+    const taskGet = { up: true };
+    const taskGetDown: typeof fetch = (input, init) => {
+      if (!taskGet.up && String(input).endsWith("/tasks/task-mid")) {
+        return Promise.reject(
+          Object.assign(new Error("connect ECONNREFUSED"), { cause: { code: "ECONNREFUSED" } }),
+        );
+      }
+      return fetch(input, init);
+    };
+    const deliverer = createDeliverer({
+      config,
+      spool,
+      wake,
+      fetchImpl: taskGetDown,
+      now: () => new Date(clockMs.value),
+    });
+    spool.writerReceive(sealTestEnvelope({ clientRequestId: "mid-handover" }), {
+      mode: "deliver",
+    });
+
+    // Cycle 1: admit + first successful poll (pickup budget attempt 1).
+    await deliverer.runCycle();
+    const cadenceBefore = spool.list()[0].lastWatchAt;
+    expect(spool.list()[0].state).toBe("admitted");
+    expect(spool.list()[0].watchAttempts).toBe(1);
+    expect(cadenceBefore).not.toBeNull();
+
+    // The PC drops mid-handover: task GETs start failing.
+    taskGet.up = false;
+
+    // Four unreachable poll cycles: each advances ONLY the cadence marker —
+    // the pickup budget stays untouched, so downtime alone can never convert
+    // recovery work into a hold.
+    for (let i = 0; i < 4; i += 1) {
+      clockMs.value += 100; // past the watch backoff each time
+      await deliverer.runCycle();
+    }
+    const held = spool.list()[0];
+    expect(held.state).toBe("admitted");
+    expect(held.watchAttempts).toBe(1);
+    expect(Date.parse(held.lastWatchAt)).toBeGreaterThan(Date.parse(cadenceBefore));
+    expect(stub.counters.postTasks).toBe(1); // never re-POSTed
+    // Coalesced: four unreachable triggers inside the open wake window fired
+    // the wake command exactly once.
+    expect(fires.length).toBe(1);
+    expect(wake.status().repeatsUsed).toBe(1);
+
+    // Bounded: past the window a second repeat fires, then the episode ceases
+    // — no infinite wake storm while the envelope stays honestly admitted.
+    wakeClock += 700; // window (500ms) and backoff elapsed on the wake clock
+    clockMs.value += 100;
+    await deliverer.runCycle();
+    expect(fires.length).toBe(2);
+    expect(wake.status().repeatsUsed).toBe(2);
+
+    wakeClock += 700;
+    clockMs.value += 100;
+    await deliverer.runCycle();
+    expect(fires.length).toBe(2); // repeats exhausted
+    expect(wake.status().exhausted).toBe(true);
+    expect(spool.list()[0].state).toBe("admitted");
+
+    // Recovery: the endpoint returns with pickup evidence; the pickup budget
+    // reserved during the outage is intact (attempt 2 = the first successful
+    // post-recovery poll), and the envelope completes.
+    taskGet.up = true;
+    stub.config.getTask.body = {
+      id: "task-mid",
+      status: "implementing",
+      lockedBy: "agent-1",
+      lockedUntil: "2030-01-01T00:00:00.000Z",
+    };
+    clockMs.value += 100;
+    await deliverer.runCycle();
+    const done = spool.list()[0];
+    expect(done.state).toBe("completed");
+    expect(done.watchAttempts).toBe(2);
+    expect(done.receipts.some((entry: { kind: string }) => entry.kind === "completed")).toBe(true);
+    await stub.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R1 rework — the ACTUAL startup path: deliverer.start() must run the §9.1
+// restart scan itself (a regression disconnecting start() from recovery fails
+// here), and the read-only --status console must observe without side effects
+// ---------------------------------------------------------------------------
+
+describe("deliverer start() crash recovery + --status console (R1 rework)", () => {
+  it("start() recovers a crash-left admitted envelope and resumes canonical byte-identical delivery", async () => {
+    const dir = makeTmpDir();
+    const stub = await createStubServer({
+      agentStatus: { status: 200, body: { intakeCompat: 1 }, delayMs: 0 },
+      postTasks: {
+        status: 201,
+        body: { id: "task-crash", status: "backlog", executionOwner: "ai" },
+        delayMs: 0,
+      },
+      // Pickup evidence on the first watch poll → completes within the cycle.
+      getTask: {
+        status: 200,
+        body: {
+          id: "task-crash",
+          status: "implementing",
+          lockedBy: "agent-1",
+          lockedUntil: "2030-01-01T00:00:00.000Z",
+        },
+        delayMs: 0,
+      },
+    });
+    const config = baseConfig(dir, { endpoint: stub.url, cycleMs: 20 });
+    const spool = createSpool({ dir: config.spoolDir, maxEnvelopes: 10, maxBytes: 1024 * 1024 });
+    // Crash state (§9.1): the admission committed and `admitted` was recorded
+    // durably, then the process died before any watch progress; a receipt-less
+    // temp and an unparseable record were also left behind.
+    spool.writerReceive(sealTestEnvelope({ clientRequestId: "crash-1" }), { mode: "deliver" });
+    const crashed = spool.list()[0];
+    spool.updateState(crashed.id, { state: "admitted" });
+    realFs.writeFileSync(join(config.spoolDir, ".tmp-crash-leftover.tmp"), "partial write");
+    realFs.writeFileSync(join(config.spoolDir, "crash-corrupt.json"), '{"truncated":');
+
+    const deliverer = createDeliverer({ config, spool, wake: null, fetchImpl: fetch });
+    deliverer.start(); // the REAL startup path — not a direct spool.restartScan() call
+    try {
+      // Startup recovery re-pends the admitted envelope, and delivery resumes:
+      // without the start()→restartScan() wiring this envelope stays admitted
+      // (never a delivery candidate) and this wait times out.
+      expect(await waitFor(() => spool.list()[0].state === "completed", 10_000)).toBe(true);
+    } finally {
+      await deliverer.stop();
+    }
+
+    const delivered = spool.list()[0];
+    expect(delivered.state).toBe("completed");
+    // The recovery actually happened through start(): the admitted record was
+    // re-pended first, then delivered, then completed on pickup evidence.
+    const kinds = delivered.receipts.map((entry: { kind: string }) => entry.kind);
+    expect(kinds).toContain("restart_repended");
+    expect(kinds).toContain("admitted");
+    expect(kinds).toContain("completed");
+    // Exactly-once: one POST, byte-identical canonical keyed body (§7.4).
+    expect(stub.counters.postTasks).toBe(1);
+    expect(stub.capturedBodies[0]).toBe(
+      JSON.stringify({ ...delivered.body, intake: { requestId: delivered.requestId } }),
+    );
+    // Crash leftovers handled truthfully: temp discarded, corrupt sibling
+    // quarantined with its bytes preserved (never deleted).
+    expect(spoolStats(config.spoolDir).temps).toBe(0);
+    expect(existsSync(join(config.spoolDir, "crash-corrupt.json"))).toBe(false);
+    expect(realFs.readFileSync(join(config.spoolDir, "crash-corrupt.json.corrupt"), "utf8")).toBe(
+      '{"truncated":',
+    );
+    await stub.close();
+  });
+
+  it("--status on an absent spool reports truthfully with zero creation/retention/delivery/wake", async () => {
+    const dir = makeTmpDir();
+    // Credential + principals exist (config validation requires them); the
+    // spool dir was NEVER created — a fresh host before the first submit.
+    const env = childSubmitEnv(dir);
+    expect(existsSync(join(dir, "spool"))).toBe(false);
+
+    const child = spawn(process.execPath, [RELAY_FILE("relay.mjs"), "--status"], {
+      env: { ...process.env, ...env },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const result = await new Promise<ChildResult>((resolve) => {
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (chunk: Buffer) => (stdout += chunk));
+      child.stderr.on("data", (chunk: Buffer) => (stderr += chunk));
+      const timer = setTimeout(() => child.kill("SIGKILL"), 30_000);
+      child.on("close", (code) => {
+        clearTimeout(timer);
+        resolve({ code, stdout, stderr });
+      });
+    });
+
+    // Truthful status, clean exit (guards the existsSync import defect: a
+    // missing import would crash the CLI here with a non-zero exit).
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe("");
+    const summary = JSON.parse(result.stdout);
+    expect(summary.mode).toBe("retain-only");
+    expect(summary.spoolNote).toBe("absent (nothing retained yet)");
+    expect(summary.spool).toBeNull();
+    expect(summary.envelopes).toEqual([]);
+    expect(summary.socketLive).toBe(false);
+    // Zero side effects: the read-only observation created no spool, retained
+    // nothing, delivered nothing, woke nothing.
+    expect(existsSync(join(dir, "spool"))).toBe(false);
+    expect(summary.fence).toBeNull();
   });
 });
 

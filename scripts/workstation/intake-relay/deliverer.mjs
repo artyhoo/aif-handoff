@@ -189,6 +189,7 @@ export async function handleWriterRequest({
   credential,
   log = () => {},
   hooks = {},
+  now = () => new Date(),
 }) {
   // Mandatory per-request credential — timing-safe compare (R3/S1). There is
   // no optional-token path and no insecure flag.
@@ -201,7 +202,7 @@ export async function handleWriterRequest({
     return { ok: false, code: "writer_unauthenticated" };
   }
   if (request.control) {
-    return handleControlRequest({ request: request.control, spool, log });
+    return handleControlRequest({ request: request.control, spool, log, now });
   }
   // Writer-side revalidation of every envelope invariant against the writer's
   // own copy of the operator map — BEFORE any quota reservation (§9.2).
@@ -242,7 +243,7 @@ export async function handleWriterRequest({
  * (hold_api_compat / hold_operator_fence) resume automatically when their
  * condition clears and are reported, not touched.
  */
-export function handleControlRequest({ request, spool, log = () => {} }) {
+export function handleControlRequest({ request, spool, log = () => {}, now = () => new Date() }) {
   if (request?.op !== "resume") {
     return { ok: false, code: "control_unsupported" };
   }
@@ -270,7 +271,7 @@ export function handleControlRequest({ request, spool, log = () => {} }) {
         ...record.receipts,
         {
           kind: "resumed_by_operator",
-          at: new Date().toISOString(),
+          at: now().toISOString(),
           note: `resumed from ${record.state}`,
         },
       ],
@@ -296,6 +297,7 @@ export function createWriterServer({
   credential,
   log = () => {},
   hooks = {},
+  now = () => new Date(),
 }) {
   if (typeof credential !== "string" || credential.length === 0) {
     throw new Error("writer credential is mandatory (§9.2) — refusing to start the writer");
@@ -327,7 +329,7 @@ export function createWriterServer({
         answer({ ok: false, code: "invalid_request" });
         return;
       }
-      handleWriterRequest({ request, config, spool, principalMap, credential, log, hooks })
+      handleWriterRequest({ request, config, spool, principalMap, credential, log, hooks, now })
         .then(answer)
         .catch((error) => {
           log({ error: String(error?.message ?? error) }, "writer request handling failed");
@@ -504,6 +506,20 @@ export function createDeliverer({
   }
 
   function wakeResetOnPcEvidence() {
+    // A passing compat probe is ROUTINE-CYCLE evidence only: it marks the
+    // endpoint healthy but must NOT reset the wake episode. Resetting here
+    // meant the §8.3 bounds could never accumulate — an admitted-unconfirmed
+    // envelope whose handover GET was unreachable while the probe still
+    // answered would fire a fresh wake every cycle, unbounded (no storm cap).
+    // The episode resets on strong PC evidence only (R1 rework repair):
+    // resetWakeEpisode() below — an answered admission POST — and the
+    // completed_pickup reset at the end of the watch phase.
+    endpointHealthy = true;
+  }
+
+  function resetWakeEpisode() {
+    // Strong PC evidence (admission POST answered): the next suspend starts a
+    // fresh, fully-budgeted wake episode (§8.3).
     endpointHealthy = true;
     wake?.reset();
   }
@@ -644,8 +660,8 @@ export function createDeliverer({
     }
 
     // 201 created / 200 replayed — admission receipt (§7.5). The PC is
-    // demonstrably awake: reset the wake episode.
-    wakeResetOnPcEvidence();
+    // demonstrably awake (it answered the POST): reset the wake episode.
+    resetWakeEpisode();
     const task = parsed ?? {};
     const scheduledAt = typeof task.scheduledAt === "string" ? task.scheduledAt : null;
     const taskId = typeof task.id === "string" ? task.id : null;
@@ -730,7 +746,11 @@ export function createDeliverer({
     } catch {
       // Mid-handover suspend (M1): the PC went down between commit and
       // pickup — bounded WoL, forward re-establishes, polling resumes.
+      // Advance only the cadence marker (the next poll waits out the backoff)
+      // but NOT the pickup budget: recovery work in progress must not be
+      // converted into a hold by endpoint downtime alone.
       endpointHealthy = false;
+      spool.updateState(record.id, { lastWatchAt: nowIso() });
       await maybeWake("endpoint_unreachable_mid_handover");
       return { outcome: "watch_unreachable" };
     }
@@ -754,9 +774,19 @@ export function createDeliverer({
       return { outcome: "completed_deleted" };
     }
     if (response.status !== 200) {
+      // The endpoint was REACHED and answered a non-200: this poll happened
+      // and can never yield pickup evidence, so it consumes the bounded
+      // budget and advances the backoff like a real poll. Without this, a
+      // persistently erroring endpoint (5xx/auth config) polls once per
+      // cycle forever while the envelope stays admitted (independent-review
+      // repair); exhausting the budget lands in the standard truthful hold.
+      spool.updateState(record.id, {
+        watchAttempts: (record.watchAttempts ?? 0) + 1,
+        lastWatchAt: nowIso(),
+      });
       appendReceipt(record, {
         kind: "watch_poll_error",
-        note: `GET /tasks status ${response.status}`,
+        note: `GET /tasks status ${response.status} (poll ${(record.watchAttempts ?? 0) + 1}/${config.handoverPollMax})`,
       });
       return { outcome: "watch_poll_error" };
     }
@@ -888,6 +918,22 @@ export function createDeliverer({
     const startupFence = readFence(config.fencePath);
     if (startupFence) {
       log({ fence: startupFence }, "startup under operator fence — delivery stays parked");
+    }
+    // Restart scan (§9.1): discard receipt-less temps, reconcile uncertain
+    // in-flight admissions back to pending (idempotent by binding), and
+    // quarantine unparseable records without blocking startup. Without this
+    // a crash between commit and response recording could leave an `admitted`
+    // envelope dormant forever.
+    const scan = spool.restartScan();
+    if (scan.discardedTemps.length > 0 || scan.rePended.length > 0 || scan.corrupted.length > 0) {
+      log(
+        {
+          discardedTemps: scan.discardedTemps,
+          rePended: scan.rePended,
+          corrupted: scan.corrupted,
+        },
+        "restart scan reconciled spool state (§9.1)",
+      );
     }
     const tick = async () => {
       const cycle = runCycle().catch((error) => {
