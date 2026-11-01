@@ -13,45 +13,15 @@ vi.mock("@aif/shared/server", async (importOriginal) => {
   };
 });
 
-const { listStaleInProgressTasks, getAiWorkloadState } = await import("@aif/data");
+const { agentStatusRouter } = await import("../routes/agentStatus.js");
 
 function createApp() {
-  const startTime = Date.now();
   const app = new Hono();
-
-  app.get("/agent/status", (c) => {
-    const now = Date.now();
-    const activeTasks = listStaleInProgressTasks().map((t) => {
-      const heartbeatAt = t.lastHeartbeatAt ? new Date(t.lastHeartbeatAt).getTime() : null;
-      const updatedAt = t.updatedAt ? new Date(t.updatedAt).getTime() : now;
-      const lagMs = heartbeatAt ? now - heartbeatAt : now - updatedAt;
-
-      return {
-        id: t.id,
-        title: t.title,
-        status: t.status,
-        lastHeartbeatAt: t.lastHeartbeatAt,
-        heartbeatLagMs: lagMs,
-        heartbeatStale: lagMs > 5 * 60 * 1000,
-        updatedAt: t.updatedAt,
-      };
-    });
-
-    // Mirrors packages/api/src/index.ts — the canonical workload snapshot and
-    // the keyed-intake compat level the bridge relay probes (§8.2/§9.3).
-    const workload = getAiWorkloadState();
-
-    return c.json({
-      uptime: Math.floor((Date.now() - startTime) / 1000),
-      activeTasks,
-      activeTaskCount: activeTasks.length,
-      staleTasks: activeTasks.filter((t) => t.heartbeatStale).length,
-      workload,
-      intakeCompat: INTAKE_COMPAT_LEVEL,
-      checkedAt: new Date().toISOString(),
-    });
-  });
-
+  // The REAL router module mounted by the API entry — not a mirrored copy —
+  // so the workload/intakeCompat contract is asserted against the handler the
+  // server actually serves (the auth-middleware interplay itself is covered by
+  // the relay↔API composition test).
+  app.route("/agent", agentStatusRouter);
   return app;
 }
 

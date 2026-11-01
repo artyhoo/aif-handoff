@@ -9,23 +9,19 @@
 // real files in tmpdirs (no spool mocks); distinct-process contention via real
 // child processes (§11.13, §11.16).
 
-import { execFile, spawn } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
+import { spawn } from "node:child_process";
 import {
   chmodSync,
   existsSync,
-  mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
   rmSync,
   statSync,
-  writeFileSync,
 } from "node:fs";
 import { createServer as createHttpServer } from "node:http";
-import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -47,10 +43,9 @@ const {
   isValidClientRequestId,
   isValidPrincipalId,
   namespaceRequestId,
-  revalidateSealedEnvelope,
   sealEnvelope,
 } = await import(RELAY_FILE("envelope.mjs"));
-const { SPOOL_STATES, SpoolError, createSpool } = await import(RELAY_FILE("spool.mjs"));
+const { SpoolError, createSpool } = await import(RELAY_FILE("spool.mjs"));
 const { createWakeEngine } = await import(RELAY_FILE("wake.mjs"));
 const {
   STARTUP_REFUSED_SOCKET_HELD,
@@ -63,12 +58,9 @@ const {
   handleControlRequest,
   handleWriterRequest,
   probeCompat,
-  readFence,
   writeFence,
 } = await import(RELAY_FILE("deliverer.mjs"));
-const { EXIT_CODES, requestWriter, resolvePrincipal, submitOnce } = await import(
-  RELAY_FILE("submit.mjs")
-);
+const { EXIT_CODES, resolvePrincipal, submitOnce } = await import(RELAY_FILE("submit.mjs"));
 const { evaluateGuard, querySupervisor, scanUncertainEffects } = await import(
   RELAY_FILE("deploy/rollback-guard.example.mjs")
 );
@@ -94,7 +86,7 @@ vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
   return {
     ...actual,
-    fsyncSync: (fd: number, ...rest: unknown[]) => {
+    fsyncSync: (fd: number) => {
       if (fsRecording) fsLog.push({ op: "fsync" });
       return (actual.fsyncSync as (fd: number) => void)(fd);
     },
@@ -331,10 +323,6 @@ function switchableFetch(realFetch: typeof fetch) {
     return realFetch(input, init);
   };
   return { impl, state };
-}
-
-async function retainViaWriter(config: RelayConfig, envelope: ReturnType<typeof sealTestEnvelope>) {
-  return requestWriter({ socketPath: config.socketPath, credential: CREDENTIAL, envelope });
 }
 
 // ---------------------------------------------------------------------------
@@ -805,8 +793,6 @@ describe("wake.mjs coalescing and bounds (§11.7)", () => {
 // ---------------------------------------------------------------------------
 
 describe("authenticated writer IPC (§11.14 S1)", () => {
-  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
   for (const mode of ["retain-only", "deliver"] as const) {
     it(`refuses missing and wrong credentials pre-quota in ${mode} mode`, async () => {
       const dir = makeTmpDir();

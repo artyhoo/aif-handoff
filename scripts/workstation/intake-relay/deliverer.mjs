@@ -351,13 +351,35 @@ export function createWriterServer({
  * reported separately from `ok`: a network-level failure means the PC may be
  * asleep (wake applies); a content mismatch means the PC is UP but the API
  * contract drifted (no wake — it would be pointless).
+ *
+ * The probe carries the relay's own configured service participant session
+ * (§5) as a cookie, exactly like deliverOne/watchOne: under
+ * PARTICIPANTS_MODE_ENABLED — the only mode in which the keyed branch admits —
+ * the API's global participantAuth middleware 401s every non-public path, and
+ * /agent/status is not public. An unauthenticated probe therefore parks all
+ * keyed delivery as hold_api_compat forever; `runCycle` always passes the
+ * loaded session token here. GET is a CSRF-safe method: no origin or
+ * x-csrf-token is required (and none is sent — probe redaction keeps the
+ * cookie out of logs). A missing/invalid/revoked session is answered 401 →
+ * `probe_status_401` → reachable-but-blocked fail-closed park, no wake.
  */
-export async function probeCompat({ endpoint, expectedLevel, fetchImpl = fetch, log = () => {} }) {
+export async function probeCompat({
+  endpoint,
+  expectedLevel,
+  sessionCookieName,
+  sessionToken,
+  fetchImpl = fetch,
+  log = () => {},
+}) {
   let response;
   try {
+    const headers = { accept: "application/json" };
+    if (sessionToken) {
+      headers.cookie = `${sessionCookieName}=${sessionToken}`;
+    }
     response = await fetchImpl(`${endpoint.replace(/\/$/, "")}/agent/status`, {
       method: "GET",
-      headers: { accept: "application/json" },
+      headers,
       redirect: "error",
       signal: AbortSignal.timeout(10_000),
     });
@@ -852,10 +874,14 @@ export function createDeliverer({
     resumeMechanicalHolds("hold_operator_fence");
 
     // Compat probe (§9.3/M3): missing/mismatched/unparseable → ALL keyed
-    // delivery parks as hold_api_compat with ZERO POSTs to /tasks.
+    // delivery parks as hold_api_compat with ZERO POSTs to /tasks. The probe
+    // presents the same relay service session as the delivery/watch calls:
+    // /agent/status is participantAuth-gated in the only mode that admits.
     lastProbe = await probeCompat({
       endpoint: config.endpoint,
       expectedLevel: config.intakeCompatLevel,
+      sessionCookieName: config.sessionCookieName,
+      sessionToken: config.sessionToken,
       fetchImpl,
       log,
     });

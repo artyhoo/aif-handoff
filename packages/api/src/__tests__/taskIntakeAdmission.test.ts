@@ -48,7 +48,6 @@ const { participantAuth } = await import("../middleware/participantAuth.js");
 const { participantCsrf } = await import("../middleware/csrf.js");
 const { participantRouteAuthorization } = await import("../middleware/requireRole.js");
 const { tasksRouter } = await import("../routes/tasks.js");
-const { INTAKE_COMPAT_LEVEL } = await import("@aif/shared");
 
 function createApp() {
   const app = new Hono<ParticipantApiEnv>();

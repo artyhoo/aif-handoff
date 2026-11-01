@@ -157,6 +157,12 @@ their condition clears.
 
 The compat probe (`GET /agent/status` → `intakeCompat`) is a runtime mismatch
 detector only — **never** a fence and never a transactional API-version lock.
+It presents the same relay service participant session as delivery and the
+handover watch: `/agent/status` is session-gated under participants mode (the
+only mode in which the keyed branch admits), so a missing/invalid/revoked
+session is answered 401 and parks keyed delivery as `hold_api_compat`
+(`probe_status_401` in `--status`) with zero POSTs and no wake; restoring a
+valid session auto-resumes it.
 Before ANY incompatible API swap:
 
 1. **Fence + stop:** `relay.mjs fence --reason …` AND stop the unit — both,

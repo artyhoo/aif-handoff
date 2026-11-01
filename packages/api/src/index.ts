@@ -1,13 +1,9 @@
 import { Hono } from "hono";
-import { INTAKE_COMPAT_LEVEL, getEnv, logger } from "@aif/shared";
-import {
-  getAiWorkloadState,
-  listProjects,
-  listStaleInProgressTasks,
-  resetStaleQaRuns,
-} from "@aif/data";
+import { getEnv, logger } from "@aif/shared";
+import { listProjects, resetStaleQaRuns } from "@aif/data";
 import { projectsRouter } from "./routes/projects.js";
 import { tasksRouter } from "./routes/tasks.js";
+import { agentStatusRouter } from "./routes/agentStatus.js";
 import { chatRouter } from "./routes/chat.js";
 import { buildSettingsOverview, settingsRoutes } from "./routes/settings.js";
 import { runtimeProfilesRouter } from "./routes/runtimeProfiles.js";
@@ -51,44 +47,11 @@ app.get("/health", (c) => {
   });
 });
 
-// Agent status: running tasks, heartbeat lag, uptime
-app.get("/agent/status", (c) => {
-  const now = Date.now();
-  const activeTasks = listStaleInProgressTasks().map((t) => {
-    const heartbeatAt = t.lastHeartbeatAt ? new Date(t.lastHeartbeatAt).getTime() : null;
-    const updatedAt = t.updatedAt ? new Date(t.updatedAt).getTime() : now;
-    const lagMs = heartbeatAt ? now - heartbeatAt : now - updatedAt;
-
-    return {
-      id: t.id,
-      title: t.title,
-      status: t.status,
-      lastHeartbeatAt: t.lastHeartbeatAt,
-      heartbeatLagMs: lagMs,
-      heartbeatStale: lagMs > 5 * 60 * 1000, // > 5 min without heartbeat
-      updatedAt: t.updatedAt,
-    };
-  });
-
-  // Canonical AI-workload snapshot (plan §8.2): admitted-not-started, in-stage
-  // (locked or not — quiet model waiting is busy), and timed obligations from
-  // ANY entry path. Binding-agnostic; the host sleep-guard consumes the pinned
-  // SQL amendment of the same predicate. Existing stale-detector fields above
-  // are unchanged.
-  const workload = getAiWorkloadState();
-
-  return c.json({
-    uptime: Math.floor((Date.now() - startTime) / 1000),
-    activeTasks,
-    activeTaskCount: activeTasks.length,
-    staleTasks: activeTasks.filter((t) => t.heartbeatStale).length,
-    workload,
-    // Keyed-intake contract level (§9.3): the bridge relay probes this before
-    // any keyed delivery; a mismatch parks delivery as `hold_api_compat`.
-    intakeCompat: INTAKE_COMPAT_LEVEL,
-    checkedAt: new Date().toISOString(),
-  });
-});
+// Agent status: running tasks, heartbeat lag, uptime, workload, intakeCompat
+// (§8.2/§9.3) — the real router, mounted behind the same global middleware
+// chain (participantAuth gates it whenever participants mode is enabled; the
+// relay's compat probe presents its service session).
+app.route("/agent", agentStatusRouter);
 
 // Settings (expose env defaults to frontend)
 app.get("/settings", async (c) => {

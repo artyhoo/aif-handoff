@@ -163,8 +163,14 @@ Envelope lifecycle and HOLD semantics:
 ## Rollback / API swap (bridge)
 
 The compat probe (`GET /agent/status` → `intakeCompat`) is a runtime mismatch
-detector only — **never** a fence, never a transactional version lock. Before
-any incompatible API swap:
+detector only — **never** a fence, never a transactional version lock. The
+probe presents the same relay service participant session as delivery and the
+handover watch (`/agent/status` is session-gated whenever participants mode is
+enabled — the only mode in which the keyed branch admits), so a missing,
+invalid, or revoked session answers 401 and parks keyed delivery as
+`hold_api_compat` (visible as `probe_status_401` in `--status`) with zero
+POSTs and no wake; restoring a valid session auto-resumes the held envelopes.
+Before any incompatible API swap:
 
 1. **Fence + stop** — `relay.mjs fence --reason …` **and** stop the unit. Both,
    never either.
