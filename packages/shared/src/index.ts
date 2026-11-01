@@ -5,6 +5,7 @@ export {
   participants,
   participantSessions,
   tasks,
+  taskIntakeBindings,
   taskComments,
   taskAssignments,
   taskExecutorHistory,
@@ -33,6 +34,8 @@ export type {
   NewParticipantSessionRow,
   TaskRow,
   NewTaskRow,
+  TaskIntakeBindingRow,
+  NewTaskIntakeBindingRow,
   TaskCommentRow,
   NewTaskCommentRow,
   TaskAssignmentRow,
@@ -197,6 +200,24 @@ export {
 
 // Logger
 export { logger, rootLogger } from "./logger.js";
+
+// Keyed intake identity encoding + frozen client-content digest (§7.3/§7.4)
+export {
+  INTAKE_CLIENT_REQUEST_ID_MAX,
+  INTAKE_COMPAT_LEVEL,
+  INTAKE_DEDUP_KEY_SEPARATOR,
+  INTAKE_ID_PATTERN,
+  INTAKE_NAMESPACED_REQUEST_ID_MAX,
+  INTAKE_NAMESPACED_REQUEST_ID_PATTERN,
+  INTAKE_PRINCIPAL_ID_MAX,
+  buildIntakeDedupKey,
+  canonicalizeIntakePayload,
+  computeIntakePayloadDigest,
+  isValidIntakeClientRequestId,
+  isValidIntakePrincipalId,
+  isValidNamespacedIntakeRequestId,
+  namespaceIntakeRequestId,
+} from "./intakeDigest.js";
 
 // Monorepo root resolution
 export { findMonorepoRoot, findMonorepoRootFromUrl } from "./monorepoRoot.js";

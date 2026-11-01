@@ -23,9 +23,7 @@ import {
   TASK_STATUSES,
   buildRuntimeLimitSignature,
   appSettings,
-  generatePlanPath,
   getEnv,
-  getProjectConfig,
   isRuntimeTransport,
   logger as createLogger,
   normalizeRuntimeLimitSnapshot,
@@ -37,8 +35,6 @@ import {
   projects,
   participants,
   taskComments,
-  taskAssignments,
-  taskExecutorHistory,
   auditEvents,
   tasks,
   runtimeProfiles,
@@ -93,6 +89,7 @@ import {
 } from "./taskOwnership.js";
 import { transitionTaskStatus as transitionTaskStatusAtomic } from "./taskTransitions.js";
 import { createAuditEventValues } from "./audit.js";
+import { insertTaskWithOwnershipRows, prepareTaskCreation } from "./taskIntake.js";
 
 export * from "./normalizeBacklogPositions.js";
 export * from "./github.js";
@@ -979,14 +976,13 @@ export function getMinBacklogPosition(projectId: string): number | null {
   return row?.minPos == null ? null : Number(row.minPos);
 }
 
-export function getMaxBacklogPosition(projectId: string): number | null {
-  const row = getDb()
-    .select({ maxPos: max(tasks.position) })
-    .from(tasks)
-    .where(and(eq(tasks.projectId, projectId), eq(tasks.status, "backlog")))
-    .get();
-  return row?.maxPos == null ? null : Number(row.maxPos);
-}
+export {
+  createTaskWithIntakeBinding,
+  getMaxBacklogPosition,
+  type CreateTaskInsertInput,
+  type CreateTaskWithIntakeBindingResult,
+  type TaskIntakeBindingInput,
+} from "./taskIntake.js";
 
 /** Summary projection — excludes heavy text fields for list/search responses. */
 export type TaskSummaryRow = Pick<TaskRow,
@@ -1204,163 +1200,15 @@ export function createTask(input: {
   scheduledAt?: string | null;
   position?: number;
 }): HydratedTaskRow | undefined {
-  const db = getDb();
-  const id = crypto.randomUUID();
-  const now = new Date().toISOString();
-  const executionOwner = input.executionOwner ?? "ai";
-  const assigneeIds = [...new Set(input.assigneeIds ?? [])];
-  const actor = input.actor ?? {
-    kind: "system",
-    id: null,
-    displayNameSnapshot: "System",
-  };
-
-  // Auto-compute planPath for full mode when no explicit path is provided
-  let resolvedPlanPath = input.planPath;
-  if (input.plannerMode === "full") {
-    const project = findProjectById(input.projectId);
-    const projectRoot = project?.rootPath ?? process.cwd();
-    const cfg = getProjectConfig(projectRoot);
-    const defaultPlanPath = cfg.paths.plan;
-
-    if (resolvedPlanPath === undefined || resolvedPlanPath === defaultPlanPath) {
-      resolvedPlanPath = generatePlanPath(input.title, "full", {
-        plansDir: cfg.paths.plans,
-        defaultPlanPath,
-      });
-      log.debug("Auto-generated plan path for full mode: %s", resolvedPlanPath);
-    }
-  }
-
-  const assignees =
-    assigneeIds.length === 0
-      ? []
-      : db
-          .select({
-            participantId: participants.id,
-            displayName: participants.displayName,
-            role: participants.role,
-            active: participants.active,
-          })
-          .from(participants)
-          .where(inArray(participants.id, assigneeIds))
-          .orderBy(asc(participants.displayName), asc(participants.id))
-          .all();
-  const hasInvalidAssignees =
-    assignees.length !== assigneeIds.length ||
-    assignees.some((participant) => !participant.active);
-  if (
-    hasInvalidAssignees ||
-    (executionOwner === "ai" && assigneeIds.length > 0)
-  ) {
-    log.warn(
-      {
-        projectId: input.projectId,
-        executionOwner,
-        requestedAssigneeCount: assigneeIds.length,
-        activeAssigneeCount: assignees.filter((participant) => participant.active).length,
-      },
-      "Rejected task creation ownership",
-    );
-    return undefined;
-  }
-  const position =
-    input.position ??
-    (() => {
-      const maxPosition = getMaxBacklogPosition(input.projectId);
-      return (maxPosition ?? 1000) + 100;
-    })();
-
-  db.transaction((tx) => {
-    tx.insert(tasks)
-      .values({
-      id,
-      projectId: input.projectId,
-      title: input.title,
-      description: input.description,
-      attachments: JSON.stringify(input.attachments ?? []),
-      priority: input.priority,
-      autoMode: input.autoMode,
-      executionOwner,
-      ownershipRevision: 0,
-      isFix: input.isFix,
-      plannerMode: input.plannerMode,
-      planPath: resolvedPlanPath,
-      planDocs: input.planDocs,
-      planTests: input.planTests,
-      skipReview: input.skipReview,
-      useSubagents: input.useSubagents,
-      runPlanImprove: input.runPlanImprove,
-      runPostVerify: input.runPostVerify,
-      autoQa: input.autoQa,
-      maxReviewIterations: input.maxReviewIterations,
-      paused: input.paused,
-      runtimeProfileId: input.runtimeProfileId ?? null,
-      modelOverride: input.modelOverride ?? null,
-      runtimeOptionsJson:
-        input.runtimeOptions === undefined ? null : JSON.stringify(input.runtimeOptions),
-      roadmapAlias: input.roadmapAlias ?? null,
-      tags: JSON.stringify(input.tags ?? []),
-      scheduledAt: input.scheduledAt ?? null,
-      reworkRequested: false,
-      manualReviewRequired: false,
-      status: "backlog",
-      position,
-      lastHeartbeatAt: now,
-      createdAt: now,
-      updatedAt: now,
-    })
-    .run();
-    if (executionOwner === "human" && assignees.length > 0) {
-      tx.insert(taskAssignments)
-        .values(
-          assignees.map((assignee) => ({
-            taskId: id,
-            participantId: assignee.participantId,
-            assignedByKind: actor.kind,
-            assignedById: actor.id,
-            assignedByDisplayNameSnapshot: actor.displayNameSnapshot,
-            createdAt: now,
-          })),
-        )
-        .run();
-    }
-    tx.insert(taskExecutorHistory)
-      .values({
-        id: crypto.randomUUID(),
-        taskId: id,
-        taskTitleSnapshot: input.title,
-        ownershipRevision: 0,
-        executionOwner,
-        assigneesSnapshotJson: JSON.stringify(executionOwner === "human" ? assignees : []),
-        statusSnapshot: "backlog",
-        actorKind: actor.kind,
-        actorId: actor.id,
-        actorDisplayNameSnapshot: actor.displayNameSnapshot,
-        reason: "task_created",
-        createdAt: now,
-      })
-      .run();
-    tx.insert(auditEvents)
-      .values(
-        createAuditEventValues({
-          action: "task.created",
-          entityType: "task",
-          entityId: id,
-          taskId: id,
-          taskTitleSnapshot: input.title,
-          executionOwnerSnapshot: executionOwner,
-          assigneesSnapshot: executionOwner === "human" ? assignees : [],
-          statusSnapshot: "backlog",
-          actor,
-          metadata: { ownershipRevision: 0 },
-          createdAt: now,
-        }),
-      )
-      .run();
+  // Shared insertion path — identical preparation and transaction body as the
+  // keyed-intake admission (`createTaskWithIntakeBinding`), so both entry paths
+  // stay byte-identical (plan p2-wake-on-work §7.2).
+  const prepared = prepareTaskCreation(input);
+  if (!prepared) return undefined;
+  getDb().transaction((tx) => {
+    insertTaskWithOwnershipRows(tx, input, prepared, { ownershipRevision: 0 });
   });
-
-  return findTaskById(id);
+  return findTaskById(prepared.id);
 }
 
 export function updateTask(id: string, fields: TaskFieldsUpdate): TaskRow | undefined {
@@ -2665,6 +2513,107 @@ export function listStaleInProgressTasks(): TaskRow[] {
       ),
     )
     .all();
+}
+
+/** Autonomous-active stages: work the coordinator/AI subsystem owns right now. */
+const AI_ACTIVE_STATUSES = ["planning", "improve", "implementing", "review", "verify"] as const;
+
+/** Terminal statuses — completed work never protects anything. */
+const AI_TERMINAL_STATUSES = ["done", "verified"] as const;
+
+export interface AiWorkloadState {
+  /** AI-owned, unpaused, in autonomous-active stage — including locked ones (quiet model waiting is busy). */
+  busy: number;
+  /**
+   * Required work the AI subsystem still owes: admitted-not-started (backlog),
+   * autonomous-active without a live lock (coordinator owes a transition), or
+   * `plan_ready` with `autoMode` true awaiting auto-start.
+   */
+  pendingCount: number;
+  /**
+   * Non-terminal, AI-owned, unpaused tasks with `scheduledAt > now` from ANY
+   * entry path (keyed intake or legacy) — timed obligations that must hold an
+   * awake PC awake (binding-agnostic: no intake-binding join, round-2 M4).
+   */
+  timedPendingCount: number;
+  /** Earliest future `scheduledAt` among the timed obligations (null when none). */
+  earliestScheduledAt: string | null;
+}
+
+function hasLiveLock(row: {
+  lockedBy: string | null;
+  lockedUntil: string | null;
+}, nowIso: string): boolean {
+  return Boolean(row.lockedBy) && row.lockedUntil !== null && row.lockedUntil > nowIso;
+}
+
+/**
+ * One live computation over `tasks` rows only (no join on
+ * `task_intake_bindings` — intake-bound tasks are a subset, not a special
+ * class). Human/external gates are excluded, mirroring the sleep-guard
+ * philosophy: `paused`, `blocked_external`, `plan_ready` with `autoMode`
+ * false, `manualReviewRequired`, and terminal `done`/`verified`. The
+ * predicate aggregates over all rows, so an old completion can never clear a
+ * newer task's protection. Exposed on `GET /agent/status`; the host sleep
+ * guard consumes the pinned SQL amendment of the same predicate (§8.2).
+ */
+export function getAiWorkloadState(nowIso: string = new Date().toISOString()): AiWorkloadState {
+  const rows = getDb()
+    .select({
+      status: tasks.status,
+      executionOwner: tasks.executionOwner,
+      paused: tasks.paused,
+      autoMode: tasks.autoMode,
+      manualReviewRequired: tasks.manualReviewRequired,
+      lockedBy: tasks.lockedBy,
+      lockedUntil: tasks.lockedUntil,
+      scheduledAt: tasks.scheduledAt,
+    })
+    .from(tasks)
+    .all();
+
+  let busy = 0;
+  let pendingCount = 0;
+  let timedPendingCount = 0;
+  let earliestScheduledAt: string | null = null;
+
+  for (const row of rows) {
+    const gated =
+      row.executionOwner !== "ai" ||
+      row.paused ||
+      row.status === "blocked_external" ||
+      row.manualReviewRequired ||
+      (AI_TERMINAL_STATUSES as readonly string[]).includes(row.status);
+
+    if (!gated && (AI_ACTIVE_STATUSES as readonly string[]).includes(row.status)) {
+      // Quiet model waiting is busy — locked or not.
+      busy += 1;
+      if (!hasLiveLock(row, nowIso)) {
+        // The coordinator owes a transition on this in-stage task.
+        pendingCount += 1;
+      }
+    }
+    if (
+      !gated &&
+      row.status === "plan_ready" &&
+      row.autoMode
+    ) {
+      // Awaiting auto-start.
+      pendingCount += 1;
+    }
+    if (!gated && row.status === "backlog") {
+      // Admitted-not-started (from any entry path).
+      pendingCount += 1;
+    }
+    if (!gated && row.scheduledAt !== null && row.scheduledAt > nowIso) {
+      timedPendingCount += 1;
+      if (earliestScheduledAt === null || row.scheduledAt < earliestScheduledAt) {
+        earliestScheduledAt = row.scheduledAt;
+      }
+    }
+  }
+
+  return { busy, pendingCount, timedPendingCount, earliestScheduledAt };
 }
 
 export function appendTaskActivityLog(taskId: string, newLines: string): void {

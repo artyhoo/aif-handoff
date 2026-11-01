@@ -420,6 +420,19 @@ function ensureTables(sqlite: Database.Database): void {
       updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
     )
   `);
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS task_intake_bindings (
+      dedup_key TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      principal_kind TEXT NOT NULL,
+      principal_id TEXT NOT NULL,
+      request_id TEXT NOT NULL,
+      payload_digest TEXT NOT NULL,
+      task_id TEXT NOT NULL,
+      source TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    )
+  `);
 
   runMigrations(sqlite);
   ensureTriggers(sqlite);
@@ -1084,6 +1097,25 @@ const MIGRATIONS: Migration[] = [
       );
     `,
   },
+  {
+    version: 29,
+    description:
+      "Add append-only task_intake_bindings for authenticated keyed intake replay (plan p2-wake-on-work §7.1)",
+    sql: `
+      CREATE TABLE IF NOT EXISTS task_intake_bindings (
+        dedup_key TEXT PRIMARY KEY,        -- canonical 'principalKind|principalId|projectId|requestId'
+        project_id TEXT NOT NULL,
+        principal_kind TEXT NOT NULL,      -- 'participant' | 'internal'
+        principal_id TEXT NOT NULL,
+        request_id TEXT NOT NULL,          -- namespaced 'pid:cid', <= 193 chars, charset [A-Za-z0-9._-] plus one ':'
+        payload_digest TEXT NOT NULL,      -- server-computed sha256 hex (frozen client-content canonicalization)
+        task_id TEXT NOT NULL,             -- NO FK: tombstones must survive task deletion
+        source TEXT NOT NULL,              -- server-derived from the verified principal, never client-claimed
+        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_task_intake_bindings_task ON task_intake_bindings(task_id);
+    `,
+  },
 ];
 
 function splitSqlStatements(sqlText: string): string[] {
@@ -1380,6 +1412,8 @@ function ensureIndexes(sqlite: Database.Database): void {
     "CREATE INDEX IF NOT EXISTS idx_codex_limit_heads_lookup ON codex_limit_heads(account_fingerprint, project_root, limit_id, observed_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_codex_limit_history_head ON codex_limit_history(head_key, observed_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_codex_limit_history_account ON codex_limit_history(account_fingerprint, project_root, limit_id, observed_at DESC)",
+    // Keyed intake: resolve binding → original task (replay/tombstone reads).
+    "CREATE INDEX IF NOT EXISTS idx_task_intake_bindings_task ON task_intake_bindings(task_id)",
   ];
 
   for (const ddl of indexDefs) {

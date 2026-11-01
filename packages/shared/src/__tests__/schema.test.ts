@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { createTestDb } from "../db.js";
-import { tasks } from "../schema.js";
+import { taskIntakeBindings, tasks } from "../schema.js";
 import type { TaskStatus } from "../types.js";
 
 describe("tasks schema", () => {
@@ -187,5 +187,95 @@ describe("tasks schema", () => {
     const result = db.select().from(tasks).where(eq(tasks.id, id)).get();
     expect(result?.runtimeLimitSnapshotJson).toBe(snapshotJson);
     expect(result?.runtimeLimitUpdatedAt).toBe("2026-04-17T10:00:05.000Z");
+  });
+});
+
+describe("task_intake_bindings schema (migration v29)", () => {
+  let db: ReturnType<typeof createTestDb>;
+
+  beforeEach(() => {
+    db = createTestDb();
+  });
+
+  it("should insert and query a keyed intake binding", () => {
+    const taskId = crypto.randomUUID();
+    db.insert(tasks).values({ id: taskId, projectId: "proj-1", title: "Intake task" }).run();
+    db.insert(taskIntakeBindings)
+      .values({
+        dedupKey: "participant|relay-svc|proj-1|relay-svc:nightly-1",
+        projectId: "proj-1",
+        principalKind: "participant",
+        principalId: "relay-svc",
+        requestId: "relay-svc:nightly-1",
+        payloadDigest: "a".repeat(64),
+        taskId,
+        source: "relay",
+      })
+      .run();
+
+    const row = db
+      .select()
+      .from(taskIntakeBindings)
+      .where(eq(taskIntakeBindings.dedupKey, "participant|relay-svc|proj-1|proj-1:nightly-1"))
+      .get();
+    expect(row).toBeUndefined();
+
+    const hit = db
+      .select()
+      .from(taskIntakeBindings)
+      .where(eq(taskIntakeBindings.dedupKey, "participant|relay-svc|proj-1|relay-svc:nightly-1"))
+      .get();
+    expect(hit).toBeDefined();
+    expect(hit!.taskId).toBe(taskId);
+    expect(hit!.principalKind).toBe("participant");
+    expect(hit!.createdAt).toBeTruthy();
+  });
+
+  it("should enforce the dedup_key primary key (anti-replay)", () => {
+    const insert = () =>
+      db
+        .insert(taskIntakeBindings)
+        .values({
+          dedupKey: "participant|relay-svc|proj-1|relay-svc:duplicate",
+          projectId: "proj-1",
+          principalKind: "participant",
+          principalId: "relay-svc",
+          requestId: "relay-svc:duplicate",
+          payloadDigest: "b".repeat(64),
+          taskId: crypto.randomUUID(),
+          source: "relay",
+        })
+        .run();
+    insert();
+    expect(insert).toThrow();
+  });
+
+  it("should back the task_id lookup with an index (tombstone/replay reads)", () => {
+    const taskId = crypto.randomUUID();
+    db.insert(tasks).values({ id: taskId, projectId: "proj-1", title: "Indexed" }).run();
+    db.insert(taskIntakeBindings)
+      .values({
+        dedupKey: "participant|relay-svc|proj-1|relay-svc:indexed",
+        projectId: "proj-1",
+        principalKind: "participant",
+        principalId: "relay-svc",
+        requestId: "relay-svc:indexed",
+        payloadDigest: "c".repeat(64),
+        taskId,
+        source: "relay",
+      })
+      .run();
+
+    const byTask = db
+      .select()
+      .from(taskIntakeBindings)
+      .where(eq(taskIntakeBindings.taskId, taskId))
+      .all();
+    expect(byTask).toHaveLength(1);
+
+    const indexes = db.all<{ name: string }>(
+      sql`SELECT name FROM pragma_index_list('task_intake_bindings')`,
+    );
+    expect(indexes.some((idx) => idx.name === "idx_task_intake_bindings_task")).toBe(true);
   });
 });

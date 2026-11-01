@@ -1,0 +1,187 @@
+{
+  "version": 1,
+  "description": "Pinned frozen client-content digest vectors (plan p2-wake-on-work §7.3). Shared by the API test suite (packages/shared/src/__tests__/intakeDigest.test.ts) and the bridge relay test suite (packages/shared/src/__tests__/workstationIntakeRelay.test.ts, envelope.mjs mirror). Expected values are frozen: a change to canonicalization must be a conscious contract change that updates this file and bumps intakeCompat.",
+  "vectors": [
+    {
+      "name": "full-payload",
+      "description": "Every client-supplied create field present; pins the canonical field set and UTC-Z scheduledAt.",
+      "payload": {
+        "projectId": "proj-1",
+        "title": "Wake the PC and file the intake report",
+        "description": "Deliver the nightly intake bundle",
+        "priority": 2,
+        "autoMode": true,
+        "autoQa": false,
+        "assigneeIds": ["p-b", "p-a"],
+        "tags": ["intake", "wake"],
+        "executionOwner": "ai",
+        "isFix": false,
+        "maxReviewIterations": 3,
+        "modelOverride": null,
+        "paused": false,
+        "planDocs": true,
+        "planPath": null,
+        "planTests": true,
+        "plannerMode": "fast",
+        "roadmapAlias": null,
+        "runPlanImprove": false,
+        "runPostVerify": false,
+        "runtimeOptions": {
+          "z": 1,
+          "a": {
+            "y": 2,
+            "x": 3
+          }
+        },
+        "runtimeProfileId": null,
+        "scheduledAt": "2026-11-05T09:30:00+02:00",
+        "skipReview": false,
+        "useSubagents": true
+      },
+      "expectedCanonicalJson": "{\"assigneeIds\":[\"p-a\",\"p-b\"],\"autoMode\":true,\"autoQa\":false,\"description\":\"Deliver the nightly intake bundle\",\"executionOwner\":\"ai\",\"isFix\":false,\"maxReviewIterations\":3,\"modelOverride\":null,\"paused\":false,\"planDocs\":true,\"planPath\":null,\"planTests\":true,\"plannerMode\":\"fast\",\"priority\":2,\"projectId\":\"proj-1\",\"roadmapAlias\":null,\"runPlanImprove\":false,\"runPostVerify\":false,\"runtimeOptions\":{\"a\":{\"x\":3,\"y\":2},\"z\":1},\"runtimeProfileId\":null,\"scheduledAt\":\"2026-11-05T07:30:00.000Z\",\"skipReview\":false,\"tags\":[\"intake\",\"wake\"],\"title\":\"Wake the PC and file the intake report\",\"useSubagents\":true}",
+      "expectedDigest": "b72e8795fdd7a1c64bf88cc66d86b52618bc2aec43844cc168d707c5c7ff06f9"
+    },
+    {
+      "name": "absent-optionals-are-null",
+      "description": "Only the required trio present; every absent optional canonicalizes to the null sentinel (never an env/route default).",
+      "payload": {
+        "projectId": "proj-1",
+        "title": "Wake the PC and file the intake report",
+        "description": "Deliver the nightly intake bundle",
+        "priority": 2
+      },
+      "expectedCanonicalJson": "{\"assigneeIds\":null,\"autoMode\":null,\"autoQa\":null,\"description\":\"Deliver the nightly intake bundle\",\"executionOwner\":null,\"isFix\":null,\"maxReviewIterations\":null,\"modelOverride\":null,\"paused\":null,\"planDocs\":null,\"planPath\":null,\"planTests\":null,\"plannerMode\":null,\"priority\":2,\"projectId\":\"proj-1\",\"roadmapAlias\":null,\"runPlanImprove\":null,\"runPostVerify\":null,\"runtimeOptions\":null,\"runtimeProfileId\":null,\"scheduledAt\":null,\"skipReview\":null,\"tags\":null,\"title\":\"Wake the PC and file the intake report\",\"useSubagents\":null}",
+      "expectedDigest": "1e57f99e14b6cdefa96695007e46f67dda908f02b3eb13da6dcd1836e1b05ae6"
+    },
+    {
+      "name": "scheduledat-offset-variant-a",
+      "description": "Same instant as variant-b expressed with a +02:00 offset — identical digest.",
+      "payload": {
+        "projectId": "proj-1",
+        "title": "Wake the PC and file the intake report",
+        "description": "Deliver the nightly intake bundle",
+        "priority": 2,
+        "scheduledAt": "2026-11-05T09:30:00+02:00"
+      },
+      "expectedCanonicalJson": "{\"assigneeIds\":null,\"autoMode\":null,\"autoQa\":null,\"description\":\"Deliver the nightly intake bundle\",\"executionOwner\":null,\"isFix\":null,\"maxReviewIterations\":null,\"modelOverride\":null,\"paused\":null,\"planDocs\":null,\"planPath\":null,\"planTests\":null,\"plannerMode\":null,\"priority\":2,\"projectId\":\"proj-1\",\"roadmapAlias\":null,\"runPlanImprove\":null,\"runPostVerify\":null,\"runtimeOptions\":null,\"runtimeProfileId\":null,\"scheduledAt\":\"2026-11-05T07:30:00.000Z\",\"skipReview\":null,\"tags\":null,\"title\":\"Wake the PC and file the intake report\",\"useSubagents\":null}",
+      "expectedDigest": "1a5262ea8a61e518bc226a6dd0bf7e6b2cb061042a5f76bd30fef38920f07d38"
+    },
+    {
+      "name": "scheduledat-offset-variant-b",
+      "description": "Same instant as variant-a expressed in UTC — identical digest.",
+      "payload": {
+        "projectId": "proj-1",
+        "title": "Wake the PC and file the intake report",
+        "description": "Deliver the nightly intake bundle",
+        "priority": 2,
+        "scheduledAt": "2026-11-05T07:30:00.000Z"
+      },
+      "expectedCanonicalJson": "{\"assigneeIds\":null,\"autoMode\":null,\"autoQa\":null,\"description\":\"Deliver the nightly intake bundle\",\"executionOwner\":null,\"isFix\":null,\"maxReviewIterations\":null,\"modelOverride\":null,\"paused\":null,\"planDocs\":null,\"planPath\":null,\"planTests\":null,\"plannerMode\":null,\"priority\":2,\"projectId\":\"proj-1\",\"roadmapAlias\":null,\"runPlanImprove\":null,\"runPostVerify\":null,\"runtimeOptions\":null,\"runtimeProfileId\":null,\"scheduledAt\":\"2026-11-05T07:30:00.000Z\",\"skipReview\":null,\"tags\":null,\"title\":\"Wake the PC and file the intake report\",\"useSubagents\":null}",
+      "expectedDigest": "1a5262ea8a61e518bc226a6dd0bf7e6b2cb061042a5f76bd30fef38920f07d38"
+    },
+    {
+      "name": "scheduledat-different-instant",
+      "description": "One minute later — must digest differently (conflicting schedules are rejected).",
+      "payload": {
+        "projectId": "proj-1",
+        "title": "Wake the PC and file the intake report",
+        "description": "Deliver the nightly intake bundle",
+        "priority": 2,
+        "scheduledAt": "2026-11-05T07:31:00.000Z"
+      },
+      "expectedCanonicalJson": "{\"assigneeIds\":null,\"autoMode\":null,\"autoQa\":null,\"description\":\"Deliver the nightly intake bundle\",\"executionOwner\":null,\"isFix\":null,\"maxReviewIterations\":null,\"modelOverride\":null,\"paused\":null,\"planDocs\":null,\"planPath\":null,\"planTests\":null,\"plannerMode\":null,\"priority\":2,\"projectId\":\"proj-1\",\"roadmapAlias\":null,\"runPlanImprove\":null,\"runPostVerify\":null,\"runtimeOptions\":null,\"runtimeProfileId\":null,\"scheduledAt\":\"2026-11-05T07:31:00.000Z\",\"skipReview\":null,\"tags\":null,\"title\":\"Wake the PC and file the intake report\",\"useSubagents\":null}",
+      "expectedDigest": "41e831c062a11f1a9dd311dcbc2a1a02251abde773bfdc0f10b2c84d1d4f4e96"
+    },
+    {
+      "name": "sort-tolerant-arrays-order-a",
+      "description": "assigneeIds/tags in insertion order a,b — same digest as order-b.",
+      "payload": {
+        "projectId": "proj-1",
+        "title": "Wake the PC and file the intake report",
+        "description": "Deliver the nightly intake bundle",
+        "priority": 2,
+        "assigneeIds": ["p-b", "p-a"],
+        "tags": ["wake", "intake"]
+      },
+      "expectedCanonicalJson": "{\"assigneeIds\":[\"p-a\",\"p-b\"],\"autoMode\":null,\"autoQa\":null,\"description\":\"Deliver the nightly intake bundle\",\"executionOwner\":null,\"isFix\":null,\"maxReviewIterations\":null,\"modelOverride\":null,\"paused\":null,\"planDocs\":null,\"planPath\":null,\"planTests\":null,\"plannerMode\":null,\"priority\":2,\"projectId\":\"proj-1\",\"roadmapAlias\":null,\"runPlanImprove\":null,\"runPostVerify\":null,\"runtimeOptions\":null,\"runtimeProfileId\":null,\"scheduledAt\":null,\"skipReview\":null,\"tags\":[\"intake\",\"wake\"],\"title\":\"Wake the PC and file the intake report\",\"useSubagents\":null}",
+      "expectedDigest": "668fccdb55e0a59ac31b7d07b931b191b054c4b883ac76a7fef5aa95f57578f2"
+    },
+    {
+      "name": "sort-tolerant-arrays-order-b",
+      "description": "assigneeIds/tags in insertion order b,a — same digest as order-a.",
+      "payload": {
+        "projectId": "proj-1",
+        "title": "Wake the PC and file the intake report",
+        "description": "Deliver the nightly intake bundle",
+        "priority": 2,
+        "assigneeIds": ["p-a", "p-b"],
+        "tags": ["intake", "wake"]
+      },
+      "expectedCanonicalJson": "{\"assigneeIds\":[\"p-a\",\"p-b\"],\"autoMode\":null,\"autoQa\":null,\"description\":\"Deliver the nightly intake bundle\",\"executionOwner\":null,\"isFix\":null,\"maxReviewIterations\":null,\"modelOverride\":null,\"paused\":null,\"planDocs\":null,\"planPath\":null,\"planTests\":null,\"plannerMode\":null,\"priority\":2,\"projectId\":\"proj-1\",\"roadmapAlias\":null,\"runPlanImprove\":null,\"runPostVerify\":null,\"runtimeOptions\":null,\"runtimeProfileId\":null,\"scheduledAt\":null,\"skipReview\":null,\"tags\":[\"intake\",\"wake\"],\"title\":\"Wake the PC and file the intake report\",\"useSubagents\":null}",
+      "expectedDigest": "668fccdb55e0a59ac31b7d07b931b191b054c4b883ac76a7fef5aa95f57578f2"
+    },
+    {
+      "name": "array-element-change",
+      "description": "One different assignee — must digest differently.",
+      "payload": {
+        "projectId": "proj-1",
+        "title": "Wake the PC and file the intake report",
+        "description": "Deliver the nightly intake bundle",
+        "priority": 2,
+        "assigneeIds": ["p-b", "p-c"]
+      },
+      "expectedCanonicalJson": "{\"assigneeIds\":[\"p-b\",\"p-c\"],\"autoMode\":null,\"autoQa\":null,\"description\":\"Deliver the nightly intake bundle\",\"executionOwner\":null,\"isFix\":null,\"maxReviewIterations\":null,\"modelOverride\":null,\"paused\":null,\"planDocs\":null,\"planPath\":null,\"planTests\":null,\"plannerMode\":null,\"priority\":2,\"projectId\":\"proj-1\",\"roadmapAlias\":null,\"runPlanImprove\":null,\"runPostVerify\":null,\"runtimeOptions\":null,\"runtimeProfileId\":null,\"scheduledAt\":null,\"skipReview\":null,\"tags\":null,\"title\":\"Wake the PC and file the intake report\",\"useSubagents\":null}",
+      "expectedDigest": "69badcffb3df92c4ef89c99156b72b30fbe40957b998dae8ae607cb8de378bf8"
+    },
+    {
+      "name": "nested-object-key-order-a",
+      "description": "runtimeOptions keys in insertion order z,a.x,a.y — same digest as order-b.",
+      "payload": {
+        "projectId": "proj-1",
+        "title": "Wake the PC and file the intake report",
+        "description": "Deliver the nightly intake bundle",
+        "priority": 2,
+        "runtimeOptions": {
+          "z": 1,
+          "a": {
+            "y": 2,
+            "x": 3
+          }
+        }
+      },
+      "expectedCanonicalJson": "{\"assigneeIds\":null,\"autoMode\":null,\"autoQa\":null,\"description\":\"Deliver the nightly intake bundle\",\"executionOwner\":null,\"isFix\":null,\"maxReviewIterations\":null,\"modelOverride\":null,\"paused\":null,\"planDocs\":null,\"planPath\":null,\"planTests\":null,\"plannerMode\":null,\"priority\":2,\"projectId\":\"proj-1\",\"roadmapAlias\":null,\"runPlanImprove\":null,\"runPostVerify\":null,\"runtimeOptions\":{\"a\":{\"x\":3,\"y\":2},\"z\":1},\"runtimeProfileId\":null,\"scheduledAt\":null,\"skipReview\":null,\"tags\":null,\"title\":\"Wake the PC and file the intake report\",\"useSubagents\":null}",
+      "expectedDigest": "930f2cb710dfdd0efaeff53d076df82fe455a47931a385ec344ba390dc29d035"
+    },
+    {
+      "name": "nested-object-key-order-b",
+      "description": "runtimeOptions keys reordered — same digest as order-a.",
+      "payload": {
+        "projectId": "proj-1",
+        "title": "Wake the PC and file the intake report",
+        "description": "Deliver the nightly intake bundle",
+        "priority": 2,
+        "runtimeOptions": {
+          "a": {
+            "x": 3,
+            "y": 2
+          },
+          "z": 1
+        }
+      },
+      "expectedCanonicalJson": "{\"assigneeIds\":null,\"autoMode\":null,\"autoQa\":null,\"description\":\"Deliver the nightly intake bundle\",\"executionOwner\":null,\"isFix\":null,\"maxReviewIterations\":null,\"modelOverride\":null,\"paused\":null,\"planDocs\":null,\"planPath\":null,\"planTests\":null,\"plannerMode\":null,\"priority\":2,\"projectId\":\"proj-1\",\"roadmapAlias\":null,\"runPlanImprove\":null,\"runPostVerify\":null,\"runtimeOptions\":{\"a\":{\"x\":3,\"y\":2},\"z\":1},\"runtimeProfileId\":null,\"scheduledAt\":null,\"skipReview\":null,\"tags\":null,\"title\":\"Wake the PC and file the intake report\",\"useSubagents\":null}",
+      "expectedDigest": "930f2cb710dfdd0efaeff53d076df82fe455a47931a385ec344ba390dc29d035"
+    },
+    {
+      "name": "one-char-title-change",
+      "description": "Title differs by one character from the base — must digest differently.",
+      "payload": {
+        "projectId": "proj-1",
+        "title": "Wake the PC and file the intake reporT",
+        "description": "Deliver the nightly intake bundle",
+        "priority": 2
+      },
+      "expectedCanonicalJson": "{\"assigneeIds\":null,\"autoMode\":null,\"autoQa\":null,\"description\":\"Deliver the nightly intake bundle\",\"executionOwner\":null,\"isFix\":null,\"maxReviewIterations\":null,\"modelOverride\":null,\"paused\":null,\"planDocs\":null,\"planPath\":null,\"planTests\":null,\"plannerMode\":null,\"priority\":2,\"projectId\":\"proj-1\",\"roadmapAlias\":null,\"runPlanImprove\":null,\"runPostVerify\":null,\"runtimeOptions\":null,\"runtimeProfileId\":null,\"scheduledAt\":null,\"skipReview\":null,\"tags\":null,\"title\":\"Wake the PC and file the intake reporT\",\"useSubagents\":null}",
+      "expectedDigest": "614cfd3d126b9821f37d334ac314792bfb5e7ce147df1aef28f10bd3381b6541"
+    }
+  ]
+}
