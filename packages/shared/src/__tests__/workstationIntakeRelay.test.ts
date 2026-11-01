@@ -19,7 +19,7 @@ import {
   rmSync,
   statSync,
 } from "node:fs";
-import { connect } from "node:net";
+import { connect, createServer as createNetServer } from "node:net";
 import { createServer as createHttpServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -61,7 +61,9 @@ const {
   probeCompat,
   writeFence,
 } = await import(RELAY_FILE("deliverer.mjs"));
-const { EXIT_CODES, resolvePrincipal, submitOnce } = await import(RELAY_FILE("submit.mjs"));
+const { EXIT_CODES, requestWriter, resolvePrincipal, submitOnce } = await import(
+  RELAY_FILE("submit.mjs")
+);
 const { evaluateGuard, querySupervisor, scanUncertainEffects } = await import(
   RELAY_FILE("deploy/rollback-guard.example.mjs")
 );
@@ -2610,4 +2612,364 @@ describe("bounded intake + truthful duplicate retention (R4 rework)", () => {
     client.destroy();
     writer.close();
   }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// Byte-preserving Unicode intake (R5 rework — finding 423c1656968f)
+// ---------------------------------------------------------------------------
+//
+// The writer decoded EACH socket chunk with `chunk.toString("utf8")` BEFORE
+// the frame was complete: a read boundary landing inside a multi-byte UTF-8
+// sequence irreversibly replaced those bytes with U+FFFD, so the reconstructed
+// frame differed from the bytes the client sent → `digest_mismatch` for any
+// legitimate non-ASCII submission whose frame spans more than one read.
+// These regressions drive the REAL createWriterServer + bindWriterSocket +
+// sealEnvelope over a real Unix socket and COORDINATE REAL DATA EVENTS: the
+// second write is sent only after an observational listener proves the server
+// consumed the first chunk as its own read with the boundary inside a
+// multibyte sequence — sender write boundaries are never assumed to equal
+// receiver reads. The requestWriter reply mirror (submit.mjs) is pinned by the
+// fragmented-response test at the end of this block.
+
+describe("byte-preserving Unicode intake (R5 rework — finding 423c1656968f)", () => {
+  /** The exact request frame bytes the shim sends (newline-delimited JSON). */
+  function frameBytes(credential: string, envelope: unknown): Buffer {
+    return Buffer.from(`${JSON.stringify({ credential, envelope })}\n`, "utf8");
+  }
+
+  interface SplitHarness {
+    config: RelayConfig;
+    spool: ReturnType<typeof createSpool>;
+    server: ReturnType<typeof createWriterServer>;
+    close: () => void;
+    observedChunks: number[];
+    firstChunkRead: Promise<void>;
+  }
+
+  /**
+   * Real writer bound to a real UDS, plus an OBSERVATIONAL connection
+   * listener recording every chunk the server actually reads (byte lengths).
+   * It never alters the stream — it only proves receiver read boundaries.
+   */
+  async function startObservedWriter(
+    config: RelayConfig,
+    spool: ReturnType<typeof createSpool>,
+    principalMap: Map<string, unknown> = PRINCIPAL_MAP as unknown as Map<string, unknown>,
+  ): Promise<SplitHarness> {
+    const server = createWriterServer({ config, spool, principalMap, credential: CREDENTIAL });
+    const observedChunks: number[] = [];
+    let sawFirstChunk: () => void = () => {};
+    const firstChunkRead = new Promise<void>((resolve) => {
+      sawFirstChunk = resolve;
+    });
+    server.on("connection", (socket: import("node:net").Socket) => {
+      socket.on("data", (chunk: Buffer) => {
+        observedChunks.push(chunk.length);
+        if (observedChunks.length === 1) sawFirstChunk();
+      });
+    });
+    const bound = await bindWriterSocket({ server, socketPath: config.socketPath });
+    if (!bound.ok) throw new Error(`writer bind failed: ${bound.code}`);
+    return {
+      config,
+      spool,
+      server,
+      close: () => server.close(),
+      observedChunks,
+      firstChunkRead,
+    };
+  }
+
+  /** Send a frame in two parts around `splitAt`, coordinating real reads. */
+  async function sendSplitFrame(
+    harness: SplitHarness,
+    frame: Buffer,
+    splitAt: number,
+  ): Promise<{ reply: string; json: () => unknown }> {
+    let reply = "";
+    const client = connect({ path: harness.config.socketPath });
+    client.on("data", (chunk) => {
+      reply += chunk.toString("utf8");
+    });
+    client.on("error", () => {
+      /* writer destroys peers on refusal — the reply assertions carry the contract */
+    });
+    client.write(frame.subarray(0, splitAt));
+    await harness.firstChunkRead; // chunk 1 was consumed as its own read
+    client.write(frame.subarray(splitAt));
+    client.end();
+    const settled = await waitFor(
+      () => {
+        try {
+          JSON.parse(reply);
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      10_000,
+      25,
+    );
+    return {
+      reply,
+      json: () => {
+        if (!settled) throw new Error(`writer reply never completed: ${reply}`);
+        return JSON.parse(reply);
+      },
+    };
+  }
+
+  it("retains a frame split INSIDE a Cyrillic/CJK multibyte sequence across coordinated reads — exact body, digest, identity, one record", async () => {
+    const dir = makeTmpDir();
+    const config = baseConfig(dir, { mode: "retain-only" });
+    const spool = createSpool({
+      dir: config.spoolDir,
+      maxEnvelopes: 10,
+      maxBytes: 4 * 1024 * 1024,
+    });
+    const harness = await startObservedWriter(config, spool);
+
+    const title = "Привет 分布式漢字 intake — byte-preserving delivery";
+    const description = "Ночная очередь: 漢字テストの整合性を保つ";
+    const envelope = sealTestEnvelope({
+      clientRequestId: "unicode-split-1",
+      title,
+      description,
+    });
+    const frame = frameBytes(CREDENTIAL, envelope);
+
+    // Split INSIDE the CJK char 漢: the boundary falls between its lead byte
+    // and a continuation byte — the exact corruption the finding describes.
+    const markerBytes = Buffer.from("漢", "utf8");
+    const markerOffset = frame.indexOf(markerBytes);
+    expect(markerOffset).toBeGreaterThan(0);
+    const splitAt = markerOffset + 1;
+
+    const { json } = await sendSplitFrame(harness, frame, splitAt);
+
+    // The read boundary is PROVEN, not assumed: the server consumed exactly
+    // the first part as one read, ending mid-codepoint, and every frame byte
+    // arrived across ≥ 2 reads.
+    expect(harness.observedChunks[0]).toBe(splitAt);
+    expect(harness.observedChunks.length).toBeGreaterThanOrEqual(2);
+    expect(harness.observedChunks.reduce((sum, n) => sum + n, 0)).toBe(frame.length);
+
+    const response = json() as {
+      ok: boolean;
+      code?: string;
+      receipt?: { id: string; dedupKey: string; requestId: string; digest: string };
+    };
+    expect(response.ok).toBe(true);
+    expect(response.receipt?.requestId).toBe(envelope.requestId);
+    expect(response.receipt?.dedupKey).toBe(envelope.dedupKey);
+    expect(response.receipt?.digest).toBe(envelope.digest);
+
+    // Exactly one record; the retained body is byte-exact Unicode.
+    expect(spoolStats(config.spoolDir)).toEqual({ count: 1, temps: 0, bytes: expect.any(Number) });
+    const record = spool.list()[0] as unknown as {
+      body: { title: string; description: string };
+      digest: string;
+      requestId: string;
+    };
+    expect(record.body.title).toBe(title);
+    expect(record.body.description).toBe(description);
+    expect(record.digest).toBe(envelope.digest);
+    expect(record.requestId).toBe(envelope.requestId);
+    harness.close();
+  });
+
+  it("retains a large legitimate CJK frame requiring several reads under the declared caps — exact retained body/digest/identity, one record/admission", async () => {
+    const dir = makeTmpDir();
+    const config = baseConfig(dir, { mode: "retain-only" });
+    // Principal bound mirrored from the deploy example (512 KiB): the frame
+    // must fit under BOTH the principal bound and the 4 MiB transport cap.
+    const largePrincipal = principalEntry({ maxRequestBytes: 512 * 1024 });
+    const principalMap = new Map([[largePrincipal.fingerprint, largePrincipal]]);
+    const spool = createSpool({
+      dir: config.spoolDir,
+      maxEnvelopes: 10,
+      maxBytes: 8 * 1024 * 1024,
+    });
+    const harness = await startObservedWriter(
+      config,
+      spool,
+      principalMap as unknown as Map<string, unknown>,
+    );
+
+    const title = "Ночной отчёт — CJK 大容量転送の検証";
+    const description = "漢".repeat(96_000); // 288 KB of 3-byte UTF-8 CJK
+    const envelope = sealTestEnvelope(
+      { clientRequestId: "unicode-large-1", title, description },
+      { maxRequestBytes: 512 * 1024 },
+    );
+    const frame = frameBytes(CREDENTIAL, envelope);
+    const frameLength = frame.length;
+    expect(frameLength).toBeGreaterThan(256 * 1024);
+    expect(frameLength).toBeLessThan(512 * 1024); // inside the principal bound
+    expect(frameLength).toBeLessThan(4 * 1024 * 1024); // inside the frame cap
+
+    // No coordinated split here: the frame is large enough that the receiver
+    // NEEDS several reads (socket read granularity is far below 256 KiB) —
+    // sender writes are not coordinated at all.
+    let reply = "";
+    const client = connect({ path: config.socketPath });
+    client.on("data", (chunk) => {
+      reply += chunk.toString("utf8");
+    });
+    client.write(frame);
+    client.end();
+    const settled = await waitFor(
+      () => {
+        try {
+          JSON.parse(reply);
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      10_000,
+      25,
+    );
+    expect(settled).toBe(true);
+
+    // Several reads actually happened (the frame cannot fit in one).
+    expect(harness.observedChunks.length).toBeGreaterThanOrEqual(2);
+    const observedTotal = harness.observedChunks.reduce((sum, n) => sum + n, 0);
+    expect(observedTotal).toBe(frameLength);
+
+    const response = JSON.parse(reply) as {
+      ok: boolean;
+      code?: string;
+      receipt?: { digest: string; requestId: string };
+    };
+    expect(response.ok).toBe(true);
+    expect(response.receipt?.digest).toBe(envelope.digest);
+    expect(response.receipt?.requestId).toBe(envelope.requestId);
+
+    // Exactly one record/admission; the retained 288 KB body is byte-exact.
+    expect(spoolStats(config.spoolDir).count).toBe(1);
+    expect(spoolStats(config.spoolDir).temps).toBe(0);
+    const record = spool.list()[0] as unknown as {
+      body: { title: string; description: string };
+      digest: string;
+    };
+    expect(record.body.title).toBe(title);
+    expect(record.body.description).toBe(description);
+    expect(record.digest).toBe(envelope.digest);
+    client.destroy();
+    harness.close();
+  });
+
+  it("retains an ASCII frame split across coordinated reads (positive companion)", async () => {
+    const dir = makeTmpDir();
+    const config = baseConfig(dir, { mode: "retain-only" });
+    const spool = createSpool({ dir: config.spoolDir, maxEnvelopes: 10, maxBytes: 1024 * 1024 });
+    const harness = await startObservedWriter(config, spool);
+
+    const title = "plain ASCII intake frame";
+    const envelope = sealTestEnvelope({ clientRequestId: "ascii-split-1", title });
+    const frame = frameBytes(CREDENTIAL, envelope);
+    const splitAt = frame.length >> 1;
+
+    const { json } = await sendSplitFrame(harness, frame, splitAt);
+    expect(harness.observedChunks[0]).toBe(splitAt);
+    expect(harness.observedChunks.length).toBeGreaterThanOrEqual(2);
+
+    const response = json() as { ok: boolean; receipt?: { digest: string } };
+    expect(response.ok).toBe(true);
+    expect(response.receipt?.digest).toBe(envelope.digest);
+    expect(spoolStats(config.spoolDir).count).toBe(1);
+    const record = spool.list()[0] as unknown as { body: { title: string } };
+    expect(record.body.title).toBe(title);
+    harness.close();
+  });
+
+  it("requestWriter decodes a fragmented UTF8 writer reply byte-exactly (reply mirror)", async () => {
+    // Stub writer on a real UDS whose REPLY carries a multibyte string split
+    // mid-codepoint across two writes, with a real event-loop gap between
+    // them so the client reads two separate data events (temporal
+    // coordination — the same latent defect as the request mirror).
+    const dir = makeTmpDir();
+    const socketPath = join(dir, "reply-mirror.sock");
+    // allowHalfOpen: the client half-closes after its request and the reply is
+    // produced asynchronously — identical to the real writer server's framing.
+    const server = createNetServer({ allowHalfOpen: true }, (socket) => {
+      socket.setTimeout(30_000);
+      socket.on("error", () => socket.destroy());
+      socket.once("data", () => {
+        const intended = {
+          ok: true,
+          receipt: {
+            id: "reply-mirror-1",
+            message: "受領 — сохранено漢",
+            digest: "a".repeat(64),
+          },
+        };
+        const replyFrame = Buffer.from(`${JSON.stringify(intended)}\n`, "utf8");
+        const markerBytes = Buffer.from("漢", "utf8");
+        const splitAt = replyFrame.indexOf(markerBytes) + 1;
+        expect(splitAt).toBeGreaterThan(1);
+        socket.write(replyFrame.subarray(0, splitAt));
+        setTimeout(() => {
+          socket.write(replyFrame.subarray(splitAt));
+          socket.end();
+        }, 25);
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+
+    const reply = await requestWriter({ socketPath, credential: CREDENTIAL, envelope: {} });
+    expect(reply).toEqual({
+      ok: true,
+      receipt: {
+        id: "reply-mirror-1",
+        message: "受領 — сохранено漢",
+        digest: "a".repeat(64),
+      },
+    });
+    server.close();
+  });
+
+  it("surfaces restartScan.boundRefused in the startup log condition and payload (R5 — runbook claim)", async () => {
+    const dir = makeTmpDir();
+    const config = baseConfig(dir, { mode: "retain-only" });
+    const loose = createSpool({ dir: config.spoolDir, maxEnvelopes: 10, maxBytes: 1024 * 1024 });
+    const record = loose.writerReceive(sealTestEnvelope(), { mode: "retain-only" });
+    loose.updateState(record.id, { state: "admitted" });
+    const path = loose.envelopePath(record.id);
+    const bytesBefore = realFs.readFileSync(path);
+
+    // A tight byte bound makes the restart re-pend receipt exceed capacity:
+    // restartScan reports boundRefused and — per the runbook — startup must
+    // REPORT it. With ONLY boundRefused set (no temps/rePended/corrupted),
+    // the pre-R5 condition logged nothing at all.
+    const totalBytes = spoolStats(config.spoolDir).bytes;
+    const tight = createSpool({ dir: config.spoolDir, maxEnvelopes: 10, maxBytes: totalBytes });
+    expect(tight.restartScan().boundRefused).toEqual([record.id]);
+
+    const logs: Array<{ payload: Record<string, unknown>; msg: string }> = [];
+    const deliverer = createDeliverer({
+      config: { ...config, spoolDir: config.spoolDir },
+      spool: tight,
+      wake: null,
+      log: (payload: Record<string, unknown>, msg: string) => logs.push({ payload, msg }),
+    });
+    deliverer.start(); // the REAL startup path, not a direct restartScan() call
+    await deliverer.stop();
+
+    const scanLog = logs.find(
+      (entry) => entry.msg === "restart scan reconciled spool state (§9.1)",
+    );
+    expect(scanLog).toBeDefined();
+    expect(scanLog?.payload.boundRefused).toEqual([record.id]);
+    // Nothing else needed surfacing — boundRefused alone fired the log, which
+    // is exactly the observability the runbook claims.
+    expect(scanLog?.payload.discardedTemps).toEqual([]);
+    expect(scanLog?.payload.rePended).toEqual([]);
+    expect(scanLog?.payload.corrupted).toEqual([]);
+    // The refused re-pend left the uncertain on-disk state untouched, and no
+    // delivery arose (retain-only: zero network calls by contract).
+    expect(realFs.readFileSync(path).equals(bytesBefore)).toBe(true);
+    expect(tight.get(record.id).state).toBe("admitted");
+  });
 });

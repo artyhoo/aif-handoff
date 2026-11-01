@@ -161,7 +161,7 @@ function camelToSnake(name) {
 export function loadPrincipalMap(path, { readFileSync: read = readFileSync } = {}) {
   let raw;
   try {
-    raw = readFileSync(path, "utf8");
+    raw = read(path, "utf8");
   } catch (error) {
     throw new ConfigError(`principal map unreadable at ${path}: ${error.message}`);
   }

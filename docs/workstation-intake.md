@@ -61,7 +61,15 @@ The shim resolves the principal from the SSH boundary **before** reading the
 payload and bounds stdin incrementally against the principal's
 `maxRequestBytes`: an oversized or never-ending stream is closed at the bound
 and refused without waiting for EOF, before any parse or writer contact — the
-bridge never buffers an unbounded input.
+bridge never buffers an unbounded input. The writer additionally enforces a
+separate TRANSPORT frame cap (4 MiB) on one writer IPC frame: it is not
+derived from the operator map, so a principal whose `maxRequestBytes` is set
+near or above ~4 MiB minus envelope framing would pass the shim bound yet be
+refused at the writer with `request_too_large` — keep per-principal bounds
+comfortably below the frame cap (the example map's 512 KiB does). Incoming
+frames are byte-preserving: chunks are accumulated as raw bytes and decoded
+once per complete frame, so multi-byte UTF-8 content (Cyrillic, CJK) survives
+any socket read boundaries.
 
 Receipts are distinct and truthful:
 

@@ -81,6 +81,17 @@ in this design; this task grants no trust and enrolls no credential.
   from a refused frame (R4). The submit shim bounds stdin incrementally
   against the same per-principal `maxRequestBytes` and refuses an oversized
   stream before any parse or writer contact.
+- **The two bounds are independent — state them truthfully together:** the
+  4 MiB frame cap is a TRANSPORT bound on one writer IPC frame, not a
+  per-principal guarantee, and `maxRequestBytes` is a POLICY bound checked at
+  the shim seal and at writer revalidation. A frame must fit under BOTH.
+  Unlike `maxRequestBytes`, the frame cap is not derived from or
+  cross-validated against the operator map: a principal configured with a
+  `maxRequestBytes` near or above ~4 MiB minus envelope framing would pass
+  the shim bound yet have every submit refused at the writer with
+  `request_too_large` — for such a principal the transport cap is the
+  effective ceiling. Operators must keep each principal's `maxRequestBytes`
+  comfortably below the frame cap (the example map's 512 KiB does).
 - Missing/invalid credential or unreachable socket ⇒ truthful refusal
   (`writer_unauthenticated` / `retention_unavailable`), zero quota, zero write,
   zero wake.

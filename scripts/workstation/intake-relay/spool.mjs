@@ -105,10 +105,6 @@ export function createSpool({
     return join(dir, `${id}.json`);
   }
 
-  function readEnvelopeFile(id) {
-    return JSON.parse(readFileSync(envelopePath(id), "utf8"));
-  }
-
   function writeEnvelope(record) {
     record.updatedAt = now();
     enforceRecordCapacity(record);

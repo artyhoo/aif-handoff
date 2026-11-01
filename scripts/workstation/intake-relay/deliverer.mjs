@@ -322,7 +322,16 @@ export function createWriterServer({
   // the reply is produced asynchronously — the socket must stay writable after
   // the client's FIN or the reply would be silently dropped by autoDestroy.
   return createServer({ allowHalfOpen: true }, (socket) => {
-    let buffered = "";
+    // Byte-preserving frame accumulation (R5 — finding 423c1656968f): received
+    // chunks are held as raw BYTES until one complete frame is available, and
+    // UTF-8 is decoded exactly once at the framed end. Per-chunk string
+    // decoding irreversibly replaced bytes split across read boundaries with
+    // U+FFFD, so any multi-byte frame spanning several reads (Cyrillic/CJK
+    // content) arrived corrupted and was refused `digest_mismatch`. The frame
+    // cap is counted from RAW chunk bytes BEFORE accumulation, so the bound
+    // holds whether or not the frame ever completes.
+    let frameChunks = [];
+    let frameBytes = 0;
     let answered = false;
     const answer = (payload) => {
       if (answered) return;
@@ -332,13 +341,13 @@ export function createWriterServer({
     socket.setTimeout(30_000, () => socket.destroy());
     socket.on("data", (chunk) => {
       if (answered) return; // refused frame — never accumulate another byte
-      buffered += chunk.toString("utf8");
-      if (Buffer.byteLength(buffered, "utf8") > MAX_FRAME_BYTES) {
+      if (frameBytes + chunk.length > MAX_FRAME_BYTES) {
         log(
-          { code: "request_too_large", bytes: Buffer.byteLength(buffered, "utf8") },
+          { code: "request_too_large", bytes: frameBytes + chunk.length },
           "writer frame cap exceeded — refusing and closing the peer",
         );
-        buffered = ""; // release the oversized frame from memory immediately
+        frameChunks = []; // release the oversized frame from memory immediately
+        frameBytes = 0;
         answered = true;
         try {
           socket.end(`${JSON.stringify({ ok: false, code: "request_too_large" })}\n`, () => {
@@ -353,12 +362,16 @@ export function createWriterServer({
         }
         return;
       }
+      frameChunks.push(chunk);
+      frameBytes += chunk.length;
     });
     socket.on("end", () => {
       if (answered) return;
       let request = null;
       try {
-        request = JSON.parse(buffered);
+        // One decode over the complete received byte sequence — a split
+        // multi-byte sequence is reassembled before UTF-8 decoding.
+        request = JSON.parse(Buffer.concat(frameChunks).toString("utf8"));
       } catch {
         answer({ ok: false, code: "invalid_request" });
         return;
@@ -487,7 +500,6 @@ export function createDeliverer({
   fetchImpl = fetch,
   log = () => {},
   now = () => new Date(),
-  hooks = {},
 }) {
   if (config.mode === "deliver") {
     if (!config.sessionToken) {
@@ -986,12 +998,23 @@ export function createDeliverer({
     // a crash between commit and response recording could leave an `admitted`
     // envelope dormant forever.
     const scan = spool.restartScan();
-    if (scan.discardedTemps.length > 0 || scan.rePended.length > 0 || scan.corrupted.length > 0) {
+    // `boundRefused` is surfaced like every other reconciliation outcome (R5):
+    // a crash-reconciliation re-pend refused by the storage bounds is an
+    // operator-visible event (docs/workstation-intake.md runbook), not a
+    // silent pass — the on-disk state is preserved and the handover watch or
+    // an operator resume still owns the record.
+    if (
+      scan.discardedTemps.length > 0 ||
+      scan.rePended.length > 0 ||
+      scan.corrupted.length > 0 ||
+      scan.boundRefused.length > 0
+    ) {
       log(
         {
           discardedTemps: scan.discardedTemps,
           rePended: scan.rePended,
           corrupted: scan.corrupted,
+          boundRefused: scan.boundRefused,
         },
         "restart scan reconciled spool state (§9.1)",
       );

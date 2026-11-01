@@ -15,13 +15,7 @@
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-import {
-  clearFence,
-  OPERATOR_AUTO_HOLD_STATES,
-  OPERATOR_HOLD_STATES,
-  readFence,
-  writeFence,
-} from "./deliverer.mjs";
+import { clearFence, OPERATOR_HOLD_STATES, readFence, writeFence } from "./deliverer.mjs";
 import { requestWriter } from "./submit.mjs";
 import { createSpool } from "./spool.mjs";
 import { loadPrincipalMap } from "./config.mjs";

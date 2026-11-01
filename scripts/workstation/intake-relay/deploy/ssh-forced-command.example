@@ -27,11 +27,16 @@
 # 2. authorized_keys entry for the submit principal (bridge relay user)
 # ---------------------------------------------------------------------------
 #
-#   restrict,command="<install-dir>/scripts/workstation/intake-relay/submit.mjs" ssh-ed25519 <COMMENT>
+# The forced command MUST invoke node explicitly — the .mjs shim carries no
+# shebang, so a bare path would fail to exec (ENOEXEC) and every submission
+# would fail closed with no shim output at all:
 #
-# `restrict` disables pty/agent/X11/port-forwarding; `command=` forces the
-# shim regardless of the client's requested command. The client submits by
-# piping the JSON payload on stdin:
+#   restrict,command="node <install-dir>/scripts/workstation/intake-relay/submit.mjs" ssh-ed25519 <COMMENT>
+#
+# (An equivalent wrapper script with a shebang that execs node on the same
+# path is also valid.) `restrict` disables pty/agent/X11/port-forwarding;
+# `command=` forces the shim regardless of the client's requested command.
+# The client submits by piping the JSON payload on stdin:
 #
 #   ssh -T <relay-user>@<bridge> < payload.json
 #

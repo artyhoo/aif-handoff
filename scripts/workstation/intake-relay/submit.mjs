@@ -206,7 +206,11 @@ export function requestWriter({
 }) {
   return new Promise((resolve, reject) => {
     const socket = connectImpl(socketPath);
-    let buffered = "";
+    // Byte-preserving reply accumulation (R5 — finding 423c1656968f mirror):
+    // reply chunks are held as raw BYTES and decoded exactly once at the
+    // framed end — per-chunk string decoding corrupted any multi-byte reply
+    // whose reads split a UTF-8 sequence into U+FFFD.
+    let replyChunks = [];
     let settled = false;
     const fail = (error) => {
       if (settled) return;
@@ -217,13 +221,13 @@ export function requestWriter({
     socket.setTimeout(10_000, () => fail(new Error("writer timeout")));
     socket.once("error", fail);
     socket.on("data", (chunk) => {
-      buffered += chunk.toString("utf8");
+      replyChunks.push(chunk);
     });
     socket.on("end", () => {
       if (settled) return;
       settled = true;
       try {
-        resolve(JSON.parse(buffered));
+        resolve(JSON.parse(Buffer.concat(replyChunks).toString("utf8")));
       } catch {
         reject(new Error("writer reply unparseable"));
       }
