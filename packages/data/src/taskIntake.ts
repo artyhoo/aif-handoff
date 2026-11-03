@@ -293,7 +293,48 @@ export interface TaskIntakeBindingInput {
 export type CreateTaskWithIntakeBindingResult =
   | { outcome: "created"; task: TaskRow }
   | { outcome: "replayed"; task: TaskRow | null; binding: TaskIntakeBindingRow }
-  | { outcome: "conflict"; binding: TaskIntakeBindingRow };
+  | { outcome: "conflict"; binding: TaskIntakeBindingRow }
+  | {
+      outcome: "rejected_first_admission";
+      rejection: IntakeFirstAdmissionRejection;
+    };
+
+/**
+ * Structured first-admission rejection returned by a `prepareFirstAdmission`
+ * hook (R7). The admission seam never inspects `status` or `body` — it returns
+ * the rejection verbatim to the caller alongside the zero-write guarantee
+ * (`rejected_first_admission`). `status` is the HTTP status the caller must
+ * answer with (never 2xx); `body` is the structured JSON payload (`error`,
+ * `code`, optional `fieldErrors`).
+ */
+export interface IntakeFirstAdmissionRejection {
+  status: number;
+  body: Record<string, unknown>;
+}
+
+export interface CreateTaskWithIntakeBindingOptions {
+  /**
+   * Mutable CREATION-ONLY eligibility and creation-input resolution (R7),
+   * invoked lazily at the binding-miss point INSIDE the admission transaction —
+   * only after the durable binding for this request ID has already failed to
+   * resolve. Runtime-profile validity, project existence, and project-config
+   * default resolution belong here: an originally valid request replayed after
+   * its profile was disabled/deleted/re-scoped or its project was deleted must
+   * resolve its existing binding (replay/conflict/tombstone), never be vetoed
+   * by mutable creation-only state — exactly as the R3 ordering deferred
+   * assignee liveness into `prepareTaskCreation`. Return
+   * `{ ok: false, rejection }` to refuse the FIRST admission with zero writes;
+   * return `{ ok: true, input }` with the fully resolved creation input to
+   * insert (that input replaces the raw `input` argument for this admission).
+   * Never consulted for a binding hit, and never invoked a second time for the
+   * same admission.
+   */
+  prepareFirstAdmission?: (
+    rawInput: CreateTaskInsertInput,
+  ) =>
+    | { ok: true; input: CreateTaskInsertInput }
+    | { ok: false; rejection: IntakeFirstAdmissionRejection };
+}
 
 /**
  * Extended better-sqlite3 result codes of the uniqueness-constraint family —
@@ -324,23 +365,28 @@ export function isSqliteUniqueConstraintError(error: unknown): boolean {
  * that either (a) resolves an existing binding — digest match → the original task
  * live (any status, terminal included: replay never restarts it) or a tombstone
  * when the task row is gone, digest mismatch → conflict with zero writes — or
- * (b) inserts the task and the binding together. Binding resolution precedes the
- * mutable creation-only ownership eligibility check (R3): an assignee who became
- * inactive AFTER admission can never veto the replay/conflict/tombstone
- * resolution of an already-durable request; the full ownership validation still
- * applies to every genuine first admission. A uniqueness-constraint failure on
- * the binding insert (`SQLITE_CONSTRAINT_PRIMARYKEY` — the extended result code
- * the installed better-sqlite3 actually throws for the dedup primary key, never
- * the bare base code; `SQLITE_CONSTRAINT_UNIQUE` for a unique index — possible
- * when a second connection/process committed the same key between this
- * transaction's read and its write) rolls the transaction back and re-reads, so
- * exactly one canonical task survives a cross-connection race. Returns
- * `undefined` only when ownership validation rejects the insert — the caller
- * answers 409 invalid_ownership and nothing was written.
+ * (b) inserts the task and the binding together. Binding resolution precedes ALL
+ * mutable creation-only eligibility and configuration IO (R3 + R7): an assignee
+ * who became inactive AFTER admission can never veto the replay/conflict/tombstone
+ * resolution of an already-durable request, and neither can a runtime profile
+ * disabled/deleted/re-scoped or a deleted project — those are resolved lazily by
+ * the caller's `prepareFirstAdmission` hook at the binding-miss point inside this
+ * same transaction; the full eligibility still applies to every genuine first
+ * admission (`rejected_first_admission` / `undefined`, zero writes). A
+ * uniqueness-constraint failure on the binding insert
+ * (`SQLITE_CONSTRAINT_PRIMARYKEY` — the extended result code the installed
+ * better-sqlite3 actually throws for the dedup primary key, never the bare base
+ * code; `SQLITE_CONSTRAINT_UNIQUE` for a unique index — possible when a second
+ * connection/process committed the same key between this transaction's read and
+ * its write) rolls the transaction back and re-reads, so exactly one canonical
+ * task survives a cross-connection race. Returns `undefined` only when ownership
+ * validation rejects the insert — the caller answers 409 invalid_ownership and
+ * nothing was written.
  */
 export function createTaskWithIntakeBinding(
   input: CreateTaskInsertInput,
   binding: TaskIntakeBindingInput,
+  options?: CreateTaskWithIntakeBindingOptions,
 ): CreateTaskWithIntakeBindingResult | undefined {
   const db = getDb();
   const auditMetadata = {
@@ -355,6 +401,7 @@ export function createTaskWithIntakeBinding(
   type TxOutcome =
     | { kind: "created"; prepared: PreparedTaskCreation }
     | { kind: "ownership_rejected" }
+    | { kind: "first_admission_rejected"; rejection: IntakeFirstAdmissionRejection }
     | { kind: "conflict"; binding: TaskIntakeBindingRow }
     | { kind: "replayed"; task: TaskRow | null; binding: TaskIntakeBindingRow };
 
@@ -388,13 +435,25 @@ export function createTaskWithIntakeBinding(
           );
           return { kind: "replayed", task: task ?? null, binding: existing };
         }
-        // Binding miss — a genuine first admission. Only here does the mutable
-        // creation-only ownership eligibility apply (R3 ordering): the replay/
-        // conflict/tombstone resolution above already returned for every durable
-        // request, so an assignee deactivated after admission is never consulted.
-        const prepared = prepareTaskCreation(input);
-        if (!prepared) return { kind: "ownership_rejected" };
-        insertTaskWithOwnershipRows(tx, input, prepared, auditMetadata);
+        // Binding miss — a genuine first admission. Only here do the mutable
+        // creation-only checks apply (R3 + R7 ordering): the replay/conflict/
+        // tombstone resolution above already returned for every durable
+        // request, so an assignee deactivated after admission, a runtime
+        // profile disabled/deleted/re-scoped after admission, or a project
+        // deleted after admission is never consulted for an existing binding.
+        // The caller's hook resolves the creation-only eligibility (profile
+        // validity, project existence) and the creation input (project-config
+        // defaults); a structured rejection ends the transaction here with
+        // zero writes.
+        let admissionInput = input;
+        if (options?.prepareFirstAdmission) {
+          const prepared = options.prepareFirstAdmission(input);
+          if (!prepared.ok) return { kind: "first_admission_rejected", rejection: prepared.rejection };
+          admissionInput = prepared.input;
+        }
+        const created = prepareTaskCreation(admissionInput);
+        if (!created) return { kind: "ownership_rejected" };
+        insertTaskWithOwnershipRows(tx, admissionInput, created, auditMetadata);
         tx.insert(taskIntakeBindings)
           .values({
             dedupKey: binding.dedupKey,
@@ -403,11 +462,11 @@ export function createTaskWithIntakeBinding(
             principalId: binding.principalId,
             requestId: binding.requestId,
             payloadDigest: binding.payloadDigest,
-            taskId: prepared.id,
+            taskId: created.id,
             source: binding.source,
           })
           .run();
-        return { kind: "created", prepared };
+        return { kind: "created", prepared: created };
       },
       { behavior: "immediate" },
     );
@@ -444,6 +503,8 @@ export function createTaskWithIntakeBinding(
       return { outcome: "replayed", task: outcome.task, binding: outcome.binding };
     case "ownership_rejected":
       return undefined;
+    case "first_admission_rejected":
+      return { outcome: "rejected_first_admission", rejection: outcome.rejection };
     case "created": {
       const task = readTaskRowById(outcome.prepared.id);
       if (!task) {

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -15,6 +15,7 @@ import {
   tasks,
   type NewTaskRow,
 } from "@aif/shared";
+import type { CreateTaskInsertInput } from "../index.js";
 
 const { createTaskWithIntakeBinding, getAiWorkloadState, createTask, updateTask } =
   await import("../index.js");
@@ -315,6 +316,152 @@ describe("createTaskWithIntakeBinding (keyed admission, §7.2)", () => {
       expect(rejected).toBeUndefined();
       expect(countTasks(db)).toBe(0);
       expect(countBindings(db)).toBe(0);
+    });
+  });
+
+  // R7: the caller-supplied `prepareFirstAdmission` hook carries the MUTABLE
+  // CREATION-ONLY eligibility (runtime-profile validity, project existence) and
+  // the creation-input resolution (project-config defaults). The admission seam
+  // must invoke it ONLY at the binding-miss point — a durable request whose
+  // binding resolves (replay/conflict/tombstone) is never vetoed by it, and a
+  // refusal is a structured zero-write rejection of the FIRST admission alone.
+  describe("prepareFirstAdmission seam (R7)", () => {
+    it("invokes the hook only on a genuine first admission, never on replay/conflict/tombstone resolution", () => {
+      const calls: string[] = [];
+      const hook = vi.fn((rawInput: CreateTaskInsertInput) => {
+        calls.push(rawInput.projectId ?? "");
+        return { ok: true as const, input: rawInput };
+      });
+      const options = { prepareFirstAdmission: hook };
+
+      const first = createTaskWithIntakeBinding(
+        creationInput(),
+        bindingInput(DIGEST_A),
+        options,
+      );
+      expect(first?.outcome).toBe("created");
+      expect(hook).toHaveBeenCalledTimes(1);
+
+      // Identical replay — binding hit, hook never consulted.
+      const replay = createTaskWithIntakeBinding(
+        creationInput(),
+        bindingInput(DIGEST_A),
+        options,
+      );
+      expect(replay?.outcome).toBe("replayed");
+      expect(hook).toHaveBeenCalledTimes(1);
+
+      // Conflicting content for the known request ID — binding hit again.
+      const conflict = createTaskWithIntakeBinding(
+        creationInput({ title: "Different content" }),
+        bindingInput(DIGEST_B),
+        options,
+      );
+      expect(conflict?.outcome).toBe("conflict");
+      expect(hook).toHaveBeenCalledTimes(1);
+
+      // Tombstone resolution — binding hit, hook still never consulted.
+      const createdTaskId = first?.outcome === "created" ? first.task.id : null;
+      db.delete(tasks).where(eq(tasks.id, createdTaskId!)).run();
+      const tombstone = createTaskWithIntakeBinding(
+        creationInput(),
+        bindingInput(DIGEST_A),
+        options,
+      );
+      expect(tombstone?.outcome).toBe("replayed");
+      if (tombstone?.outcome !== "replayed") throw new Error("expected replayed");
+      expect(tombstone.task).toBeNull();
+      expect(hook).toHaveBeenCalledTimes(1);
+    });
+
+    it("returns the structured rejection verbatim with zero writes when the hook refuses the first admission", () => {
+      const rejection = {
+        status: 400,
+        body: { error: "Invalid runtime profile selection", fieldErrors: { runtimeProfileId: ["nope"] } },
+      };
+      const refused = createTaskWithIntakeBinding(creationInput(), bindingInput(DIGEST_A), {
+        prepareFirstAdmission: () => ({ ok: false as const, rejection }),
+      });
+      expect(refused?.outcome).toBe("rejected_first_admission");
+      if (refused?.outcome !== "rejected_first_admission") throw new Error("expected rejection");
+      expect(refused.rejection).toBe(rejection);
+      // Zero writes: no task, no binding, no rollback residue.
+      expect(countTasks(db)).toBe(0);
+      expect(countBindings(db)).toBe(0);
+    });
+
+    it("inserts the hook-resolved creation input on first admission", () => {
+      const admitted = createTaskWithIntakeBinding(creationInput(), bindingInput(DIGEST_A), {
+        prepareFirstAdmission: (rawInput) => ({
+          ok: true as const,
+          input: { ...rawInput, title: "Resolved at the binding-miss seam", plannerMode: "full" },
+        }),
+      });
+      expect(admitted?.outcome).toBe("created");
+      if (admitted?.outcome !== "created") throw new Error("expected created");
+      expect(admitted.task.title).toBe("Resolved at the binding-miss seam");
+      expect(admitted.task.plannerMode).toBe("full");
+      expect(countTasks(db)).toBe(1);
+      expect(countBindings(db)).toBe(1);
+    });
+
+    it("resolves the replay when the hook would now refuse the degraded first admission", () => {
+      // Simulates the R7 causal state: the creation-only configuration was
+      // available at admission and is gone afterwards. The durable request
+      // still resolves its binding because the hook only ever runs on a miss.
+      let configAvailable = true;
+      const first = createTaskWithIntakeBinding(creationInput(), bindingInput(DIGEST_A), {
+        prepareFirstAdmission: () =>
+          configAvailable
+            ? { ok: true as const, input: creationInput() }
+            : {
+                ok: false as const,
+                rejection: {
+                  status: 404,
+                  body: { error: "Project not found", code: "project_not_found" },
+                },
+              },
+      });
+      expect(first?.outcome).toBe("created");
+
+      configAvailable = false;
+      const replay = createTaskWithIntakeBinding(creationInput(), bindingInput(DIGEST_A), {
+        prepareFirstAdmission: () =>
+          configAvailable
+            ? { ok: true as const, input: creationInput() }
+            : {
+                ok: false as const,
+                rejection: {
+                  status: 404,
+                  body: { error: "Project not found", code: "project_not_found" },
+                },
+              },
+      });
+      expect(replay?.outcome).toBe("replayed");
+      if (replay?.outcome !== "replayed") throw new Error("expected replayed");
+      if (first?.outcome !== "created") throw new Error("expected created first");
+      expect(replay.task?.id).toBe(first.task.id);
+      expect(countTasks(db)).toBe(1);
+      expect(countBindings(db)).toBe(1);
+
+      // A NEW request ID with the same degraded configuration is still
+      // refused with zero writes — first-admission eligibility is retained.
+      const rejected = createTaskWithIntakeBinding(
+        creationInput(),
+        bindingInput(DIGEST_A, "participant|relay-svc|proj-intake|relay-svc:degraded-new-1"),
+        {
+          prepareFirstAdmission: () => ({
+            ok: false as const,
+            rejection: {
+              status: 404,
+              body: { error: "Project not found", code: "project_not_found" },
+            },
+          }),
+        },
+      );
+      expect(rejected?.outcome).toBe("rejected_first_admission");
+      expect(countTasks(db)).toBe(1);
+      expect(countBindings(db)).toBe(1);
     });
   });
 

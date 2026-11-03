@@ -12,6 +12,7 @@ import {
   getEnv,
   buildIntakeDedupKey,
   computeIntakePayloadDigest,
+  type PlannerMode,
   type TaskActionContext,
 } from "@aif/shared";
 import {
@@ -64,6 +65,8 @@ import {
   findGitHubIssueByTaskId,
   createTaskWithIntakeBinding,
   appendAuditEvent,
+  type CreateTaskInsertInput,
+  type IntakeFirstAdmissionRejection,
   type TaskRow,
   type TaskOwnershipFilters,
 } from "@aif/data";
@@ -626,24 +629,23 @@ tasksRouter.post("/", postTaskBodyValidator(), async (c) => {
   // `undefined` → 409 invalid_ownership below, zero writes). The member rule
   // above stays pre-lookup: it is authorization, keyed on the verified role.
 
-  // Step 4 — runtime-profile validation and project existence (400/404, no writes).
-  const runtimeValidation = validateProjectScopedRuntimeProfileSelections({
-    projectId: parsedBody.projectId,
-    selections: { runtimeProfileId: parsedBody.runtimeProfileId },
-  });
-  if (runtimeValidation) {
-    log.warn(
-      { projectId: parsedBody.projectId, fieldErrors: runtimeValidation.fieldErrors },
-      "Rejected invalid keyed task runtime selection",
-    );
-    return c.json(runtimeValidation, 400);
-  }
-  const project = findProjectById(parsedBody.projectId);
-  if (!project) {
-    return c.json({ error: "Project not found", code: "project_not_found" }, 404);
-  }
+  // NOTE (R7, extending R3): runtime-profile validity, project existence, and
+  // the project-config default resolution below are MUTABLE CREATION-ONLY
+  // eligibility and configuration IO. None of them runs before the binding
+  // lookup: checking any of them pre-lookup lets an admin action AFTER
+  // admission (profile disable/delete/re-scope via PUT/DELETE
+  // /runtime-profiles/:id, or DELETE /projects/:id) veto the identical replay
+  // of an already-durable request with 400/404 instead of resolving the
+  // original task (200) or its retained tombstone (410) — a retained envelope
+  // the relay then parks as hold_auth_config, permanently undeliverable.
+  // `prepareFirstAdmission` therefore defers all of it to the binding-miss
+  // point INSIDE `createTaskWithIntakeBinding`'s atomic IMMEDIATE admission
+  // transaction — the existing seam, never a racy second lookup. Assignee
+  // liveness stays deferred the same way inside `prepareTaskCreation` (R3
+  // NOTE above). The member rule above stays pre-lookup: it is authorization,
+  // keyed on the verified role, not creation-only eligibility.
 
-  // Step 5 — FREEZE the client-content digest BEFORE any route default is
+  // Step 4 — FREEZE the client-content digest BEFORE any route default is
   // applied (M2): project-config `planPath`, `parallelEnabled → plannerMode`,
   // and mode-driven flags must never enter the digest of identical bytes.
   const digest = computeIntakePayloadDigest(parsedBody);
@@ -654,55 +656,92 @@ tasksRouter.post("/", postTaskBodyValidator(), async (c) => {
     requestId: intake.requestId,
   });
 
-  // Creation-time route default resolution (post-digest; creation only — the
-  // transaction's binding lookup above never observes these).
-  const defaultPlanPath = getProjectConfig(project.rootPath).paths.plan;
-  if (project.parallelEnabled) {
-    parsedBody.plannerMode = "full";
-  }
-  const modeDefaults = defaultsForMode(parsedBody.plannerMode);
-  const resolvedSkipReview = parsedBody.skipReview ?? modeDefaults.skipReview;
-  const resolvedPlanDocs = parsedBody.planDocs ?? modeDefaults.planDocs;
-  const resolvedPlanTests = parsedBody.planTests ?? modeDefaults.planTests;
-  const resolvedRunPlanImprove =
-    (parsedBody.useSubagents ?? getEnv().AGENT_USE_SUBAGENTS) === true
-      ? false
-      : (parsedBody.runPlanImprove ?? false);
-  const resolvedRunPostVerify =
-    (parsedBody.useSubagents ?? getEnv().AGENT_USE_SUBAGENTS) === true
-      ? false
-      : (parsedBody.runPostVerify ?? false);
+  // The raw client selections — no route defaults. When the binding misses,
+  // `prepareFirstAdmission` resolves them into the creation input; the raw
+  // form is only used verbatim when no hook is configured.
+  const rawSelections: CreateTaskInsertInput = {
+    projectId: parsedBody.projectId,
+    title: parsedBody.title,
+    description: parsedBody.description,
+    attachments: [],
+    priority: parsedBody.priority,
+    autoMode: parsedBody.autoMode,
+    executionOwner: parsedBody.executionOwner,
+    assigneeIds: parsedBody.assigneeIds,
+    actor,
+    isFix: parsedBody.isFix,
+    plannerMode: parsedBody.plannerMode,
+    planPath: parsedBody.planPath,
+    planDocs: parsedBody.planDocs,
+    planTests: parsedBody.planTests,
+    skipReview: parsedBody.skipReview,
+    useSubagents: parsedBody.useSubagents,
+    runPlanImprove: parsedBody.runPlanImprove,
+    runPostVerify: parsedBody.runPostVerify,
+    autoQa: parsedBody.autoQa,
+    maxReviewIterations: parsedBody.maxReviewIterations,
+    paused: parsedBody.paused,
+    runtimeProfileId: parsedBody.runtimeProfileId,
+    modelOverride: parsedBody.modelOverride,
+    runtimeOptions: parsedBody.runtimeOptions,
+    roadmapAlias: parsedBody.roadmapAlias,
+    tags: parsedBody.tags,
+    scheduledAt: parsedBody.scheduledAt ?? null,
+  };
+
+  const prepareFirstAdmission = (
+    rawInput: CreateTaskInsertInput,
+  ):
+    | { ok: true; input: CreateTaskInsertInput }
+    | { ok: false; rejection: IntakeFirstAdmissionRejection } => {
+    const runtimeValidation = validateProjectScopedRuntimeProfileSelections({
+      projectId: rawInput.projectId,
+      selections: { runtimeProfileId: rawInput.runtimeProfileId },
+    });
+    if (runtimeValidation) {
+      log.warn(
+        { projectId: rawInput.projectId, fieldErrors: runtimeValidation.fieldErrors },
+        "Rejected invalid keyed task runtime selection",
+      );
+      return { ok: false, rejection: { status: 400, body: runtimeValidation } };
+    }
+    const project = findProjectById(rawInput.projectId);
+    if (!project) {
+      return {
+        ok: false,
+        rejection: {
+          status: 404,
+          body: { error: "Project not found", code: "project_not_found" },
+        },
+      };
+    }
+
+    // Creation-time route default resolution (post-digest; creation only).
+    // `parsedBody.plannerMode` is the schema-defaulted enum value — the same
+    // runtime value as `rawInput.plannerMode`, just not widened to `string`.
+    const defaultPlanPath = getProjectConfig(project.rootPath).paths.plan;
+    const plannerMode: PlannerMode = project.parallelEnabled ? "full" : parsedBody.plannerMode;
+    const modeDefaults = defaultsForMode(plannerMode);
+    const useSubagents = rawInput.useSubagents ?? getEnv().AGENT_USE_SUBAGENTS;
+    return {
+      ok: true,
+      input: {
+        ...rawInput,
+        plannerMode,
+        planPath: rawInput.planPath ?? defaultPlanPath,
+        planDocs: rawInput.planDocs ?? modeDefaults.planDocs,
+        planTests: rawInput.planTests ?? modeDefaults.planTests,
+        skipReview: rawInput.skipReview ?? modeDefaults.skipReview,
+        useSubagents,
+        runPlanImprove: useSubagents === true ? false : (rawInput.runPlanImprove ?? false),
+        runPostVerify: useSubagents === true ? false : (rawInput.runPostVerify ?? false),
+        maxReviewIterations: rawInput.maxReviewIterations ?? getEnv().AGENT_MAX_REVIEW_ITERATIONS,
+      },
+    };
+  };
 
   const result = createTaskWithIntakeBinding(
-    {
-      projectId: parsedBody.projectId,
-      title: parsedBody.title,
-      description: parsedBody.description,
-      attachments: [],
-      priority: parsedBody.priority,
-      autoMode: parsedBody.autoMode,
-      executionOwner: parsedBody.executionOwner,
-      assigneeIds: parsedBody.assigneeIds,
-      actor,
-      isFix: parsedBody.isFix,
-      plannerMode: parsedBody.plannerMode,
-      planPath: parsedBody.planPath ?? defaultPlanPath,
-      planDocs: resolvedPlanDocs,
-      planTests: resolvedPlanTests,
-      skipReview: resolvedSkipReview,
-      useSubagents: parsedBody.useSubagents ?? getEnv().AGENT_USE_SUBAGENTS,
-      runPlanImprove: resolvedRunPlanImprove,
-      runPostVerify: resolvedRunPostVerify,
-      autoQa: parsedBody.autoQa,
-      maxReviewIterations: parsedBody.maxReviewIterations ?? getEnv().AGENT_MAX_REVIEW_ITERATIONS,
-      paused: parsedBody.paused,
-      runtimeProfileId: parsedBody.runtimeProfileId,
-      modelOverride: parsedBody.modelOverride,
-      runtimeOptions: parsedBody.runtimeOptions,
-      roadmapAlias: parsedBody.roadmapAlias,
-      tags: parsedBody.tags,
-      scheduledAt: parsedBody.scheduledAt ?? null,
-    },
+    rawSelections,
     {
       dedupKey,
       projectId: parsedBody.projectId,
@@ -713,10 +752,18 @@ tasksRouter.post("/", postTaskBodyValidator(), async (c) => {
       // Server-derived admission channel — never client-claimed (§7.1).
       source: "api:participant",
     },
+    { prepareFirstAdmission },
   );
 
   if (!result) {
     return c.json({ error: "Failed to create task ownership", code: "invalid_ownership" }, 409);
+  }
+
+  if (result.outcome === "rejected_first_admission") {
+    // First admission refused by a mutable creation-only eligibility check
+    // (invalid profile / missing project) — zero writes, exactly as when the
+    // check ran pre-lookup.
+    return c.json(result.rejection.body, result.rejection.status as ContentfulStatusCode);
   }
 
   if (result.outcome === "conflict") {

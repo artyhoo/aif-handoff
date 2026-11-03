@@ -1011,13 +1011,18 @@ intake_attachments_unavailable` before any write (attachments are not
    available on the keyed path; the legacy attachment flow is unchanged).
 3. Static/structural validation (types, lengths, charsets, `scheduledAt`
    format + UTC-Z normalization only — **no** time-of-day judgment here).
-4. Project existence / runtime-profile validation (existing checks).
-5. Frozen digest computed over the client-supplied fields only (absent
+4. Frozen digest computed over the client-supplied fields only (absent
    optionals canonicalize to fixed sentinels — never environment, project
    config, or route defaults, so a changed environment can never change the
    digest of identical original bytes). Binding lookup by the dedup key
    happens **after** the digest and **before** any time/env-dependent
    validation.
+5. Runtime-profile validity, project existence, and project-config default
+   resolution — all **mutable creation-only** checks — run only on the
+   binding-miss path (a genuine first admission), inside the atomic admission
+   transaction. A first admission still answers `400` (invalid runtime
+   profile selection) / `404 project_not_found` with zero writes; an
+   identical replay of an already-durable request is never vetoed by them.
 
 **Replay semantics (lookup precedes time validation):**
 
@@ -1030,12 +1035,16 @@ intake_attachments_unavailable` before any write (attachments are not
 
 Binding resolution precedes **mutable creation-only eligibility**: an assignee
 who became inactive (or missing) _after_ admission never vetoes the
-replay/tombstone/conflict resolution of the identical request — the canonical
-replay promise covers human-owned keyed tasks too. The assignee-liveness rule
-still applies to every genuine first admission (no binding for the key): such
-requests are rejected `409 invalid_ownership` with zero writes. Session
-authentication, project authorization, and structural validation are always
-required — a revoked or unauthorized caller gains no replay access.
+replay/tombstone/conflict resolution of the identical request — and neither do
+a runtime profile disabled, deleted, or re-scoped _after_ admission, or the
+creation-time project being deleted (the retained task/binding survive it;
+there is no foreign key on `tasks.project_id`). The canonical replay promise
+covers human-owned keyed tasks too. All of these rules still apply to every
+genuine first admission (no binding for the key): `409 invalid_ownership`,
+`400` (invalid runtime profile selection), or `404 project_not_found`, each
+with zero writes. Session authentication, project authorization, and
+structural validation are always required — a revoked or unauthorized caller
+gains no replay access.
 
 **Keyed overdue policy:** because lookup precedes time validation, a first
 keyed delivery whose `scheduledAt` is already in the past is **admitted**
@@ -1051,8 +1060,11 @@ as `200`).
 
 **Errors:**
 
-- `400` — structural/validation failure (including legacy past-`scheduledAt`)
+- `400` — structural/validation failure (including legacy past-`scheduledAt`);
+  invalid runtime profile selection on a first admission (zero writes)
 - `401` / `403` — unauthenticated / unauthorized session (pre-write)
+- `404` — `project_not_found` on a first admission (zero writes); never
+  returned for an existing binding's replay/tombstone resolution
 - `409` — `intake_conflict`; `invalid_ownership` when the (binding-miss) first
   admission fails creation-time ownership validation
 - `410` — `intake_tombstone`

@@ -51,6 +51,12 @@ const {
   createParticipantSession,
   revokeParticipantSession,
   listDueScheduledTasks,
+  createRuntimeProfile,
+  updateRuntimeProfile,
+  deleteRuntimeProfile,
+  deleteProject,
+  deactivateParticipant,
+  findRuntimeProfileById,
 } = await import("@aif/data");
 const { participantAuth } = await import("../middleware/participantAuth.js");
 const { participantCsrf } = await import("../middleware/csrf.js");
@@ -924,6 +930,319 @@ describe("POST /tasks keyed replay after mutable ownership change (R3)", () => {
     const replay = await app.request("/tasks", {
       method: "POST",
       headers: authHeaders(admin.session, true),
+      body: payload,
+    });
+
+    expect(replay.status).toBe(401);
+    expect(countTasks()).toBe(1);
+    expect(countBindings()).toBe(1);
+    expect(testDb.current.select().from(auditEvents).all().length).toBe(auditsBefore);
+    expect(mockBroadcast).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /tasks keyed replay after mutable creation-only configuration change (R7)", () => {
+  // R7, extending R3: the runtime-profile validity, project-existence, and
+  // project-config default checks are MUTABLE CREATION-ONLY eligibility. Once a
+  // binding is durable, an admin disabling, deleting, or re-scoping the
+  // referenced runtime profile — or deleting the creation-time project — must
+  // never veto the replay/conflict/tombstone resolution of the identical
+  // request (the relay parks 400/404 as hold_auth_config, which made a
+  // retained envelope permanently undeliverable). The degradation steps below
+  // go through the real @aif/data mutations those admin routes perform
+  // (PUT/DELETE /runtime-profiles/:id, DELETE /projects/:id — `tasks.project_id`
+  // and `task_intake_bindings.project_id` carry no foreign key, so the retained
+  // task/binding survive project deletion by the actual schema contract).
+  // Authorization stays mandatory throughout: every replay below still runs on
+  // a currently verified session, and the revoked-principal contrast proves the
+  // binding is never an authorization bypass.
+  const OTHER_PROJECT_ID = "00000000-0000-4000-8000-000000000002";
+  const PROFILE_REQUEST_ID = "relay-svc:p2-profile-replay-1";
+
+  function createGlobalProfile() {
+    const profile = createRuntimeProfile({
+      name: "Keyed intake profile",
+      runtimeId: "claude",
+      providerId: "claude-sdk",
+      enabled: true,
+    });
+    if (!profile) throw new Error("runtime profile creation failed");
+    return profile;
+  }
+
+  function keyedProfileBody(profileId: string, requestId = PROFILE_REQUEST_ID) {
+    return keyedBody({ intake: { requestId }, runtimeProfileId: profileId });
+  }
+
+  async function admitFirst(payload: string) {
+    const admin = await createAuthenticatedParticipant("admin");
+    const app = createApp();
+    const first = await app.request("/tasks", {
+      method: "POST",
+      headers: authHeaders(admin.session, true),
+      body: payload,
+    });
+    expect(first.status).toBe(201);
+    const created = (await first.json()) as { id: string; intake: { digest: string } };
+    expect(broadcastsOfType("task:created")).toHaveLength(1);
+    mockBroadcast.mockClear();
+    return { admin, app, created };
+  }
+
+  function expectReplayOf(replay: Response): void {
+    expect(replay.status).toBe(200);
+  }
+
+  it("resolves the identical replay after the referenced runtime profile was disabled", async () => {
+    const profile = createGlobalProfile();
+    const payload = JSON.stringify(keyedProfileBody(profile.id));
+    const { admin, app, created } = await admitFirst(payload);
+
+    // The real write behind PUT /runtime-profiles/:id — the profile that was
+    // valid at admission is now disabled.
+    updateRuntimeProfile(profile.id, { enabled: false });
+    expect(findRuntimeProfileById(profile.id)?.enabled).toBe(false);
+
+    const replay = await app.request("/tasks", {
+      method: "POST",
+      headers: authHeaders(admin.session, true),
+      body: payload,
+    });
+
+    expectReplayOf(replay);
+    const body = (await replay.json()) as { id: string; intake: { replayed: boolean } };
+    expect(body.id).toBe(created.id);
+    expect(body.intake.replayed).toBe(true);
+    expect(countTasks()).toBe(1);
+    expect(countBindings()).toBe(1);
+    // Replay emits neither task:created nor agent:wake — the original task's
+    // stored profile selection is untouched by the degradation.
+    expect(mockBroadcast).not.toHaveBeenCalled();
+    const stored = testDb.current.select().from(tasks).all()[0];
+    expect(stored.runtimeProfileId).toBe(profile.id);
+  });
+
+  it("resolves the identical replay after the referenced runtime profile was deleted", async () => {
+    const profile = createGlobalProfile();
+    const payload = JSON.stringify(keyedProfileBody(profile.id));
+    const { admin, app, created } = await admitFirst(payload);
+
+    // The real write behind DELETE /runtime-profiles/:id.
+    deleteRuntimeProfile(profile.id);
+    expect(findRuntimeProfileById(profile.id)).toBeUndefined();
+
+    const replay = await app.request("/tasks", {
+      method: "POST",
+      headers: authHeaders(admin.session, true),
+      body: payload,
+    });
+
+    expectReplayOf(replay);
+    const body = (await replay.json()) as { id: string; intake: { replayed: boolean } };
+    expect(body.id).toBe(created.id);
+    expect(body.intake.replayed).toBe(true);
+    expect(countTasks()).toBe(1);
+    expect(countBindings()).toBe(1);
+    expect(mockBroadcast).not.toHaveBeenCalled();
+  });
+
+  it("resolves the identical replay after the referenced runtime profile was re-scoped to another project", async () => {
+    const profile = createGlobalProfile();
+    const payload = JSON.stringify(keyedProfileBody(profile.id));
+    const { admin, app, created } = await admitFirst(payload);
+
+    testDb.current
+      .insert(projects)
+      .values({ id: OTHER_PROJECT_ID, name: "Other", rootPath: "/tmp/other-project" })
+      .run();
+    // The real write behind PUT /runtime-profiles/:id — the profile is now
+    // scoped to a different project and no longer visible to this one.
+    updateRuntimeProfile(profile.id, { projectId: OTHER_PROJECT_ID });
+    expect(findRuntimeProfileById(profile.id)?.projectId).toBe(OTHER_PROJECT_ID);
+
+    const replay = await app.request("/tasks", {
+      method: "POST",
+      headers: authHeaders(admin.session, true),
+      body: payload,
+    });
+
+    expectReplayOf(replay);
+    const body = (await replay.json()) as { id: string; intake: { replayed: boolean } };
+    expect(body.id).toBe(created.id);
+    expect(body.intake.replayed).toBe(true);
+    expect(countTasks()).toBe(1);
+    expect(countBindings()).toBe(1);
+    expect(mockBroadcast).not.toHaveBeenCalled();
+  });
+
+  it("resolves the identical replay when the creation-time project and its config are no longer available", async () => {
+    // DELETE /projects/:id has no task/binding cascade and no foreign key on
+    // tasks.project_id (actual schema contract), so the retained rows survive
+    // with the project row gone. The replay must resolve the binding — the
+    // missing project must not veto it with 404, and the unavailable project
+    // config (default plan path) is creation-only and never consulted.
+    const payload = JSON.stringify(keyedBody());
+    const { admin, app, created } = await admitFirst(payload);
+
+    // The real write behind DELETE /projects/:id.
+    deleteProject(PROJECT_ID);
+    const projectGone = testDb.current.select().from(projects).all();
+    expect(projectGone).toHaveLength(0);
+
+    const replay = await app.request("/tasks", {
+      method: "POST",
+      headers: authHeaders(admin.session, true),
+      body: payload,
+    });
+
+    expectReplayOf(replay);
+    const body = (await replay.json()) as {
+      id: string;
+      status: string;
+      intake: { replayed: boolean };
+    };
+    expect(body.id).toBe(created.id);
+    expect(body.status).toBe("backlog");
+    expect(body.intake.replayed).toBe(true);
+    expect(countTasks()).toBe(1);
+    expect(countBindings()).toBe(1);
+    expect(mockBroadcast).not.toHaveBeenCalled();
+  });
+
+  it("resolves the retained tombstone (410) after the project was deleted and the original task removed", async () => {
+    const payload = JSON.stringify(keyedBody());
+    const { admin, app, created } = await admitFirst(payload);
+
+    deleteProject(PROJECT_ID);
+    testDb.current.delete(tasks).where(eq(tasks.id, created.id)).run();
+
+    const replay = await app.request("/tasks", {
+      method: "POST",
+      headers: authHeaders(admin.session, true),
+      body: payload,
+    });
+
+    expect(replay.status).toBe(410);
+    const body = (await replay.json()) as { code: string };
+    expect(body.code).toBe("intake_tombstone");
+    expect(countTasks()).toBe(0);
+    expect(countBindings()).toBe(1);
+    expect(mockBroadcast).not.toHaveBeenCalled();
+  });
+
+  it("resolves a content conflict (409) after the referenced runtime profile was deleted", async () => {
+    const profile = createGlobalProfile();
+    const { admin, app, created } = await admitFirst(JSON.stringify(keyedProfileBody(profile.id)));
+
+    deleteRuntimeProfile(profile.id);
+    mockBroadcast.mockClear();
+    const auditsBefore = testDb.current.select().from(auditEvents).all().length;
+
+    const conflict = await app.request("/tasks", {
+      method: "POST",
+      headers: authHeaders(admin.session, true),
+      body: JSON.stringify(
+        keyedBody({
+          intake: { requestId: PROFILE_REQUEST_ID },
+          runtimeProfileId: profile.id,
+          title: "Different content entirely",
+        }),
+      ),
+    });
+
+    expect(conflict.status).toBe(409);
+    const body = (await conflict.json()) as { code: string };
+    expect(body.code).toBe("intake_conflict");
+    expect(countTasks()).toBe(1);
+    expect(countBindings()).toBe(1);
+    expect(testDb.current.select().from(auditEvents).all().length).toBe(auditsBefore);
+    expect(mockBroadcast).not.toHaveBeenCalled();
+    expect(created.id).toBeTruthy();
+  });
+
+  it("still rejects a NEW request ID referencing the now-deleted profile with 400 and zero writes", async () => {
+    // Paired negative: only the ORIGINAL request ID resolves past the
+    // degradation. First admission still enforces the mutable eligibility.
+    const profile = createGlobalProfile();
+    const payload = JSON.stringify(keyedProfileBody(profile.id));
+    const { admin, app } = await admitFirst(payload);
+
+    deleteRuntimeProfile(profile.id);
+    mockBroadcast.mockClear();
+    const auditsBefore = testDb.current.select().from(auditEvents).all().length;
+
+    const rejected = await app.request("/tasks", {
+      method: "POST",
+      headers: authHeaders(admin.session, true),
+      body: JSON.stringify(keyedProfileBody(profile.id, "relay-svc:p2-profile-after-delete-1")),
+    });
+
+    expect(rejected.status).toBe(400);
+    const body = (await rejected.json()) as {
+      error: string;
+      fieldErrors: Record<string, string[]>;
+    };
+    expect(body.error).toBe("Invalid runtime profile selection");
+    expect(body.fieldErrors.runtimeProfileId).toHaveLength(1);
+    expect(countTasks()).toBe(1);
+    expect(countBindings()).toBe(1);
+    expect(testDb.current.select().from(auditEvents).all().length).toBe(auditsBefore);
+    expect(mockBroadcast).not.toHaveBeenCalled();
+  });
+
+  it("still rejects a NEW request ID against the now-deleted project with 404 and zero writes", async () => {
+    const payload = JSON.stringify(keyedBody());
+    const { admin, app } = await admitFirst(payload);
+
+    deleteProject(PROJECT_ID);
+    mockBroadcast.mockClear();
+    const auditsBefore = testDb.current.select().from(auditEvents).all().length;
+
+    const rejected = await app.request("/tasks", {
+      method: "POST",
+      headers: authHeaders(admin.session, true),
+      body: JSON.stringify(
+        keyedBody({ intake: { requestId: "relay-svc:p2-project-after-delete-1" } }),
+      ),
+    });
+
+    expect(rejected.status).toBe(404);
+    const body = (await rejected.json()) as { code: string };
+    expect(body.code).toBe("project_not_found");
+    expect(countTasks()).toBe(1);
+    expect(countBindings()).toBe(1);
+    expect(testDb.current.select().from(auditEvents).all().length).toBe(auditsBefore);
+    expect(mockBroadcast).not.toHaveBeenCalled();
+  });
+
+  it("never grants replay to a deactivated principal whose sessions were revoked", async () => {
+    // Authorization stays mandatory: a member whose participant was
+    // deactivated (the real data mutation behind the admin participant
+    // operation, which revokes every session) must not read the canonical task
+    // back out of the binding — even though the binding itself is intact.
+    const member = await createAuthenticatedParticipant("member");
+    const app = createApp();
+    const payload = JSON.stringify(
+      keyedBody({ intake: { requestId: "relay-svc:p2-revoked-member-1" } }),
+    );
+
+    const first = await app.request("/tasks", {
+      method: "POST",
+      headers: authHeaders(member.session, true),
+      body: payload,
+    });
+    expect(first.status).toBe(201);
+    mockBroadcast.mockClear();
+
+    const deactivated = deactivateParticipant(member.participant.id);
+    expect(deactivated.ok).toBe(true);
+    // Baseline AFTER the deactivation (which legitimately writes its own audit
+    // event) — the assertion below proves the REPLAY appends nothing.
+    const auditsBefore = testDb.current.select().from(auditEvents).all().length;
+
+    const replay = await app.request("/tasks", {
+      method: "POST",
+      headers: authHeaders(member.session, true),
       body: payload,
     });
 

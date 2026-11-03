@@ -980,7 +980,9 @@ export {
   createTaskWithIntakeBinding,
   getMaxBacklogPosition,
   type CreateTaskInsertInput,
+  type CreateTaskWithIntakeBindingOptions,
   type CreateTaskWithIntakeBindingResult,
+  type IntakeFirstAdmissionRejection,
   type TaskIntakeBindingInput,
 } from "./taskIntake.js";
 
