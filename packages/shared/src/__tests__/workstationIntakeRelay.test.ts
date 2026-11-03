@@ -3811,3 +3811,304 @@ describe("legacy spool payload tightening (R9 rework — completes f83f7699ae43)
     chmodDeny.delete(record.path);
   });
 });
+
+// ---------------------------------------------------------------------------
+// R10 rework — finding R9-OPENSSH-AUTHINFO-WIRE-FORMAT: real sshd identity
+// bytes at the trusted seam.
+//
+// Official OpenSSH sshd (verified against upstream V_10_0_P2: auth2.c
+// auth2_update_session_info writes `<method>` + `sshkey_format_text(key)`;
+// sshkey.c sshkey_format_text writes `<key-algorithm> <base64-wire-blob>`) puts
+// `publickey <algorithm> <base64-key-blob>` in the ExposeAuthInfo file — NOT
+// `publickey SHA256:…`. The fingerprint is never written by sshd; the resolver
+// must DERIVE it the way stock OpenSSH does (SHA256 over the raw wire blob
+// bytes, base64 with padding trimmed) and resolve THAT against the operator
+// map. The fixture lines below are therefore written as sshd writes them.
+//
+// PUBLIC, NONSECRET fixtures only: the key lines and expected fingerprints are
+// the canonical openssh-portable V_10_0_P2 regression vectors
+// (regress/unittests/sshkey/testdata/{ed25519_1,rsa_1}.pub with the
+// stock-utility-computed fingerprints from the matching .fp files, ISC
+// license). No real host key, host fingerprint, or session material.
+// ---------------------------------------------------------------------------
+
+describe("native ExposeAuthInfo publickey format (R10 rework — finding R9-OPENSSH-AUTHINFO-WIRE-FORMAT)", () => {
+  // Canonical public test vectors (openssh-portable V_10_0_P2 testdata).
+  const ED25519_BLOB = "AAAAC3NzaC1lZDI1NTE5AAAAIFOG6kY7Rf4UtCFvPwKgo/BztXck2xC4a2WyA34XtIwZ";
+  // Stock OpenSSH-computed (testdata/ed25519_1.fp): SHA256:L3k/oJubblSY0lB9Ulsl7emDMnRPKm/8udf2ccwk560
+  const ED25519_STOCK_FINGERPRINT = "SHA256:L3k/oJubblSY0lB9Ulsl7emDMnRPKm/8udf2ccwk560";
+  const RSA_BLOB =
+    "AAAAB3NzaC1yc2EAAAADAQABAAAAgQDLV5lUTt7FrADseB/CGhEZzpoojjEW5y8+ePvLppmK3MmMI18ud6vxzpK3bwZLYkVSyfJYI0HmIuGhdu7yMrW6wb84gbq8C31Xoe9EORcIUuGSvDKdNSM1SjlhDquRblDFB8kToqXyx1lqrXecXylxIUOL0jE+u0rU1967pDJx+w==";
+  // Stock OpenSSH-computed (testdata/rsa_1.fp): SHA256:l6itGumSMcRBBAFteCgmjQBIXqLK/jFGUH3viHX1RmE
+  const RSA_STOCK_FINGERPRINT = "SHA256:l6itGumSMcRBBAFteCgmjQBIXqLK/jFGUH3viHX1RmE";
+
+  /** A principal map keyed by the STOCK fingerprint of the canonical ed25519 vector. */
+  function nativePrincipalMap(fingerprint = ED25519_STOCK_FINGERPRINT) {
+    return new Map([[fingerprint, principalEntry({ fingerprint })]]);
+  }
+
+  function writeIdentityFile(content: string): { dir: string; identityFile: string } {
+    const dir = makeTmpDir();
+    const identityFile = join(dir, "sshd-authinfo");
+    realFs.writeFileSync(identityFile, content);
+    return { dir, identityFile };
+  }
+
+  it("resolves the mapped principal from REAL sshd bytes: publickey <algorithm> <base64-key-blob>", () => {
+    const { dir, identityFile } = writeIdentityFile(`publickey ssh-ed25519 ${ED25519_BLOB}\n`);
+    // The map is keyed by the STOCK OpenSSH fingerprint of the SAME public key
+    // (canonical vector .fp) — an independently computed expected value, not a
+    // hash of the line or of anything this code derives.
+    const resolved = resolvePrincipal({
+      config: { ...baseConfig(dir), sshAuthInfoPath: identityFile },
+      principalMap: nativePrincipalMap(),
+      readFileSync: realFs.readFileSync,
+    });
+    expect(resolved.via).toBe("expose-auth-info");
+    expect(resolved.principal?.principalId).toBe("bridge-principal");
+    expect(resolved.principal?.fingerprint).toBe(ED25519_STOCK_FINGERPRINT);
+  });
+
+  it("resolves the RSA canonical vector through the same seam (multi-field wire blob)", () => {
+    const { dir, identityFile } = writeIdentityFile(`publickey ssh-rsa ${RSA_BLOB}\n`);
+    const resolved = resolvePrincipal({
+      config: { ...baseConfig(dir), sshAuthInfoPath: identityFile },
+      principalMap: nativePrincipalMap(RSA_STOCK_FINGERPRINT),
+      readFileSync: realFs.readFileSync,
+    });
+    expect(resolved.via).toBe("expose-auth-info");
+    expect(resolved.principal?.fingerprint).toBe(RSA_STOCK_FINGERPRINT);
+  });
+
+  it("ignores sshd's trailing method-info annotation after the key text", () => {
+    const { dir, identityFile } = writeIdentityFile(
+      `publickey ssh-ed25519 ${ED25519_BLOB} ED25519 test key #1\n`,
+    );
+    const resolved = resolvePrincipal({
+      config: { ...baseConfig(dir), sshAuthInfoPath: identityFile },
+      principalMap: nativePrincipalMap(),
+      readFileSync: realFs.readFileSync,
+    });
+    expect(resolved.principal?.fingerprint).toBe(ED25519_STOCK_FINGERPRINT);
+  });
+
+  it("retains exactly once through the real submit→writer composition with the native identity file", async () => {
+    const dir = makeTmpDir();
+    const config = baseConfig(dir, { mode: "retain-only" });
+    const spool = createSpool({ dir: config.spoolDir, maxEnvelopes: 10, maxBytes: 1024 * 1024 });
+    // The writer holds ITS OWN copy of the operator map keyed by the SAME
+    // stock fingerprint, so the derived fingerprint is revalidated writer-side
+    // before retention (the generic startWriter helper pins PRINCIPAL_MAP).
+    const principalMap = nativePrincipalMap();
+    const server = createWriterServer({
+      config,
+      spool,
+      principalMap,
+      credential: CREDENTIAL,
+    });
+    await bindWriterSocket({ server, socketPath: config.socketPath });
+
+    const identityFile = join(dir, "sshd-authinfo");
+    realFs.writeFileSync(identityFile, `publickey ssh-ed25519 ${ED25519_BLOB}\n`);
+    const credentialFile = join(dir, "cred");
+    realFs.writeFileSync(credentialFile, CREDENTIAL);
+    const { exitCode, response } = await submitOnce({
+      config: { ...config, sshAuthInfoPath: identityFile, writerCredentialPath: credentialFile },
+      principalMap,
+      input: clientInput({ principalId: "forged-principal", fingerprint: "SHA256:forged" }),
+      readFileSync: realFs.readFileSync,
+    });
+    expect(exitCode).toBe(EXIT_CODES.accepted);
+    expect(response.ok).toBe(true);
+    expect(response.receipt.state).toBe("retained");
+    const records = spool.list();
+    expect(records.length).toBe(1);
+    expect(records[0].principal.principalId).toBe("bridge-principal");
+    expect(records[0].principal.principalId).not.toBe("forged-principal");
+    expect(records[0].principal.fingerprint).toBe(ED25519_STOCK_FINGERPRINT);
+  });
+
+  it("refuses a native line whose key is NOT the mapped key, before any writer retention", async () => {
+    const dir = makeTmpDir();
+    const config = baseConfig(dir, { mode: "retain-only" });
+    const spool = createSpool({ dir: config.spoolDir, maxEnvelopes: 10, maxBytes: 1024 * 1024 });
+    await startWriter(config, spool);
+    const identityFile = join(dir, "sshd-authinfo");
+    realFs.writeFileSync(identityFile, `publickey ssh-rsa ${RSA_BLOB}\n`);
+    const credentialFile = join(dir, "cred");
+    realFs.writeFileSync(credentialFile, CREDENTIAL);
+    const { exitCode, response } = await submitOnce({
+      config: { ...config, sshAuthInfoPath: identityFile, writerCredentialPath: credentialFile },
+      principalMap: nativePrincipalMap(),
+      input: clientInput({ clientRequestId: "unmapped-key" }),
+      readFileSync: realFs.readFileSync,
+    });
+    expect(exitCode).toBe(EXIT_CODES.refused_pre_writer);
+    expect(response.code).toBe("principal_unknown");
+    // Refused BEFORE the writer: the spool never sees the request.
+    expect(spoolStats(config.spoolDir).count).toBe(0);
+  });
+
+  it("refuses a type-mismatched blob (declared algorithm ≠ blob's embedded algorithm)", () => {
+    const { dir, identityFile } = writeIdentityFile(`publickey ssh-rsa ${ED25519_BLOB}\n`);
+    const resolved = resolvePrincipal({
+      config: { ...baseConfig(dir), sshAuthInfoPath: identityFile },
+      principalMap: nativePrincipalMap(),
+      readFileSync: realFs.readFileSync,
+    });
+    expect(resolved.principal).toBeNull();
+    expect(resolved.via).toBeNull();
+  });
+
+  it("refuses truncated, non-base64, and oversized key blobs", () => {
+    const truncated = writeIdentityFile("publickey ssh-ed25519 AAAAC3Nz\n");
+    expect(
+      resolvePrincipal({
+        config: { ...baseConfig(truncated.dir), sshAuthInfoPath: truncated.identityFile },
+        principalMap: nativePrincipalMap(),
+        readFileSync: realFs.readFileSync,
+      }).principal,
+    ).toBeNull();
+
+    const badCharset = writeIdentityFile(`publickey ssh-ed25519 AAAA@@@@////\n`);
+    expect(
+      resolvePrincipal({
+        config: { ...baseConfig(badCharset.dir), sshAuthInfoPath: badCharset.identityFile },
+        principalMap: nativePrincipalMap(),
+        readFileSync: realFs.readFileSync,
+      }).principal,
+    ).toBeNull();
+
+    const oversized = writeIdentityFile(`publickey ssh-ed25519 ${"QQ".repeat(20_000)}\n`);
+    expect(
+      resolvePrincipal({
+        config: { ...baseConfig(oversized.dir), sshAuthInfoPath: oversized.identityFile },
+        principalMap: nativePrincipalMap(),
+        readFileSync: realFs.readFileSync,
+      }).principal,
+    ).toBeNull();
+  });
+
+  it("refuses a blob that carries only the algorithm header with no key parameters", () => {
+    // Wire bytes: u32 length prefix + "ssh-ed25519" and nothing after —
+    // structurally a truncated key, exactly what stock sshkey_read rejects.
+    const headerOnly = Buffer.alloc(4 + 11);
+    headerOnly.writeUInt32BE(11, 0);
+    headerOnly.write("ssh-ed25519", 4);
+    const { dir, identityFile } = writeIdentityFile(
+      `publickey ssh-ed25519 ${headerOnly.toString("base64")}\n`,
+    );
+    const resolved = resolvePrincipal({
+      config: { ...baseConfig(dir), sshAuthInfoPath: identityFile },
+      principalMap: nativePrincipalMap(),
+      readFileSync: realFs.readFileSync,
+    });
+    expect(resolved.principal).toBeNull();
+  });
+
+  it("refuses other auth methods, and key bytes under a non-publickey method", () => {
+    const onlyPassword = writeIdentityFile("password\n");
+    expect(
+      resolvePrincipal({
+        config: { ...baseConfig(onlyPassword.dir), sshAuthInfoPath: onlyPassword.identityFile },
+        principalMap: nativePrincipalMap(),
+        readFileSync: realFs.readFileSync,
+      }).principal,
+    ).toBeNull();
+
+    const multiAuth = writeIdentityFile(
+      `password\nkeyboard-interactive/pam\npublickey ssh-ed25519 ${ED25519_BLOB}\n`,
+    );
+    // The publickey line among successful methods still resolves.
+    expect(
+      resolvePrincipal({
+        config: { ...baseConfig(multiAuth.dir), sshAuthInfoPath: multiAuth.identityFile },
+        principalMap: nativePrincipalMap(),
+        readFileSync: realFs.readFileSync,
+      }).principal?.fingerprint,
+    ).toBe(ED25519_STOCK_FINGERPRINT);
+
+    const keyUnderPassword = writeIdentityFile(`password ssh-ed25519 ${ED25519_BLOB}\n`);
+    expect(
+      resolvePrincipal({
+        config: {
+          ...baseConfig(keyUnderPassword.dir),
+          sshAuthInfoPath: keyUnderPassword.identityFile,
+        },
+        principalMap: nativePrincipalMap(),
+        readFileSync: realFs.readFileSync,
+      }).principal,
+    ).toBeNull();
+  });
+
+  it("refuses arbitrary fingerprint-looking text and valid-shaped but unmapped fingerprints", () => {
+    const garbage = writeIdentityFile("publickey SHA256:not-a-real-fingerprint!!!\n");
+    expect(
+      resolvePrincipal({
+        config: { ...baseConfig(garbage.dir), sshAuthInfoPath: garbage.identityFile },
+        principalMap: nativePrincipalMap(),
+        readFileSync: realFs.readFileSync,
+      }).principal,
+    ).toBeNull();
+
+    // A well-formed key the operator never mapped (RSA vs an ed25519-only
+    // map): refused — the map, not the key's validity, is the authority.
+    const unmapped = writeIdentityFile(`publickey ssh-rsa ${RSA_BLOB}\n`);
+    expect(
+      resolvePrincipal({
+        config: { ...baseConfig(unmapped.dir), sshAuthInfoPath: unmapped.identityFile },
+        principalMap: nativePrincipalMap(),
+        readFileSync: realFs.readFileSync,
+      }).principal,
+    ).toBeNull();
+  });
+
+  it("refuses OpenSSH certificate algorithms truthfully (unsupported, never fingerprinted)", () => {
+    const certificate = writeIdentityFile(
+      `publickey ssh-ed25519-cert-v01@openssh.com ${ED25519_BLOB}\n`,
+    );
+    const resolved = resolvePrincipal({
+      config: { ...baseConfig(certificate.dir), sshAuthInfoPath: certificate.identityFile },
+      principalMap: nativePrincipalMap(),
+      readFileSync: realFs.readFileSync,
+    });
+    expect(resolved.principal).toBeNull();
+    expect(resolved.via).toBeNull();
+  });
+
+  it("still accepts the LEGACY fingerprint-line fixture form (explicitly NOT the native sshd format)", () => {
+    // Pre-R10 fixture/tooling compatibility ONLY: stock sshd never writes a
+    // bare `publickey SHA256:…` line (it writes the key text). This form is a
+    // verbatim map-key lookup from the same trusted file — nothing is derived,
+    // and the operator map remains the authority.
+    const { dir, identityFile } = writeIdentityFile("publickey SHA256:test-fingerprint\n");
+    const resolved = resolvePrincipal({
+      config: { ...baseConfig(dir), sshAuthInfoPath: identityFile },
+      principalMap: PRINCIPAL_MAP,
+      readFileSync: realFs.readFileSync,
+    });
+    expect(resolved.via).toBe("expose-auth-info");
+    expect(resolved.principal?.principalId).toBe("bridge-principal");
+  });
+
+  it("falls back to the SSH_USER_AUTH path sshd actually exports when no explicit path is configured", () => {
+    const { dir, identityFile } = writeIdentityFile(`publickey ssh-ed25519 ${ED25519_BLOB}\n`);
+    const resolved = resolvePrincipal({
+      config: baseConfig(dir),
+      principalMap: nativePrincipalMap(),
+      env: { SSH_USER_AUTH: identityFile },
+      readFileSync: realFs.readFileSync,
+    });
+    expect(resolved.via).toBe("expose-auth-info");
+    expect(resolved.principal?.fingerprint).toBe(ED25519_STOCK_FINGERPRINT);
+
+    // The retired variable is no longer consulted.
+    const retiredOnly = resolvePrincipal({
+      config: baseConfig(dir),
+      principalMap: nativePrincipalMap(),
+      env: { SSH_AUTH_INFO_0: identityFile },
+      readFileSync: realFs.readFileSync,
+    });
+    expect(retiredOnly.principal).toBeNull();
+  });
+});

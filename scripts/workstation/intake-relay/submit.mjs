@@ -12,6 +12,7 @@
 // ⇒ truthful refusal exit; the supervisor restarts the writer and clients
 // retry.
 
+import { createHash } from "node:crypto";
 import { readFileSync, realpathSync } from "node:fs";
 import { connect } from "node:net";
 import { fileURLToPath } from "node:url";
@@ -29,13 +30,121 @@ export const EXIT_CODES = {
 };
 
 /**
+ * The plain (non-certificate) SSH public key algorithms this resolver
+ * fingerprints from sshd-presented key text. Deriving `SHA256:` over the raw
+ * wire blob is the stock OpenSSH rule for every listed algorithm; anything
+ * else — OpenSSH `-cert` certificates included — is refused truthfully
+ * (`principal_unknown`), never fingerprinted by an unproven rule. The
+ * operator map stays the sole authority on which fingerprint means which
+ * principal.
+ */
+const SUPPORTED_PUBLIC_KEY_ALGORITHMS = new Set([
+  "ssh-ed25519",
+  "ssh-rsa",
+  "ssh-dss",
+  "ecdsa-sha2-nistp256",
+  "ecdsa-sha2-nistp384",
+  "ecdsa-sha2-nistp521",
+  "sk-ssh-ed25519@openssh.com",
+  "sk-ecdsa-sha2-nistp256@openssh.com",
+]);
+
+/** Standard base64 only (sshd writes unpadded; key files may pad). */
+const PRESENTED_KEY_BLOB_PATTERN = /^[A-Za-z0-9+/]+={0,2}$/;
+
+/** Legacy bare-fingerprint line charset (verbatim map-key candidate). */
+const PRESENTED_FINGERPRINT_PATTERN = /^SHA256:[A-Za-z0-9+/=_-]+$/;
+
+/** Real public key blobs are far below this; larger input is refused. */
+const MAX_PRESENTED_KEY_BLOB_BYTES = 16 * 1024;
+
+/**
+ * Minimal SSH wire check (deliberately NOT a general key parser): the blob
+ * must carry its own algorithm name as the first length-prefixed string, that
+ * name must equal the declared algorithm on the line (type mismatch refused),
+ * and key parameters must follow (truncated keys refused). Stock
+ * `sshkey_read` applies the same two checks before trusting a key line; the
+ * operator map then decides whether the derived fingerprint means anything.
+ */
+function wireAlgorithmMatches(blob, algorithm) {
+  if (blob.length < 4 + 1) return false;
+  const nameLength = blob.readUInt32BE(0);
+  if (nameLength < 1 || nameLength > blob.length - 4) return false;
+  if (4 + nameLength >= blob.length) return false;
+  return blob.toString("latin1", 4, 4 + nameLength) === algorithm;
+}
+
+/**
+ * Fingerprint ONE `publickey …` line, or null when the line is not a
+ * resolvable identity. Two forms, labeled truthfully:
+ *
+ * NATIVE (what official OpenSSH sshd actually writes): `publickey
+ * <algorithm> <base64-key-blob> [method-info…]` — auth2.c
+ * `auth2_update_session_info` appends `sshkey_format_text(key)`, and
+ * sshkey.c `sshkey_format_text` writes `<key-algorithm> <base64-blob>`
+ * (upstream V_10_0_P2). sshd NEVER writes a fingerprint; this resolver
+ * DERIVES it exactly as the stock utility reports it: SHA256 over the raw
+ * wire blob bytes, base64 with padding trimmed (`sshkey_fingerprint` +
+ * `fingerprint_b64`). Trailing tokens are sshd-authored method-info
+ * annotations — ignored, never trusted.
+ *
+ * LEGACY (pre-R10 fixture/tooling compatibility, NOT native sshd output): a
+ * bare `publickey SHA256:…` line is accepted as a VERBATIM map-key candidate
+ * from the same trusted file — nothing is derived. It is documented as a
+ * non-native compatibility form and is never called the sshd format.
+ *
+ * Unsupported or malformed content (certificate algorithms, unknown
+ * algorithms, truncated/non-base64/oversized blobs, type mismatches, other
+ * auth methods) yields null → the caller refuses `principal_unknown`.
+ */
+function presentedFingerprintFromTokens([method, second, ...rest]) {
+  if (!second) return null;
+  if (second.startsWith("SHA256:")) {
+    return PRESENTED_FINGERPRINT_PATTERN.test(second) ? second : null;
+  }
+  const algorithm = second;
+  const blobText = rest[0];
+  if (!blobText || !SUPPORTED_PUBLIC_KEY_ALGORITHMS.has(algorithm)) return null;
+  if (!PRESENTED_KEY_BLOB_PATTERN.test(blobText)) return null;
+  const blob = Buffer.from(blobText, "base64");
+  if (blob.length === 0 || blob.length > MAX_PRESENTED_KEY_BLOB_BYTES) return null;
+  // Round-trip: Node's base64 decoder silently ignores invalid characters,
+  // so confirm the canonical re-encoding matches what sshd wrote (padding
+  // aside) before trusting the bytes.
+  if (blob.toString("base64").replace(/=+$/, "") !== blobText.replace(/=+$/, "")) return null;
+  if (!wireAlgorithmMatches(blob, algorithm)) return null;
+  return `SHA256:${createHash("sha256").update(blob).digest("base64").replace(/=+$/, "")}`;
+}
+
+/**
+ * Extract the presented-key fingerprint from the ExposeAuthInfo identity
+ * file: the first `publickey …` line that resolves (native key text with the
+ * stock-derived fingerprint, or the labeled legacy bare-fingerprint form).
+ * Lines for other auth methods never produce a fingerprint.
+ */
+export function extractPresentedFingerprint(content) {
+  if (typeof content !== "string") return null;
+  for (const line of content.split("\n")) {
+    const tokens = line.trim().split(/\s+/);
+    if (tokens[0] !== "publickey") continue;
+    const fingerprint = presentedFingerprintFromTokens(tokens);
+    if (fingerprint) return fingerprint;
+  }
+  return null;
+}
+
+/**
  * Resolve principal₁ (R1): prefer the sshd ExposeAuthInfo identity file — the
- * fingerprint of the key sshd ACTUALLY presented — checked against the
- * operator-owned map. The per-key `environment=` variable named by
- * `principalEnvVar` is the documented fallback with a weaker trust basis
- * (operator-set per authorized_keys key, but not a proof of the presented
- * key). An arbitrary inherited environment variable is never sufficient by
- * itself. Client-supplied principal fields are never consulted.
+ * fingerprint of the key sshd ACTUALLY presented (derived from the native
+ * key text; see extractPresentedFingerprint) — checked against the
+ * operator-owned map. When no explicit path is configured, the
+ * `SSH_USER_AUTH` variable is the documented fallback: it is the variable
+ * name OpenSSH actually exports for ExposeAuthInfo (official 10.0p2
+ * session.c). The per-key `environment=` variable named by `principalEnvVar`
+ * is the documented fallback with a weaker trust basis (operator-set per
+ * authorized_keys key, but not a proof of the presented key). An arbitrary
+ * inherited environment variable is never sufficient by itself.
+ * Client-supplied principal fields are never consulted.
  */
 export function resolvePrincipal({
   config,
@@ -43,7 +152,7 @@ export function resolvePrincipal({
   env = process.env,
   readFileSync: read = readFileSync,
 }) {
-  const identityPath = config.sshAuthInfoPath || env.SSH_AUTH_INFO_0 || "";
+  const identityPath = config.sshAuthInfoPath || env.SSH_USER_AUTH || "";
   if (identityPath) {
     let content;
     try {
@@ -67,13 +176,6 @@ export function resolvePrincipal({
     }
   }
   return { principal: null, via: null };
-}
-
-/** Extract the first `publickey SHA256:…` fingerprint from ExposeAuthInfo output. */
-export function extractPresentedFingerprint(content) {
-  if (typeof content !== "string") return null;
-  const match = /^publickey\s+(SHA256:[A-Za-z0-9+/=_-]+)/m.exec(content);
-  return match?.[1] ?? null;
 }
 
 /**

@@ -17,17 +17,29 @@
 # With this, every session gets SSH_USER_AUTH=<path> in its environment (the
 # variable name OpenSSH actually exports — official 10.0p2 session.c:1168);
 # the per-session file (mkstemp'd, session-user-owned, 0600, unlinked at
-# session end) contains a line like:
+# session end) contains one line per successful method. For key
+# authentication that line is the METHOD followed by the KEY TEXT —
+# `publickey <algorithm> <base64-key-blob>` (official 10.0p2 auth2.c
+# auth2_update_session_info + sshkey.c sshkey_format_text) — for example:
 #
-#   publickey SHA256:<base64-fingerprint>
+#   publickey ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA…
+#
+# sshd never writes a fingerprint into this file. submit.mjs derives the
+# SHA256 fingerprint the stock utility reports (`ssh-keygen -lf`: SHA256 over
+# the raw wire-blob bytes, base64 with padding trimmed) from those bytes and
+# resolves THAT against the operator-owned principals.json. A bare
+# `publickey SHA256:…` line is NOT the sshd format; the shim still accepts it
+# from the same trusted file only as a legacy compatibility form (pre-R10
+# fixtures/tooling), documented as non-native.
 #
 # The forced-command wrapper assigns that real per-session path to the
 # EXISTING submit config seam AIF_INTAKE_RELAY_SSH_AUTH_INFO_PATH (after any
 # operator config file is sourced, so a config value can never override or
-# blank it); submit.mjs reads the fingerprint from that seam FIRST (what sshd
-# ACTUALLY presented) and resolves it against the operator-owned
-# principals.json. There is no static per-session filename to hardcode.
-# Reload sshd after changing sshd_config (existing owner procedure).
+# blank it); submit.mjs reads the identity from that seam FIRST (what sshd
+# ACTUALLY presented) and falls back to the SSH_USER_AUTH path only when no
+# explicit path is configured. There is no static per-session filename to
+# hardcode. Reload sshd after changing sshd_config (existing owner
+# procedure).
 
 # ---------------------------------------------------------------------------
 # 2. authorized_keys entry for the submit principal (bridge relay user)
