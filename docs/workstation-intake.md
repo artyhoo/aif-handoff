@@ -173,6 +173,17 @@ Envelope lifecycle and HOLD semantics:
   state is preserved as-is (an `admitted` envelope stays `admitted` and is
   reconciled by the handover watch or operator resume), and startup is never
   blocked by a full spool.
+- **Private filesystem boundary in source (R8/R9):** spool/state directories
+  are created and kept no broader than `0750` and payload-bearing durable
+  files (record temps, records, fence markers) are created `0600`,
+  independent of the deployment umask (`UMask=0077` stays defense-in-depth).
+  Reopening an existing spool as a mutating consumer also tightens legacy
+  broader modes of its known payload-bearing files — envelope records,
+  receipt-less temps, preserved record quarantine — to `0600` BEFORE any
+  acceptance; already-stricter modes are never widened, foreign entries are
+  never chmod-ed recursively, a payload-named symlinked entry is left
+  untouched rather than followed, a read-only `--status` invocation changes
+  nothing, and a denied enforcement fails closed before any acceptance.
 - **Singleton is fail-closed:** the Unix socket bind is the latch. If the path
   exists — live listener or stale file — startup refuses (exit 78,
   `startup_refused_socket_held`). The relay never unlinks its own socket path.

@@ -14,14 +14,20 @@
 #
 #   ExposeAuthInfo yes
 #
-# With this, every session gets SSH_AUTH_INFO_0=<path> in its environment;
-# the file contains a line like:
+# With this, every session gets SSH_USER_AUTH=<path> in its environment (the
+# variable name OpenSSH actually exports — official 10.0p2 session.c:1168);
+# the per-session file (mkstemp'd, session-user-owned, 0600, unlinked at
+# session end) contains a line like:
 #
 #   publickey SHA256:<base64-fingerprint>
 #
-# submit.mjs prefers this fingerprint (what sshd ACTUALLY presented) and
-# resolves it against the operator-owned principals.json. Reload sshd after
-# changing sshd_config (existing owner procedure).
+# The forced-command wrapper assigns that real per-session path to the
+# EXISTING submit config seam AIF_INTAKE_RELAY_SSH_AUTH_INFO_PATH (after any
+# operator config file is sourced, so a config value can never override or
+# blank it); submit.mjs reads the fingerprint from that seam FIRST (what sshd
+# ACTUALLY presented) and resolves it against the operator-owned
+# principals.json. There is no static per-session filename to hardcode.
+# Reload sshd after changing sshd_config (existing owner procedure).
 
 # ---------------------------------------------------------------------------
 # 2. authorized_keys entry for the submit principal (bridge relay user)
@@ -48,9 +54,11 @@
 # ---------------------------------------------------------------------------
 #
 # When ExposeAuthInfo cannot be enabled, a per-key environment variable can
-# carry the principalId. Requires sshd_config:
+# carry the principalId. Requires sshd_config — as the scoped PATTERN LIST,
+# never the global yes (which would let every accepted client request
+# environment variables):
 #
-#   PermitUserEnvironment yes
+#   PermitUserEnvironment AIF_RELAY_PRINCIPAL
 #
 # authorized_keys entry:
 #

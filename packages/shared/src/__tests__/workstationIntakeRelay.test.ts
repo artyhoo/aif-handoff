@@ -3628,3 +3628,186 @@ process.umask(0o022);
     expect(realFs.readdirSync(outside)).toEqual([]);
   });
 });
+
+describe("legacy spool payload tightening (R9 rework — completes f83f7699ae43)", () => {
+  function octalMode(path: string): string {
+    return (realFs.statSync(path).mode & 0o777).toString(8);
+  }
+
+  /**
+   * Seed one REAL spool record (identity, digest, payload, retention receipt)
+   * into `spoolDir` with a legacy broader file mode — the exact state the
+   * pre-R8 writer produced under a permissive umask, reproduced from the
+   * owner reconciliation (owner-r8-legacy-mode-reconciliation.json): valid
+   * retained records whose FILE modes were never tightened by the R8
+   * directory boundary.
+   */
+  function seedLegacyRecord(
+    dir: string,
+    spoolDir: string,
+    clientRequestId: string,
+    mode: number,
+  ): { id: string; path: string; bytes: Buffer } {
+    const scratch = createSpool({
+      dir: join(dir, "scratch-spool"),
+      maxEnvelopes: 10,
+      maxBytes: 1024 * 1024,
+    });
+    const seeded = scratch.writerReceive(sealTestEnvelope({ clientRequestId }), {
+      mode: "retain-only",
+    });
+    const path = join(spoolDir, `${seeded.id}.json`);
+    const bytes = realFs.readFileSync(join(dir, "scratch-spool", `${seeded.id}.json`));
+    realFs.writeFileSync(path, bytes);
+    realFs.chmodSync(path, mode);
+    return { id: seeded.id, path, bytes };
+  }
+
+  /** Build the full legacy state: permissive dir + 0644 records/temp/quarantine. */
+  function seedLegacySpool(dir: string, clientRequestIds: string[]) {
+    const spoolDir = join(dir, "spool");
+    realFs.mkdirSync(spoolDir, { recursive: true });
+    realFs.chmodSync(spoolDir, 0o755);
+    const records = clientRequestIds.map((id) => seedLegacyRecord(dir, spoolDir, id, 0o644));
+    const legacyTemp = join(spoolDir, ".tmp-legacy-000.tmp");
+    realFs.writeFileSync(legacyTemp, '{"receiptless":true}\n');
+    realFs.chmodSync(legacyTemp, 0o644);
+    const legacyQuarantine = join(spoolDir, "legacy.json.corrupt");
+    realFs.writeFileSync(legacyQuarantine, '{"corrupt-record-bytes":true}\n');
+    realFs.chmodSync(legacyQuarantine, 0o644);
+    return { spoolDir, records, legacyTemp, legacyQuarantine };
+  }
+
+  it("tightens TWO legacy 0644 records at the mutating open BEFORE either is touched; a third distinct acceptance preserves every older byte/receipt and leaves all modes safe", () => {
+    const dir = makeTmpDir();
+    const { spoolDir, records, legacyTemp, legacyQuarantine } = seedLegacySpool(dir, [
+      "legacy-1",
+      "legacy-2",
+    ]);
+    const [record1, record2] = records;
+    // The exact legacy state from the owner reconciliation: a valid retained
+    // record at 0644 inside a group-readable directory.
+    expect(octalMode(spoolDir)).toBe("755");
+    expect(octalMode(record1.path)).toBe("644");
+    expect(octalMode(record2.path)).toBe("644");
+
+    // Reopening the spool as a MUTATING consumer is the required upgrade
+    // boundary: both legacy records must already be owner-only at this point
+    // — no updateState, no writerReceive, no restartScan has touched either
+    // record (the R8 test only observed the mode AFTER rewriting the same
+    // record, which missed this boundary).
+    const spool = createSpool({ dir: spoolDir, maxEnvelopes: 10, maxBytes: 1024 * 1024 });
+    expect(octalMode(spoolDir)).toBe("750");
+    expect(octalMode(record1.path)).toBe("600");
+    expect(octalMode(record2.path)).toBe("600");
+    // Known payload-bearing temp/quarantine state is tightened too.
+    expect(octalMode(legacyTemp)).toBe("600");
+    expect(octalMode(legacyQuarantine)).toBe("600");
+    // Tightening is mode metadata only: accepted bytes are preserved verbatim.
+    expect(realFs.readFileSync(record1.path).equals(record1.bytes)).toBe(true);
+    expect(realFs.readFileSync(record2.path).equals(record2.bytes)).toBe(true);
+
+    // A DIFFERENT third request is accepted after the boundary…
+    const third = spool.writerReceive(sealTestEnvelope({ clientRequestId: "legacy-3-new" }), {
+      mode: "retain-only",
+    });
+    expect(octalMode(join(spoolDir, `${third.id}.json`))).toBe("600");
+    // …and every older byte and receipt survives exactly.
+    expect(realFs.readFileSync(record1.path).equals(record1.bytes)).toBe(true);
+    expect(realFs.readFileSync(record2.path).equals(record2.bytes)).toBe(true);
+    const older1 = spool.get(record1.id);
+    const older2 = spool.get(record2.id);
+    for (const [older, envelope] of [
+      [older1, "legacy-1"],
+      [older2, "legacy-2"],
+    ] as const) {
+      expect(older.state).toBe("retained");
+      expect(older.receipts).toHaveLength(1);
+      expect(older.receipts[0].kind).toBe("retention");
+      expect(older.dedupKey).toBe(sealTestEnvelope({ clientRequestId: envelope }).dedupKey);
+      expect(older.digest).toBe(sealTestEnvelope({ clientRequestId: envelope }).digest);
+    }
+    expect(spoolStats(spoolDir).count).toBe(3);
+  });
+
+  it("a read-only consumer on a legacy spool still creates/chmods/repairs NOTHING (records, temps, quarantine included)", () => {
+    const dir = makeTmpDir();
+    const { spoolDir, records, legacyTemp, legacyQuarantine } = seedLegacySpool(dir, [
+      "legacy-readonly",
+    ]);
+    const [record] = records;
+    const observer = createSpool({
+      dir: spoolDir,
+      maxEnvelopes: 10,
+      maxBytes: 1024 * 1024,
+      create: false,
+    });
+    expect(observer.list()).toHaveLength(1);
+    expect(octalMode(spoolDir)).toBe("755");
+    expect(octalMode(record.path)).toBe("644");
+    expect(octalMode(legacyTemp)).toBe("644");
+    expect(octalMode(legacyQuarantine)).toBe("644");
+    expect(realFs.readFileSync(record.path).equals(record.bytes)).toBe(true);
+  });
+
+  it("never follows or touches a payload-named symlink outside the owned spool, and never chmods foreign non-payload entries", () => {
+    const dir = makeTmpDir();
+    const outside = join(dir, "outside");
+    realFs.mkdirSync(outside, { recursive: true });
+    const outsideTarget = join(outside, "operator-notes.txt");
+    realFs.writeFileSync(outsideTarget, "foreign bytes\n");
+    realFs.chmodSync(outsideTarget, 0o644);
+
+    const { spoolDir, records } = seedLegacySpool(dir, ["legacy-real"]);
+    const [record] = records;
+    // A payload-named symlink pointing OUTSIDE the owned spool: a naive
+    // chmod would follow it and mutate the foreign target.
+    realFs.symlinkSync(outsideTarget, join(spoolDir, "escaped.json"));
+    // A foreign regular entry that is NOT known payload-bearing spool state.
+    const foreignEntry = join(spoolDir, "operator-readme.txt");
+    realFs.writeFileSync(foreignEntry, "not payload-bearing\n");
+    realFs.chmodSync(foreignEntry, 0o644);
+
+    const spool = createSpool({ dir: spoolDir, maxEnvelopes: 10, maxBytes: 1024 * 1024 });
+    // The REAL legacy record was tightened…
+    expect(octalMode(record.path)).toBe("600");
+    // …the symlink was not followed: it still points outside, and the
+    // outside target's mode and bytes are untouched.
+    expect(realFs.lstatSync(join(spoolDir, "escaped.json")).isSymbolicLink()).toBe(true);
+    expect(octalMode(outsideTarget)).toBe("644");
+    expect(realFs.readFileSync(outsideTarget, "utf8")).toBe("foreign bytes\n");
+    // The foreign non-payload entry was left alone (no recursive chmod).
+    expect(octalMode(foreignEntry)).toBe("644");
+    expect(spool.list()).toHaveLength(1);
+    expect(spool.get(record.id).state).toBe("retained");
+  });
+
+  it("a denied REQUIRED FILE tightening refuses the mutating open with zero new acceptance (LABELED FAULT INJECTION — mocked chmod EACCES; proves the fail-closed refusal path, not a native-kernel race)", () => {
+    const dir = makeTmpDir();
+    const spoolDir = join(dir, "spool");
+    // The directory is already boundary-safe, so the ONLY required
+    // enforcement is the legacy record's file mode — isolating the file path.
+    realFs.mkdirSync(spoolDir, { recursive: true });
+    realFs.chmodSync(spoolDir, 0o750);
+    const record = seedLegacyRecord(dir, spoolDir, "legacy-denied", 0o644);
+    expect(octalMode(record.path)).toBe("644");
+
+    chmodDeny.add(record.path);
+    let refused: unknown = null;
+    try {
+      createSpool({ dir: spoolDir, maxEnvelopes: 10, maxBytes: 1024 * 1024 });
+      throw new Error("expected the denied record tightening to refuse construction");
+    } catch (error) {
+      refused = error;
+    }
+    expect(refused).toBeInstanceOf(SpoolError);
+    expect((refused as InstanceType<typeof SpoolError>).code).toBe("permission_enforcement_failed");
+    // Fail closed BEFORE any acceptance/mutation: no new record, no temp, and
+    // the denied legacy record is exactly as it was (mode AND bytes).
+    expect(octalMode(record.path)).toBe("644");
+    expect(realFs.readFileSync(record.path).equals(record.bytes)).toBe(true);
+    expect(spoolStats(spoolDir).count).toBe(1);
+    expect(spoolStats(spoolDir).temps).toBe(0);
+    chmodDeny.delete(record.path);
+  });
+});

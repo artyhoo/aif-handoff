@@ -55,12 +55,16 @@ export const SPOOL_STATES = [
 const TEMP_PREFIX = ".tmp-";
 
 /**
- * Private-filesystem boundary (R8 — finding f83f7699ae43): spool records hold
- * full client payloads, principal identities and request IDs, so their
- * privacy is enforced IN SOURCE, independently of the deployment umask or any
- * systemd UMask (which remains defense-in-depth). Durable payload-bearing
- * files (record temps, records, fence markers) are created owner-only `0600`;
- * relay-owned directories are created and kept no broader than `0750`.
+ * Private-filesystem boundary (R8 — finding f83f7699ae43; R9 completion):
+ * spool records hold full client payloads, principal identities and request
+ * IDs, so their privacy is enforced IN SOURCE, independently of the
+ * deployment umask or any systemd UMask (which remains defense-in-depth).
+ * Durable payload-bearing files (record temps, records, fence markers) are
+ * created owner-only `0600`; relay-owned directories are created and kept no
+ * broader than `0750`; and a mutating open of an EXISTING owned spool
+ * tightens legacy broader modes of its known payload-bearing files (records,
+ * temps, preserved record quarantine) BEFORE any acceptance — a directory
+ * boundary alone would leave pre-R8 record files group-readable inside it.
  */
 export const PRIVATE_DIR_MODE = 0o750;
 export const PRIVATE_FILE_MODE = 0o600;
@@ -112,6 +116,64 @@ export function enforceOwnedPrivateDir(dirPath) {
       throw new SpoolError(
         "permission_enforcement_failed",
         `cannot tighten relay directory ${dirPath} to 0${PRIVATE_DIR_MODE.toString(8)}: ${error.message}`,
+      );
+    }
+  }
+}
+
+/**
+ * Tighten KNOWN payload-bearing regular files in an owned relay directory
+ * (R9 — completion of finding f83f7699ae43): a legacy spool written by the
+ * pre-R8 writer under a permissive umask keeps valid records at `0644` even
+ * after the directory is tightened to `0750` — the directory boundary alone
+ * still lets the GROUP read those payloads. A mutating consumer therefore
+ * tightens every known payload-bearing REGULAR file in the directory to
+ * owner-only `0600` BEFORE any acceptance or other mutation:
+ *   • envelope records (`*.json`),
+ *   • receipt-less record temps (`.tmp-*`),
+ *   • preserved record quarantine (`*.json.corrupt*`).
+ * Already-stricter safe modes (0600, 0400, …) are preserved untouched;
+ * entries that are not known payload-bearing spool state are never touched
+ * (no recursive/foreign chmod); a payload-named SYMLINK is not a regular
+ * file and is left exactly as found — chmod would FOLLOW it and mutate a
+ * target outside the owned tree. A required tightening the OS denies throws
+ * `permission_enforcement_failed` so the mutating open fails closed BEFORE
+ * any acceptance (bytes, identities and receipts are never rewritten to
+ * hide a mode; only the mode metadata changes).
+ */
+export function enforceOwnedPrivateRecords(dirPath) {
+  let entries;
+  try {
+    entries = readdirSync(dirPath);
+  } catch (error) {
+    throw new SpoolError(
+      "spool_dir_unavailable",
+      `relay directory ${dirPath} is unreadable: ${error.message}`,
+    );
+  }
+  for (const entry of entries) {
+    const payloadBearing =
+      entry.endsWith(".json") || entry.startsWith(TEMP_PREFIX) || entry.includes(".corrupt");
+    if (!payloadBearing) continue;
+    const path = join(dirPath, entry);
+    let stats;
+    try {
+      stats = lstatSync(path); // lstat — never resolve a symlink to its target
+    } catch (error) {
+      throw new SpoolError(
+        "permission_enforcement_failed",
+        `cannot evaluate relay record ${path}: ${error.message}`,
+      );
+    }
+    if (!stats.isFile()) continue; // symlink/dir at a payload-named path: untouched
+    const mode = stats.mode & 0o777;
+    if ((mode & ~PRIVATE_FILE_MODE) === 0) continue; // already owner-only-safe
+    try {
+      chmodSync(path, PRIVATE_FILE_MODE);
+    } catch (error) {
+      throw new SpoolError(
+        "permission_enforcement_failed",
+        `cannot tighten relay record ${path} to 0${PRIVATE_FILE_MODE.toString(8)}: ${error.message}`,
       );
     }
   }
@@ -176,10 +238,15 @@ export function createSpool({
   // repair). Mutating consumers create the directory no broader than 0750 and
   // enforce that boundary explicitly (mkdir mode alone is umask-masked), so
   // existing owned-but-unsafe state is tightened — or the failure surfaces
-  // truthfully — BEFORE any acceptance or mutation (R8).
+  // truthfully — BEFORE any acceptance or mutation (R8). The same mutating
+  // open also tightens the known payload-bearing FILES inside the directory
+  // (records, temps, preserved record quarantine) to owner-only 0600 — the
+  // directory boundary alone leaves legacy 0644 record files group-readable
+  // (R9, completion of finding f83f7699ae43).
   if (create) {
     mkdirSync(dir, { recursive: true, mode: PRIVATE_DIR_MODE });
     enforceOwnedPrivateDir(dir);
+    enforceOwnedPrivateRecords(dir);
   }
 
   function envelopePath(id) {

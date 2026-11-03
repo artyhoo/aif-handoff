@@ -73,15 +73,21 @@ in this design; this task grants no trust and enrolls no credential.
 - The writer is reachable **only** through the Unix domain socket: file `0600`
   inside a service-user-owned `0750` directory — kernel-enforced reachability.
   The deliverer opens **no TCP listener at all**.
-- **The private filesystem boundary is enforced in source** (R8), independent
+- **The private filesystem boundary is enforced in source** (R8/R9), independent
   of the deployment umask or any systemd `UMask` (which stays defense-in-depth,
   `UMask=0077` in the example unit): spool and state directories are created
   and kept **no broader than `0750`**, and every payload-bearing durable file
   (record temps, envelope records, the fence marker) is created **`0600`**.
+  Reopening an EXISTING spool as a mutating consumer also tightens the legacy
+  broader modes of its known payload-bearing files — envelope records,
+  receipt-less temps, and preserved record quarantine — to `0600` BEFORE any
+  acceptance or other mutation (R9: a directory tightening alone would leave
+  pre-R8 `0644` record files group-readable inside the now-`0750` directory).
   An already-stricter safe mode is never widened; only the relay's own named
   paths are touched (never a recursive chmod of foreign state); a symlinked
-  relay directory is refused rather than followed; a read-only `--status`
-  invocation creates, chmods, and repairs nothing; and a denied
+  relay directory is refused rather than followed, and a payload-named
+  symlinked entry is left untouched rather than chmod-ed through; a read-only
+  `--status` invocation creates, chmods, and repairs nothing; and a denied
   permission-enforcement operation fails closed BEFORE any acceptance — a
   native permission failure can never produce a successful acceptance receipt.
 - **Every** request must present the per-instance writer credential
