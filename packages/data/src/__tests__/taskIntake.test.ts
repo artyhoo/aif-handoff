@@ -1231,3 +1231,138 @@ describe("pinned host SQL mirror (C2 amendment, §11.12)", () => {
     expect(runPinnedSql(sql)).toBe(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Keyed admission identity isolation across principals and projects (R8 —
+// finding 252035188273)
+//
+// The dedup key is `principalKind|principalId|projectId|requestId`, composed
+// from the API-VERIFIED session principal and the body's project. These
+// real-SQLite acceptance cases pin the identity dimensions that a regression
+// dropping principalId or projectId from the composition would silently break
+// (a cross-principal 200 replay of another principal's task is an
+// authenticated info leak while every single-participant test stays green).
+// ---------------------------------------------------------------------------
+
+describe("keyed admission identity isolation across principals and projects (R8)", () => {
+  let workDir: string;
+  let db: Db;
+
+  const SECOND_PROJECT_ID = "proj-intake-second";
+  const REQUEST_ID = "relay-svc:isolation-1";
+
+  function isolatedBindingInput(
+    digest: string,
+    overrides: { projectId?: string; principalId?: string; requestId?: string } = {},
+  ) {
+    const projectId = overrides.projectId ?? PROJECT_ID;
+    const principalId = overrides.principalId ?? "relay-svc";
+    const requestId = overrides.requestId ?? REQUEST_ID;
+    return {
+      dedupKey: `participant|${principalId}|${projectId}|${requestId}`,
+      projectId,
+      principalKind: "participant" as const,
+      principalId,
+      requestId,
+      payloadDigest: digest,
+      source: "relay",
+    };
+  }
+
+  beforeEach(() => {
+    closeDb();
+    workDir = mkdtempSync(join(tmpdir(), "aif-task-intake-isolation-"));
+    db = getDb(join(workDir, "intake-isolation.sqlite"));
+    db.insert(projects)
+      .values({ id: PROJECT_ID, name: "Intake", rootPath: join(workDir, "root-a") })
+      .run();
+    db.insert(projects)
+      .values({ id: SECOND_PROJECT_ID, name: "Intake Second", rootPath: join(workDir, "root-b") })
+      .run();
+  });
+
+  afterEach(() => {
+    closeDb();
+    rmSync(workDir, { recursive: true, force: true });
+  });
+
+  it("two principals with the same requestId admit distinct canonical tasks; each replay resolves only its own original", () => {
+    const alice = isolatedBindingInput(DIGEST_A, { principalId: "principal-alice" });
+    const bob = isolatedBindingInput(DIGEST_A, { principalId: "principal-bob" });
+    const payload = creationInput(); // byte-identical client content for both
+
+    const first = createTaskWithIntakeBinding(payload, alice);
+    const second = createTaskWithIntakeBinding(payload, bob);
+    expect(first?.outcome).toBe("created");
+    expect(second?.outcome).toBe("created");
+    if (first?.outcome !== "created" || second?.outcome !== "created") {
+      throw new Error("expected both admissions to be created");
+    }
+    expect(first.task.id).not.toBe(second.task.id);
+    expect(countTasks(db)).toBe(2);
+    expect(countBindings(db)).toBe(2);
+
+    const bindings = db.select().from(taskIntakeBindings).all();
+    expect(new Set(bindings.map((b) => b.principalId))).toEqual(
+      new Set(["principal-alice", "principal-bob"]),
+    );
+    expect(new Set(bindings.map((b) => b.requestId))).toEqual(new Set([REQUEST_ID]));
+
+    // Each principal's identical replay resolves ONLY its own original task.
+    const replayAlice = createTaskWithIntakeBinding(payload, alice);
+    const replayBob = createTaskWithIntakeBinding(payload, bob);
+    expect(replayAlice?.outcome).toBe("replayed");
+    expect(replayBob?.outcome).toBe("replayed");
+    if (replayAlice?.outcome !== "replayed" || replayBob?.outcome !== "replayed") {
+      throw new Error("expected both replays");
+    }
+    expect(replayAlice.task?.id).toBe(first.task.id);
+    expect(replayBob.task?.id).toBe(second.task.id);
+    expect(countTasks(db)).toBe(2);
+    expect(countBindings(db)).toBe(2);
+  });
+
+  it("one principal with the same requestId across two projects admits distinct originals; per-project replay is stable", () => {
+    const inFirst = isolatedBindingInput(DIGEST_A, { projectId: PROJECT_ID });
+    const inSecond = isolatedBindingInput(DIGEST_A, { projectId: SECOND_PROJECT_ID });
+
+    const first = createTaskWithIntakeBinding(creationInput({ projectId: PROJECT_ID }), inFirst);
+    const second = createTaskWithIntakeBinding(
+      creationInput({ projectId: SECOND_PROJECT_ID }),
+      inSecond,
+    );
+    expect(first?.outcome).toBe("created");
+    expect(second?.outcome).toBe("created");
+    if (first?.outcome !== "created" || second?.outcome !== "created") {
+      throw new Error("expected both admissions to be created");
+    }
+    expect(first.task.id).not.toBe(second.task.id);
+    expect(first.task.projectId).toBe(PROJECT_ID);
+    expect(second.task.projectId).toBe(SECOND_PROJECT_ID);
+    expect(countTasks(db)).toBe(2);
+    expect(countBindings(db)).toBe(2);
+
+    const bindings = db.select().from(taskIntakeBindings).all();
+    expect(new Set(bindings.map((b) => b.projectId))).toEqual(
+      new Set([PROJECT_ID, SECOND_PROJECT_ID]),
+    );
+    expect(new Set(bindings.map((b) => b.principalId))).toEqual(new Set(["relay-svc"]));
+
+    // Stable per-project replay: each project's identical body returns its
+    // own original; the shared requestId across projects never collides.
+    const replayFirst = createTaskWithIntakeBinding(creationInput({ projectId: PROJECT_ID }), inFirst);
+    const replaySecond = createTaskWithIntakeBinding(
+      creationInput({ projectId: SECOND_PROJECT_ID }),
+      inSecond,
+    );
+    expect(replayFirst?.outcome).toBe("replayed");
+    expect(replaySecond?.outcome).toBe("replayed");
+    if (replayFirst?.outcome !== "replayed" || replaySecond?.outcome !== "replayed") {
+      throw new Error("expected both replays");
+    }
+    expect(replayFirst.task?.id).toBe(first.task.id);
+    expect(replaySecond.task?.id).toBe(second.task.id);
+    expect(countTasks(db)).toBe(2);
+    expect(countBindings(db)).toBe(2);
+  });
+});

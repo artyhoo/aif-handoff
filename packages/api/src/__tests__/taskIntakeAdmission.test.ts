@@ -1253,3 +1253,150 @@ describe("POST /tasks keyed replay after mutable creation-only configuration cha
     expect(mockBroadcast).not.toHaveBeenCalled();
   });
 });
+
+describe("POST /tasks keyed replay isolation across principals and projects (R8 — finding 252035188273)", () => {
+  // Acceptance proof for the IDENTITY dimensions of the dedup key
+  // (`principalKind|principalId|projectId|requestId`): the code composes the
+  // key from the API-VERIFIED session principal (never a client-claimed
+  // field) and the body's project, so a byte-identical payload with the SAME
+  // requestId from two simultaneously valid principals must admit two
+  // distinct canonical tasks, and one principal's same requestId across two
+  // real projects must admit two distinct originals. These cases pin the
+  // isolation contract that a regression dropping principalId/projectId from
+  // the composition — or sourcing the principal from the body — would break
+  // (another principal's task returned over a 200 replay is an authenticated
+  // info leak). Roles/global authorization are unchanged: ordinary member
+  // sessions, no per-project ACL invented, no client identity trusted.
+  const ISOLATION_SECOND_PROJECT = "00000000-0000-4000-8000-000000000002";
+
+  function insertSecondProject() {
+    testDb.current
+      .insert(projects)
+      .values({
+        id: ISOLATION_SECOND_PROJECT,
+        name: "Intake Second",
+        rootPath: "/tmp/intake-project-second",
+      })
+      .run();
+  }
+
+  function bindingRows() {
+    return testDb.current.select().from(taskIntakeBindings).all();
+  }
+
+  it("two simultaneously valid principals, byte-identical payload, same requestId: two admissions, distinct tasks, each replay returns only its own original", async () => {
+    const alice = await createAuthenticatedParticipant("member");
+    const bob = await createAuthenticatedParticipant("member");
+    const app = createApp();
+    // BYTE-IDENTICAL body for both principals — same projectId, same title,
+    // same intake.requestId. Only the VERIFIED session differs.
+    const payload = JSON.stringify(keyedBody());
+
+    const first = await app.request("/tasks", {
+      method: "POST",
+      headers: authHeaders(alice.session, true),
+      body: payload,
+    });
+    const second = await app.request("/tasks", {
+      method: "POST",
+      headers: authHeaders(bob.session, true),
+      body: payload,
+    });
+
+    expect(first.status).toBe(201);
+    expect(second.status).toBe(201);
+    const firstTask = (await first.json()) as { id: string };
+    const secondTask = (await second.json()) as { id: string };
+    expect(firstTask.id).not.toBe(secondTask.id);
+
+    // Exactly two tasks and two bindings; the bindings differ ONLY by the
+    // server-derived principal — same requestId, same project.
+    expect(countTasks()).toBe(2);
+    expect(countBindings()).toBe(2);
+    const bindings = bindingRows();
+    expect(bindings.map((b) => b.requestId)).toEqual([REQUEST_ID, REQUEST_ID]);
+    expect(new Set(bindings.map((b) => b.principalId))).toEqual(
+      new Set([alice.participant.id, bob.participant.id]),
+    );
+    expect(bindings.map((b) => b.taskId).sort()).toEqual([firstTask.id, secondTask.id].sort());
+
+    // Each principal's identical replay resolves ONLY its own original task
+    // (200 replay, no restart, no new row) — never the other principal's.
+    const replayAlice = await app.request("/tasks", {
+      method: "POST",
+      headers: authHeaders(alice.session, true),
+      body: payload,
+    });
+    expect(replayAlice.status).toBe(200);
+    expect(((await replayAlice.json()) as { id: string }).id).toBe(firstTask.id);
+    const replayBob = await app.request("/tasks", {
+      method: "POST",
+      headers: authHeaders(bob.session, true),
+      body: payload,
+    });
+    expect(replayBob.status).toBe(200);
+    expect(((await replayBob.json()) as { id: string }).id).toBe(secondTask.id);
+
+    expect(countTasks()).toBe(2);
+    expect(countBindings()).toBe(2);
+    // Replays are quiet: no new broadcasts after the two creations.
+    expect(broadcastsOfType("task:created")).toHaveLength(2);
+  });
+
+  it("one principal, same requestId, two real projects: distinct originals, then stable per-project replay", async () => {
+    insertSecondProject();
+    const principal = await createAuthenticatedParticipant("member");
+    const app = createApp();
+    const payloadFirst = JSON.stringify(keyedBody());
+    const payloadSecond = JSON.stringify(keyedBody({ projectId: ISOLATION_SECOND_PROJECT }));
+
+    const first = await app.request("/tasks", {
+      method: "POST",
+      headers: authHeaders(principal.session, true),
+      body: payloadFirst,
+    });
+    const second = await app.request("/tasks", {
+      method: "POST",
+      headers: authHeaders(principal.session, true),
+      body: payloadSecond,
+    });
+
+    expect(first.status).toBe(201);
+    expect(second.status).toBe(201);
+    const firstTask = (await first.json()) as { id: string };
+    const secondTask = (await second.json()) as { id: string };
+    expect(firstTask.id).not.toBe(secondTask.id);
+    expect(countTasks()).toBe(2);
+    expect(countBindings()).toBe(2);
+
+    const bindings = bindingRows();
+    expect(new Set(bindings.map((b) => b.projectId))).toEqual(
+      new Set([PROJECT_ID, ISOLATION_SECOND_PROJECT]),
+    );
+    expect(bindings.map((b) => b.requestId)).toEqual([REQUEST_ID, REQUEST_ID]);
+    expect(bindings.map((b) => b.principalId)).toEqual([
+      principal.participant.id,
+      principal.participant.id,
+    ]);
+
+    // Stable per-project replay: each project's identical body returns its
+    // own original — the shared requestId across projects never collides.
+    const replayFirst = await app.request("/tasks", {
+      method: "POST",
+      headers: authHeaders(principal.session, true),
+      body: payloadFirst,
+    });
+    expect(replayFirst.status).toBe(200);
+    expect(((await replayFirst.json()) as { id: string }).id).toBe(firstTask.id);
+    const replaySecond = await app.request("/tasks", {
+      method: "POST",
+      headers: authHeaders(principal.session, true),
+      body: payloadSecond,
+    });
+    expect(replaySecond.status).toBe(200);
+    expect(((await replaySecond.json()) as { id: string }).id).toBe(secondTask.id);
+
+    expect(countTasks()).toBe(2);
+    expect(countBindings()).toBe(2);
+  });
+});

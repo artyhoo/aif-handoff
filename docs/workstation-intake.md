@@ -20,6 +20,13 @@ the `task_intake_bindings` row committed atomically with task admission
 > requires owner-installed credentials and wiring (participant session,
 > reverse forward, host amendments) that this repository does not ship or
 > enroll. Until those are applied and reviewed, the relay only retains.
+> Enabling `deliver` mode later is lossless for already-accepted work: the
+> deliver-mode startup promotes every durably retained envelope back to
+> `pending` (receipt `promoted_from_retained`) and delivers it exactly once
+> through the normal keyed path — no resubmission, no operator resume. A
+> retain-only restart stays retain-only (zero network, zero wake), and a
+> promotion the spool byte bound refuses is surfaced truthfully at startup
+> with the accepted record preserved as-is.
 
 ## Identity chain (who is allowed to submit)
 
@@ -123,6 +130,13 @@ node relay.mjs resume --all
 
 Envelope lifecycle and HOLD semantics:
 
+- `retained → pending` happens automatically at the next deliver-mode start
+  (the `promoted_from_retained` receipt is appended; identity, digest, payload
+  and all earlier receipts are preserved). A retain-only restart never
+  promotes. If the spool byte bound cannot hold the promoted record, the
+  refusal is surfaced at startup (`promotionRefused`) and the accepted record
+  stays exactly as it was — never lost, never delivered from the inhibited
+  state.
 - `pending → admitted` on a `201/200` admission receipt; **`completed` only on
   pickup evidence** (authenticated `GET /tasks/:id` polling shows the task
   left `backlog`, holds a live lock, or reached a terminal status). Delivery

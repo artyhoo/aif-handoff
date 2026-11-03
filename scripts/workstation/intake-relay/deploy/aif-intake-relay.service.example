@@ -43,8 +43,14 @@ EnvironmentFile=<install-dir>/deploy/config.env
 # Supervisor-owned stale-socket cleanup (see contract above): runs only after
 # the previous instance of THIS unit is reaped. `-` ignores a missing path.
 ExecStartPre=-/bin/rm -f <state-dir>/aif-intake-relay/relay.sock
-# The spool and state directories are created by the relay with 0750; assert
-# the expected ownership without ever chown-ing across owners from the unit.
+# The relay ENFORCES its private filesystem boundary in source (R8): spool
+# and state directories are created and kept no broader than 0750 and all
+# payload-bearing durable files (record temps, records, fence markers) are
+# created 0600 — independent of this unit's UMask, which stays as
+# defense-in-depth for anything else the service may touch.
+UMask=0077
+# Assert the expected state directory exists without ever chown-ing across
+# owners from the unit.
 ExecStartPre=/usr/bin/test -d <state-dir>/aif-intake-relay
 
 ExecStart=<node-bin> <install-dir>/scripts/workstation/intake-relay/relay.mjs

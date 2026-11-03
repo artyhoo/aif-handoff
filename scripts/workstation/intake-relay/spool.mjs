@@ -13,11 +13,18 @@
 //   any delivery-capable state → hold_auth_config | hold_api_compat |
 //                                hold_operator_fence | hold_handover_unconfirmed
 // `retained` is the honest deliver-mode-waiting state of a receipt issued in
-// retain-only mode (delivery pending: transport not configured).
+// retain-only mode (delivery pending: transport not configured). It becomes
+// deliverable through the restart-scan promotion (R8): when the relay starts
+// in deliver mode, previously accepted retained envelopes are promoted to
+// `pending` through this same durable bounded transition — exactly once,
+// with all original receipts preserved — so enabling delivery after owner
+// review never strands accepted work.
 
 import {
+  chmodSync,
   closeSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readdirSync,
@@ -47,11 +54,66 @@ export const SPOOL_STATES = [
 
 const TEMP_PREFIX = ".tmp-";
 
+/**
+ * Private-filesystem boundary (R8 — finding f83f7699ae43): spool records hold
+ * full client payloads, principal identities and request IDs, so their
+ * privacy is enforced IN SOURCE, independently of the deployment umask or any
+ * systemd UMask (which remains defense-in-depth). Durable payload-bearing
+ * files (record temps, records, fence markers) are created owner-only `0600`;
+ * relay-owned directories are created and kept no broader than `0750`.
+ */
+export const PRIVATE_DIR_MODE = 0o750;
+export const PRIVATE_FILE_MODE = 0o600;
+
 export class SpoolError extends Error {
   constructor(code, message) {
     super(message);
     this.name = "SpoolError";
     this.code = code;
+  }
+}
+
+/**
+ * Tighten a relay-owned directory to no broader than `PRIVATE_DIR_MODE`
+ * WITHOUT ever widening an already-stricter safe mode (e.g. 0700 stays 0700).
+ * Only the named directory is touched — never a recursive chmod of
+ * unrelated/foreign state — and a symlinked path is REFUSED (fail closed)
+ * rather than followed outside the owned tree. A denied enforcement operation
+ * throws `permission_enforcement_failed` so the caller fails closed before
+ * any acceptance or mutation (a native permission failure can therefore never
+ * produce a successful acceptance receipt).
+ */
+export function enforceOwnedPrivateDir(dirPath) {
+  let stats;
+  try {
+    stats = lstatSync(dirPath);
+  } catch (error) {
+    throw new SpoolError(
+      "spool_dir_unavailable",
+      `relay directory ${dirPath} is unavailable: ${error.message}`,
+    );
+  }
+  if (stats.isSymbolicLink()) {
+    throw new SpoolError(
+      "spool_symlink_refused",
+      `relay directory ${dirPath} is a symlink — refusing to follow it outside the owned tree`,
+    );
+  }
+  if (!stats.isDirectory()) {
+    throw new SpoolError("spool_dir_unavailable", `relay path ${dirPath} is not a directory`);
+  }
+  const mode = stats.mode & 0o777;
+  // Broader than 0750 = group-write, or ANY access for other. Stricter safe
+  // modes (0700, 0500, …) are preserved untouched.
+  if ((mode & 0o027) !== 0) {
+    try {
+      chmodSync(dirPath, PRIVATE_DIR_MODE);
+    } catch (error) {
+      throw new SpoolError(
+        "permission_enforcement_failed",
+        `cannot tighten relay directory ${dirPath} to 0${PRIVATE_DIR_MODE.toString(8)}: ${error.message}`,
+      );
+    }
   }
 }
 
@@ -73,7 +135,18 @@ function writeFileDurable(filePath, data) {
     dirnameOf(filePath),
     `${TEMP_PREFIX}${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.tmp`,
   );
-  const fd = openSync(tmpPath, "wx"); // O_EXCL — unique name, never clobbers
+  // Private-filesystem boundary (R8 — finding f83f7699ae43): the durable file
+  // is created owner-only `0600` EXPLICITLY — never left to the process
+  // umask. An existing destination that is already stricter-safe (e.g. 0400)
+  // keeps its mode: the atomic rename must not widen it.
+  let fileMode = PRIVATE_FILE_MODE;
+  try {
+    const existing = statSync(filePath).mode & 0o777;
+    if ((existing & ~PRIVATE_FILE_MODE) === 0) fileMode = existing;
+  } catch {
+    // New file — create at PRIVATE_FILE_MODE.
+  }
+  const fd = openSync(tmpPath, "wx", fileMode); // O_EXCL — unique name, never clobbers
   try {
     writeSync(fd, data);
     fsyncSync(fd);
@@ -98,8 +171,16 @@ export function createSpool({
   create = true,
 }) {
   // Read-only consumers (`--status`) pass `create:false`: observing the spool
-  // must never create it on a fresh host (independent-review repair).
-  if (create) mkdirSync(dir, { recursive: true });
+  // must never create it on a fresh host, and never chmod/repairs an existing
+  // one — no creation, no mode change, no fixup (R8; independent-review
+  // repair). Mutating consumers create the directory no broader than 0750 and
+  // enforce that boundary explicitly (mkdir mode alone is umask-masked), so
+  // existing owned-but-unsafe state is tightened — or the failure surfaces
+  // truthfully — BEFORE any acceptance or mutation (R8).
+  if (create) {
+    mkdirSync(dir, { recursive: true, mode: PRIVATE_DIR_MODE });
+    enforceOwnedPrivateDir(dir);
+  }
 
   function envelopePath(id) {
     return join(dir, `${id}.json`);
@@ -294,12 +375,28 @@ export function createSpool({
    * admission POST is never replayed from this state; the handover watch and
    * operator resume reconcile it idempotently) — no receipt is invented, no
    * bytes are corrupted, and startup is never blocked by a full spool.
+   *
+   * Deliver-mode promotion (R8 — finding 230ed4d58111): with
+   * `{ promoteRetained: true }`, previously accepted retain-only envelopes
+   * (`state === "retained"`) are promoted to `pending` through this same
+   * durable bounded transition — the documented retain-first bootstrap
+   * ("accept while fail-closed, enable delivery after owner review") must
+   * deliver the already-accepted work automatically and exactly once, never
+   * strand it. The promotion appends one receipt; identity, digest, payload
+   * and all original receipts are preserved verbatim. A retain-only scan
+   * (the default) NEVER promotes. A promotion the byte bound refuses is
+   * reported in `promotionRefused` with the on-disk record preserved AS-IS —
+   * never lost, never delivered from the inhibited state (a `retained`
+   * record is not a delivery candidate, so the next successful promotion
+   * reconciles it).
    */
-  function restartScan() {
+  function restartScan({ promoteRetained = false } = {}) {
     const discardedTemps = [];
     const rePended = [];
     const corrupted = [];
     const boundRefused = [];
+    const promoted = [];
+    const promotionRefused = [];
     for (const entry of readdirSync(dir)) {
       if (entry.startsWith(TEMP_PREFIX)) {
         unlinkSync(join(dir, entry));
@@ -344,9 +441,35 @@ export function createSpool({
           }
           throw error;
         }
+      } else if (promoteRetained && record.state === "retained") {
+        // Deliver mode is now configured (R8): re-queue the already-accepted
+        // retain-only work through the same durable bounded transition — no
+        // resubmission, no operator resume, exactly one promotion receipt.
+        record.state = "pending";
+        record.deliveryPending = false;
+        record.holdReason = null;
+        record.receipts.push({
+          kind: "promoted_from_retained",
+          at: now(),
+          note: "deliver mode configured: retained work re-queued for delivery",
+        });
+        try {
+          writeEnvelope(record);
+          promoted.push(record.id);
+        } catch (error) {
+          if (error instanceof SpoolError && error.code === "spool_full_bytes") {
+            // Capacity prevents persisting the promotion — the accepted
+            // record stays durable exactly as it was (R4: never corrupt or
+            // evict accepted work to record bookkeeping), and it is NOT
+            // delivered from the inhibited state.
+            promotionRefused.push(record.id);
+            continue;
+          }
+          throw error;
+        }
       }
     }
-    return { discardedTemps, rePended, corrupted, boundRefused };
+    return { discardedTemps, rePended, corrupted, boundRefused, promoted, promotionRefused };
   }
 
   return { dir, writerReceive, list, get, updateState, restartScan, stats, envelopePath };

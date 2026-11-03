@@ -287,6 +287,15 @@ function countBindings() {
   return testDb.current.select().from(taskIntakeBindings).all().length;
 }
 
+async function waitFor(cond: () => boolean, timeoutMs = 15_000, stepMs = 25): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (cond()) return true;
+    await new Promise((resolve) => setTimeout(resolve, stepMs));
+  }
+  return cond();
+}
+
 interface PostedIntakeBody {
   projectId: string;
   intake?: { requestId: string };
@@ -549,6 +558,105 @@ describe("relay ↔ API authenticated compat composition (rework R2)", () => {
     } finally {
       await heldDeliverer.stop();
       writer.close();
+      await api.close();
+    }
+  });
+
+  // R8 rework — finding 230ed4d58111: the documented retain-first bootstrap
+  // ("accept while fail-closed retain-only, enable delivery after owner
+  // review") used to strand every pre-switch envelope forever — no code path
+  // made a `retained` record a delivery candidate. This composition proof
+  // drives the REAL deliver-mode startup (start() → restartScan promotion →
+  // compat probe → keyed POST → binding) over real loopback HTTP against the
+  // REAL API on file-backed durable retained state, asserting the ACTUAL task
+  // identity and counts, and proving a true replay restart cannot create a
+  // second task.
+  it("promotes durable retain-only work to exactly one canonical task when deliver mode is enabled; a true replay restart cannot create a second task", async () => {
+    const api = await startComposedApp();
+    const dir = mkdtempSync(join(tmpdir(), "relay-composition-"));
+    tmpDirs.push(dir);
+    const { session } = await createAuthenticatedParticipant("member");
+    // Phase 1 — retain-only acceptance (real writer IPC, real durable file):
+    // the envelope is accepted while the relay is still fail-closed.
+    const retainConfig = relayConfig(dir, api.url, { mode: "retain-only" });
+    const spool = makeSpool(retainConfig);
+    const writer = await startWriter(retainConfig, spool);
+    const envelope = sealCompositionEnvelope();
+    await retainViaWriter(retainConfig, envelope);
+    const retained = spool.list().find((r: any) => r.dedupKey === envelope.dedupKey);
+    expect(retained.state).toBe("retained");
+    writer.close();
+
+    // Phase 2 — the owner enables deliver mode: a REAL deliverer in deliver
+    // mode starts over the SAME durable spool state.
+    const deliverConfig = relayConfig(dir, api.url, {
+      sessionToken: session.token,
+      csrfToken: session.csrfToken,
+    });
+    const wake = recordingWake();
+    const deliverer = (createDeliverer as any)({
+      config: deliverConfig,
+      spool: makeSpool(deliverConfig),
+      wake: wake.engine,
+    });
+    const identity = {
+      requestId: envelope.requestId as string,
+      dedupKey: envelope.dedupKey as string,
+      digest: envelope.digest as string,
+    };
+    try {
+      deliverer.start();
+      expect(
+        await waitFor(() => {
+          const record = spool.list().find((r: any) => r.dedupKey === identity.dedupKey);
+          return record?.state === "admitted" || record?.state === "completed";
+        }),
+      ).toBe(true);
+      await deliverer.stop();
+
+      // Exactly one keyed POST ever → exactly one canonical task and one
+      // binding, with the envelope identity preserved end-to-end.
+      expect(api.postTaskBodies).toHaveLength(1);
+      expect(countTasks()).toBe(1);
+      expect(countBindings()).toBe(1);
+      const taskRows = testDb.current.select().from(tasks).all();
+      const bindings = testDb.current.select().from(taskIntakeBindings).all();
+      expect(bindings[0].requestId).toBe(identity.requestId);
+      expect(bindings[0].payloadDigest).toBe(identity.digest);
+      expect(bindings[0].taskId).toBe(taskRows[0].id);
+      const promoted = spool.list().find((r: any) => r.dedupKey === identity.dedupKey);
+      const kinds = (promoted.receipts as Array<{ kind: string }>).map((r) => r.kind);
+      expect(kinds).toContain("promoted_from_retained");
+      expect(kinds).toContain("admitted");
+      expect(promoted.taskId).toBe(taskRows[0].id);
+      expect(promoted.requestId).toBe(identity.requestId);
+      expect(promoted.digest).toBe(identity.digest);
+      // The PC answered the POST — no pointless wake fired for the promotion.
+      expect(wake.triggers).toEqual([]);
+
+      // Phase 3 — a true restart in deliver mode re-POSTs the byte-identical
+      // body; the REAL keyed admission resolves it as a replay of the SAME
+      // original task. No second task, no second binding, no new record.
+      const replayDeliverer = (createDeliverer as any)({
+        config: deliverConfig,
+        spool: makeSpool(deliverConfig),
+        wake: wake.engine,
+      });
+      replayDeliverer.start();
+      expect(await waitFor(() => api.postTaskBodies.length >= 2)).toBe(true);
+      await replayDeliverer.stop();
+      expect(api.postTaskBodies).toHaveLength(2);
+      expect(api.postTaskBodies[1]).toBe(api.postTaskBodies[0]);
+      expect(countTasks()).toBe(1);
+      expect(countBindings()).toBe(1);
+      const replayedBindings = testDb.current.select().from(taskIntakeBindings).all();
+      expect(replayedBindings).toHaveLength(1);
+      expect(replayedBindings[0].taskId).toBe(taskRows[0].id);
+      expect(replayedBindings[0].requestId).toBe(identity.requestId);
+      expect(replayedBindings[0].payloadDigest).toBe(identity.digest);
+      expect(spool.list().filter((r: any) => r.dedupKey === identity.dedupKey)).toHaveLength(1);
+    } finally {
+      await deliverer.stop();
       await api.close();
     }
   });

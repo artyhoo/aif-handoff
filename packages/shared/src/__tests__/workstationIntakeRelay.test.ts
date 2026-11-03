@@ -22,7 +22,7 @@ import {
 import { connect, createServer as createNetServer } from "node:net";
 import { createServer as createHttpServer } from "node:http";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -85,6 +85,8 @@ const VECTORS = JSON.parse(
 
 const fsLog: Array<{ op: string; path?: string }> = [];
 let fsRecording = false;
+/** Paths whose chmodSync calls are denied (R8 fault injection — armed per test). */
+const chmodDeny = new Set<string>();
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
   return {
@@ -96,6 +98,17 @@ vi.mock("node:fs", async (importOriginal) => {
     renameSync: (from: string, to: string) => {
       if (fsRecording) fsLog.push({ op: "rename", path: to });
       return (actual.renameSync as (from: string, to: string) => void)(from, to);
+    },
+    chmodSync: (path: import("node:fs").PathLike, mode: number) => {
+      if (chmodDeny.has(String(path))) {
+        const error = new Error(
+          `EACCES: permission denied, chmod '${String(path)}'`,
+        ) as NodeJS.ErrnoException;
+        error.code = "EACCES";
+        error.errno = -13;
+        throw error;
+      }
+      return (actual.chmodSync as (p: import("node:fs").PathLike, m: number) => void)(path, mode);
     },
   };
 });
@@ -124,6 +137,7 @@ function makeTmpDir(): string {
 afterEach(() => {
   fsRecording = false;
   fsLog.length = 0;
+  chmodDeny.clear();
   while (tmpDirs.length > 0) {
     const dir = tmpDirs.pop();
     if (dir) rmSync(dir, { recursive: true, force: true });
@@ -2971,5 +2985,646 @@ describe("byte-preserving Unicode intake (R5 rework — finding 423c1656968f)", 
     // delivery arose (retain-only: zero network calls by contract).
     expect(realFs.readFileSync(path).equals(bytesBefore)).toBe(true);
     expect(tight.get(record.id).state).toBe("admitted");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Retained → deliver promotion (R8 rework — finding 230ed4d58111)
+//
+// The documented bootstrap flow ("retain first in retain-only mode, enable
+// deliver after owner review") used to strand every pre-switch envelope
+// forever: `writerReceive` in retain-only mode records state `retained` with
+// an honest "delivery pending" receipt, but no surface ever made a `retained`
+// record deliverable — DELIVERY_CAPABLE_STATES excluded it, restartScan only
+// reconciled `admitted`, and the operator resume op only covered explicit
+// auth/handover holds. These regressions pin the repair: the deliver-mode
+// startup reconciliation promotes durable retained envelopes to `pending`
+// through the SAME durable bounded state transition, automatically, exactly
+// once, with identity/digest/payload and all original receipts preserved; a
+// retain-only restart stays retain-only with zero POST/wake; a promotion the
+// storage bounds refuse is reported truthfully with the accepted bytes
+// preserved as-is (never lost, never falsely delivered).
+// ---------------------------------------------------------------------------
+
+describe("retained → deliver promotion (R8 rework — finding 230ed4d58111)", () => {
+  function recordingWake() {
+    const triggers: string[] = [];
+    return {
+      triggers,
+      engine: {
+        trigger: async (reason: string) => {
+          triggers.push(reason);
+          return { fired: true, attempts: 1, reason };
+        },
+        reset: () => {},
+        status: () => ({}),
+      },
+    };
+  }
+
+  function retainRetainedRecord(dir: string) {
+    // Phase 1 — the owner's documented bootstrap: accept work while the relay
+    // is still in fail-closed retain-only mode (real durable write).
+    const retainConfig = baseConfig(dir, { mode: "retain-only" });
+    const retainSpool = createSpool({
+      dir: retainConfig.spoolDir,
+      maxEnvelopes: 10,
+      maxBytes: 1024 * 1024,
+    });
+    const envelope = sealTestEnvelope();
+    const retained = retainSpool.writerReceive(envelope, { mode: "retain-only" });
+    expect(retained.state).toBe("retained");
+    expect(retained.receipts.some((entry: { kind: string }) => entry.kind === "retention")).toBe(
+      true,
+    );
+    return { envelope, record: retained as { id: string; receipts: Array<{ kind: string }> } };
+  }
+
+  it("promotes a durable retained envelope through the restart scan when deliver mode is configured", () => {
+    const dir = makeTmpDir();
+    const { envelope, record } = retainRetainedRecord(dir);
+    const receiptsBefore = record.receipts.map((entry) => entry.kind);
+
+    // Phase 2 — owner enables deliver mode; the relay restarts into deliver
+    // mode over the SAME durable spool state.
+    const deliverConfig = baseConfig(dir, { mode: "deliver" });
+    const deliverSpool = createSpool({
+      dir: deliverConfig.spoolDir,
+      maxEnvelopes: 10,
+      maxBytes: 1024 * 1024,
+    });
+    const scan = deliverSpool.restartScan({ promoteRetained: true });
+    expect(scan.promoted).toEqual([record.id]);
+    expect(scan.promotionRefused).toEqual([]);
+
+    const promoted = deliverSpool.get(record.id);
+    // The accepted envelope is now a delivery candidate through the SAME
+    // durable bounded transition — identity, digest, payload, and ALL
+    // original receipts preserved verbatim (append-only receipt history).
+    expect(promoted.state).toBe("pending");
+    expect(promoted.deliveryPending).toBe(false);
+    expect(promoted.dedupKey).toBe(envelope.dedupKey);
+    expect(promoted.requestId).toBe(envelope.requestId);
+    expect(promoted.digest).toBe(envelope.digest);
+    expect(promoted.body).toEqual(envelope.body);
+    expect(
+      promoted.receipts.slice(0, receiptsBefore.length).map((e: { kind: string }) => e.kind),
+    ).toEqual(receiptsBefore);
+    expect(promoted.receipts[receiptsBefore.length]?.kind).toBe("promoted_from_retained");
+    // Promotion does not invent admission or delivery evidence.
+    expect(promoted.taskId).toBeUndefined();
+    expect(promoted.attempts).toBe(0);
+  });
+
+  it("a retain-only restart stays retain-only: no promotion, no state change", () => {
+    const dir = makeTmpDir();
+    const { record } = retainRetainedRecord(dir);
+    const config = baseConfig(dir, { mode: "retain-only" });
+    const spool = createSpool({ dir: config.spoolDir, maxEnvelopes: 10, maxBytes: 1024 * 1024 });
+
+    // Default scan (the retain-only startup path) and an explicit false both
+    // leave the retained record exactly as accepted.
+    for (const options of [undefined, { promoteRetained: false }]) {
+      const scan = spool.restartScan(options as never);
+      expect(scan.promoted).toEqual([]);
+      expect(scan.promotionRefused).toEqual([]);
+      const after = spool.get(record.id);
+      expect(after.state).toBe("retained");
+      expect(after.deliveryPending).toBe(true);
+      expect(
+        after.receipts.some((entry: { kind: string }) => entry.kind === "promoted_from_retained"),
+      ).toBe(false);
+    }
+  });
+
+  it("a promotion inhibited at the byte bound is reported truthfully and the accepted record is preserved as-is", () => {
+    const dir = makeTmpDir();
+    const { record } = retainRetainedRecord(dir);
+    const config = baseConfig(dir, { mode: "retain-only" });
+    const path = join(config.spoolDir, `${record.id}.json`);
+    const bytesBefore = realFs.readFileSync(path);
+
+    // Reopen with a byte bound that cannot hold the promoted representation
+    // (the promotion receipt grows the durable record past the bound).
+    const totalBytes = spoolStats(config.spoolDir).bytes;
+    const tight = createSpool({ dir: config.spoolDir, maxEnvelopes: 10, maxBytes: totalBytes });
+    const scan = tight.restartScan({ promoteRetained: true });
+    expect(scan.promoted).toEqual([]);
+    expect(scan.promotionRefused).toEqual([record.id]);
+
+    // The accepted bytes/state/receipts survive exactly — the record is not
+    // lost and is NOT silently delivered from the inhibited state (it stays
+    // `retained`, a non-delivery-capable state).
+    expect(realFs.readFileSync(path).equals(bytesBefore)).toBe(true);
+    const after = tight.get(record.id);
+    expect(after.state).toBe("retained");
+    expect(
+      after.receipts.some((entry: { kind: string }) => entry.kind === "promoted_from_retained"),
+    ).toBe(false);
+    expect(spoolStats(config.spoolDir).temps).toBe(0);
+  });
+
+  it("starting the deliverer in deliver mode delivers previously retained work exactly once; a true replay restart cannot create a second task", async () => {
+    const dir = makeTmpDir();
+    const stub = await createStubServer({
+      postTasks: { status: 201, body: { id: "task-retained-1", status: "backlog" }, delayMs: 0 },
+    });
+    try {
+      const { record } = retainRetainedRecord(dir);
+      const deliverConfig = baseConfig(dir, {
+        mode: "deliver",
+        endpoint: stub.url,
+        cycleMs: 20,
+      });
+      const deliverSpool = createSpool({
+        dir: deliverConfig.spoolDir,
+        maxEnvelopes: 10,
+        maxBytes: 1024 * 1024,
+      });
+      const wake = recordingWake();
+      const deliverer = createDeliverer({
+        config: deliverConfig,
+        spool: deliverSpool,
+        wake: wake.engine,
+        fetchImpl: fetch,
+      });
+
+      // Phase 2 — the REAL startup path: promotion at start(), then delivery.
+      deliverer.start();
+      try {
+        expect(await waitFor(() => deliverSpool.get(record.id)?.state === "admitted", 10_000)).toBe(
+          true,
+        );
+      } finally {
+        await deliverer.stop();
+      }
+      const delivered = deliverSpool.get(record.id);
+      const kinds = delivered.receipts.map((entry: { kind: string }) => entry.kind);
+      expect(kinds).toContain("promoted_from_retained");
+      expect(kinds).toContain("admitted");
+      expect(delivered.taskId).toBe("task-retained-1");
+      expect(stub.counters.postTasks).toBe(1);
+      expect(stub.capturedBodies[0]).toBe(
+        JSON.stringify({ ...delivered.body, intake: { requestId: delivered.requestId } }),
+      );
+      // The PC answered the POST — no pointless wake fired for the promotion.
+      expect(wake.triggers).toEqual([]);
+
+      // Phase 3 — a true restart/replay in deliver mode re-POSTs the
+      // byte-identical body (idempotent by binding at the API) and can never
+      // grow the spool into a second task/record. The stub answers the replay
+      // with 200 + the original task id, exactly what the real API returns.
+      stub.config.postTasks = {
+        status: 200,
+        body: { id: "task-retained-1", status: "backlog" },
+        delayMs: 0,
+      };
+      const replaySpool = createSpool({
+        dir: deliverConfig.spoolDir,
+        maxEnvelopes: 10,
+        maxBytes: 1024 * 1024,
+      });
+      const replayDeliverer = createDeliverer({
+        config: deliverConfig,
+        spool: replaySpool,
+        wake: wake.engine,
+        fetchImpl: fetch,
+      });
+      replayDeliverer.start();
+      try {
+        expect(await waitFor(() => stub.counters.postTasks >= 2, 10_000)).toBe(true);
+      } finally {
+        await replayDeliverer.stop();
+      }
+      expect(stub.counters.postTasks).toBe(2);
+      expect(stub.capturedBodies[1]).toBe(stub.capturedBodies[0]);
+      // Exactly one durable record — the replay resolved into the SAME
+      // admitted envelope, never a second retained/pending record.
+      expect(spoolStats(deliverConfig.spoolDir).count).toBe(1);
+      expect(deliverSpool.get(record.id).state).toBe("admitted");
+    } finally {
+      await stub.close();
+    }
+  }, 30_000);
+
+  it("a retain-only restart keeps retained envelopes with zero POST and zero wake", async () => {
+    const dir = makeTmpDir();
+    const stub = await createStubServer({});
+    try {
+      const { record } = retainRetainedRecord(dir);
+      const config = baseConfig(dir, { mode: "retain-only", endpoint: stub.url, cycleMs: 20 });
+      const spool = createSpool({ dir: config.spoolDir, maxEnvelopes: 10, maxBytes: 1024 * 1024 });
+      const wake = recordingWake();
+      const deliverer = createDeliverer({ config, spool, wake: wake.engine, fetchImpl: fetch });
+      deliverer.start();
+      // Let several cycles run; then stop and prove the network was untouched.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      await deliverer.stop();
+
+      expect(stub.counters.agentStatus).toBe(0);
+      expect(stub.counters.postTasks).toBe(0);
+      expect(stub.counters.getTask).toBe(0);
+      expect(wake.triggers).toEqual([]);
+      const after = spool.get(record.id);
+      expect(after.state).toBe("retained");
+      expect(
+        after.receipts.some((entry: { kind: string }) => entry.kind === "promoted_from_retained"),
+      ).toBe(false);
+    } finally {
+      await stub.close();
+    }
+  });
+
+  it("missing auth/config produces zero admission and zero wake from retained work, then delivers once when auth is restored", async () => {
+    const dir = makeTmpDir();
+    // Phase 2 with a BROKEN configuration: the deliverer is in deliver mode
+    // (so promotion at startup is legitimate) but the configured service
+    // session is invalid — the API answers the authenticated probe 401.
+    const stub = await createStubServer({
+      agentStatus: { status: 401, body: { code: "authentication_required" }, delayMs: 0 },
+    });
+    try {
+      const { envelope, record } = retainRetainedRecord(dir);
+      const brokenConfig = baseConfig(dir, {
+        mode: "deliver",
+        endpoint: stub.url,
+        cycleMs: 20,
+        sessionToken: "forged-session-token",
+        csrfToken: "forged-csrf-token",
+      });
+      const spool = createSpool({
+        dir: brokenConfig.spoolDir,
+        maxEnvelopes: 10,
+        maxBytes: 1024 * 1024,
+      });
+      const wake = recordingWake();
+      const broken = createDeliverer({
+        config: brokenConfig,
+        spool,
+        wake: wake.engine,
+        fetchImpl: fetch,
+      });
+      broken.start();
+      try {
+        expect(await waitFor(() => spool.get(record.id)?.state === "hold_api_compat", 10_000)).toBe(
+          true,
+        );
+      } finally {
+        await broken.stop();
+      }
+      const parked = spool.get(record.id);
+      const kinds = parked.receipts.map((entry: { kind: string }) => entry.kind);
+      // Promotion happened (deliver mode IS configured), but the broken auth
+      // fenced every POST: zero admission effects, zero wake.
+      expect(kinds).toContain("promoted_from_retained");
+      expect(kinds).toContain("parked_hold_api_compat");
+      expect(stub.counters.postTasks).toBe(0);
+      expect(stub.counters.getTask).toBe(0);
+      expect(wake.triggers).toEqual([]);
+      expect(parked.dedupKey).toBe(envelope.dedupKey);
+      expect(parked.digest).toBe(envelope.digest);
+
+      // Phase 3 — the owner completes the configuration (valid session): the
+      // SAME envelope auto-resumes from the mechanical hold and delivers
+      // exactly once, identity intact.
+      stub.config.agentStatus = { status: 200, body: { intakeCompat: 1 }, delayMs: 0 };
+      stub.config.postTasks = {
+        status: 201,
+        body: { id: "task-restored-1", status: "backlog" },
+        delayMs: 0,
+      };
+      const restored = createDeliverer({
+        config: brokenConfig,
+        spool,
+        wake: wake.engine,
+        fetchImpl: fetch,
+      });
+      restored.start();
+      try {
+        expect(await waitFor(() => spool.get(record.id)?.state === "admitted", 10_000)).toBe(true);
+      } finally {
+        await restored.stop();
+      }
+      expect(stub.counters.postTasks).toBe(1);
+      const final = spool.get(record.id);
+      expect(final.taskId).toBe("task-restored-1");
+      expect(final.requestId).toBe(envelope.requestId);
+      expect(final.digest).toBe(envelope.digest);
+      expect(spoolStats(brokenConfig.spoolDir).count).toBe(1);
+    } finally {
+      await stub.close();
+    }
+  }, 30_000);
+
+  it("an inhibited promotion at the bound through the REAL startup path reports refusal and delivers nothing", async () => {
+    const dir = makeTmpDir();
+    const stub = await createStubServer({});
+    try {
+      const { record } = retainRetainedRecord(dir);
+      const deliverConfig = baseConfig(dir, { mode: "deliver", endpoint: stub.url, cycleMs: 20 });
+      const bytesBefore = realFs.readFileSync(join(deliverConfig.spoolDir, `${record.id}.json`));
+      const totalBytes = spoolStats(deliverConfig.spoolDir).bytes;
+      const tight = createSpool({
+        dir: deliverConfig.spoolDir,
+        maxEnvelopes: 10,
+        maxBytes: totalBytes,
+      });
+      const logs: Array<{ payload: Record<string, unknown>; msg: string }> = [];
+      const deliverer = createDeliverer({
+        config: deliverConfig,
+        spool: tight,
+        wake: null,
+        fetchImpl: fetch,
+        log: (payload: Record<string, unknown>, msg: string) => logs.push({ payload, msg }),
+      });
+      deliverer.start();
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      await deliverer.stop();
+
+      const scanLog = logs.find(
+        (entry) => entry.msg === "restart scan reconciled spool state (§9.1)",
+      );
+      expect(scanLog).toBeDefined();
+      expect(scanLog?.payload.promotedFromRetained).toEqual([]);
+      expect(scanLog?.payload.promotionRefused).toEqual([record.id]);
+      // The accepted record is preserved as-is and was never delivered.
+      expect(
+        realFs.readFileSync(join(deliverConfig.spoolDir, `${record.id}.json`)).equals(bytesBefore),
+      ).toBe(true);
+      expect(tight.get(record.id).state).toBe("retained");
+      expect(stub.counters.postTasks).toBe(0);
+    } finally {
+      await stub.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Private filesystem boundary (R8 rework — finding f83f7699ae43)
+//
+// Spool records carry full client payloads, principal identities and request
+// IDs, but the spool directory was created with `mkdirSync(dir, {recursive:
+// true})` (no mode) and every durable record temp with `openSync(tmpPath,
+// "wx")` (no mode) — under a normal permissive umask that exposed full
+// request payloads as 0755/0644, while the shipped docs claimed 0750/0600.
+// These regressions pin the repair over REAL POSIX directories/files: the
+// mode-sensitive lifecycle runs in ISOLATED CHILD PROCESSES that set umask
+// 0o022 explicitly (the child's process setting never leaks into — or
+// depends on — the test runner's), and the parent asserts the ACTUAL stat
+// modes, content, and durable receipts across creation, later update,
+// restart scan, and the fence marker. Fault injection below (mocked EACCES
+// on chmodSync) is honestly labeled: it proves the fail-closed CONTRACT of a
+// denied permission-enforcement operation; it is NOT a real-kernel EACCES,
+// ENOSPC, or concurrency proof.
+// ---------------------------------------------------------------------------
+
+describe("private filesystem boundary (R8 rework — finding f83f7699ae43)", () => {
+  function octalMode(path: string): string {
+    return (realFs.statSync(path).mode & 0o777).toString(8);
+  }
+
+  /** Run a script in an isolated child that sets umask 0o022 FIRST. */
+  function runUmaskChild(script: string, timeoutMs = 30_000): Promise<ChildResult> {
+    return new Promise((resolve) => {
+      const child = spawn(process.execPath, ["-e", script], {
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (chunk: Buffer) => (stdout += chunk));
+      child.stderr.on("data", (chunk: Buffer) => (stderr += chunk));
+      const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
+      child.on("close", (code) => {
+        clearTimeout(timer);
+        resolve({ code, stdout, stderr });
+      });
+    });
+  }
+
+  function lifecycleChild(spoolDir: string, envelope: unknown, fencePath: string): string {
+    return `
+process.umask(0o022);
+(async () => {
+  const { createSpool } = await import(${JSON.stringify(RELAY_FILE("spool.mjs"))});
+  const { writeFence } = await import(${JSON.stringify(RELAY_FILE("deliverer.mjs"))});
+  const spool = createSpool({
+    dir: ${JSON.stringify(spoolDir)},
+    maxEnvelopes: 10,
+    maxBytes: 1024 * 1024,
+  });
+  const record = spool.writerReceive(JSON.parse(${JSON.stringify(JSON.stringify(envelope))}), {
+    mode: "retain-only",
+  });
+  // Later update + restart reconciliation — every durable write must keep the
+  // private boundary.
+  spool.updateState(record.id, { state: "pending" });
+  spool.restartScan();
+  writeFence(${JSON.stringify(fencePath)}, "r8-mode-check");
+  process.stdout.write(JSON.stringify({ ok: true, recordId: record.id }));
+})().catch((error) => {
+  console.error(String(error?.code ?? error?.message ?? error));
+  process.exit(1);
+});
+`;
+  }
+
+  it("creates spool dirs/records and fence markers owner-only under umask 022, across update/restart/fence, with content and receipts intact", async () => {
+    const dir = makeTmpDir();
+    const config = baseConfig(dir, { mode: "retain-only" });
+    const envelope = sealTestEnvelope();
+    const fencePath = join(dir, "state", "fence.active");
+    const child = await runUmaskChild(lifecycleChild(config.spoolDir, envelope, fencePath));
+    expect(child.code).toBe(0);
+    expect(child.stderr).toBe("");
+
+    // ACTUAL stat modes — enforced in source, independent of the umask 022
+    // the child set (which alone would leave 0755 dirs and 0644 files).
+    expect(octalMode(config.spoolDir)).toBe("750");
+    const recordPath = join(config.spoolDir, `${JSON.parse(child.stdout).recordId}.json`);
+    expect(octalMode(recordPath)).toBe("600");
+    expect(octalMode(fencePath)).toBe("600");
+    expect(octalMode(dirname(fencePath))).toBe("750");
+
+    // Durable content/receipts survived the lifecycle: retention receipt,
+    // the later update, restart scan, and the fence marker are all intact.
+    const record = JSON.parse(realFs.readFileSync(recordPath, "utf8"));
+    expect(record.state).toBe("pending");
+    expect(record.dedupKey).toBe(envelope.dedupKey);
+    expect(record.digest).toBe(envelope.digest);
+    expect(record.body).toEqual(envelope.body);
+    expect(record.receipts[0].kind).toBe("retention");
+    const fence = JSON.parse(realFs.readFileSync(fencePath, "utf8"));
+    expect(fence.reason).toBe("r8-mode-check");
+    expect(typeof fence.at).toBe("string");
+    // No temp remnants with relaxed modes.
+    expect(spoolStats(config.spoolDir).temps).toBe(0);
+  });
+
+  it("tightens existing owned-but-unsafe state (0755 dir / 0644 record) before mutation, preserving bytes and receipts", async () => {
+    const dir = makeTmpDir();
+    const spoolDir = join(dir, "spool");
+    // Simulate state written by the pre-R8 code under a permissive umask:
+    // a world-readable directory and a group/world-readable record file.
+    realFs.mkdirSync(spoolDir, { recursive: true });
+    realFs.chmodSync(spoolDir, 0o755);
+    const scratch = createSpool({
+      dir: join(dir, "scratch-spool"),
+      maxEnvelopes: 10,
+      maxBytes: 1024 * 1024,
+    });
+    const envelope = sealTestEnvelope();
+    const seeded = scratch.writerReceive(envelope, { mode: "retain-only" });
+    const seededBytes = realFs.readFileSync(join(dir, "scratch-spool", `${seeded.id}.json`));
+    realFs.writeFileSync(join(spoolDir, `${seeded.id}.json`), seededBytes);
+    realFs.chmodSync(join(spoolDir, `${seeded.id}.json`), 0o644);
+    expect(octalMode(spoolDir)).toBe("755");
+    expect(octalMode(join(spoolDir, `${seeded.id}.json`))).toBe("644");
+
+    // A mutating spool consumer tightens the owned state BEFORE any further
+    // acceptance/mutation — the failing direction is a truthful refusal, not
+    // a silent continue at 0755/0644.
+    const tightened = createSpool({ dir: spoolDir, maxEnvelopes: 10, maxBytes: 1024 * 1024 });
+    expect(octalMode(spoolDir)).toBe("750");
+
+    // A later update re-installs the record through a 0600 temp rename: the
+    // previously 0644 record is tightened, its bytes/receipts preserved.
+    tightened.updateState(seeded.id, { state: "pending" });
+    const recordPath = join(spoolDir, `${seeded.id}.json`);
+    expect(octalMode(recordPath)).toBe("600");
+    const record = JSON.parse(realFs.readFileSync(recordPath, "utf8"));
+    expect(record.state).toBe("pending");
+    expect(record.dedupKey).toBe(envelope.dedupKey);
+    expect(record.digest).toBe(envelope.digest);
+    expect(record.body).toEqual(envelope.body);
+    expect(record.receipts[0].kind).toBe("retention");
+    expect(record.receipts.at(-1).kind).toBe("retention");
+  });
+
+  it("never widens an already-stricter safe directory or file mode", async () => {
+    const dir = makeTmpDir();
+    const spoolDir = join(dir, "spool");
+    realFs.mkdirSync(spoolDir, { recursive: true });
+    realFs.chmodSync(spoolDir, 0o700);
+    const scratch = createSpool({
+      dir: join(dir, "scratch-spool"),
+      maxEnvelopes: 10,
+      maxBytes: 1024 * 1024,
+    });
+    const envelopeA = sealTestEnvelope({ clientRequestId: "strict-600" });
+    const envelopeB = sealTestEnvelope({ clientRequestId: "strict-400" });
+    const seededA = scratch.writerReceive(envelopeA, { mode: "retain-only" });
+    const seededB = scratch.writerReceive(envelopeB, { mode: "retain-only" });
+    for (const [seeded, mode] of [
+      [seededA, 0o600],
+      [seededB, 0o400],
+    ] as const) {
+      const destination = join(spoolDir, `${seeded.id}.json`);
+      realFs.writeFileSync(
+        destination,
+        realFs.readFileSync(join(dir, "scratch-spool", `${seeded.id}.json`)),
+      );
+      realFs.chmodSync(destination, mode);
+    }
+
+    const spool = createSpool({ dir: spoolDir, maxEnvelopes: 10, maxBytes: 1024 * 1024 });
+    // The stricter directory is NOT widened to 0750.
+    expect(octalMode(spoolDir)).toBe("700");
+    spool.updateState(seededA.id, { state: "pending" });
+    spool.updateState(seededB.id, { state: "pending" });
+    // Neither record is widened: 0600 stays 0600, the stricter 0400 stays
+    // 0400 — the atomic rename preserves stricter-safe modes.
+    expect(octalMode(join(spoolDir, `${seededA.id}.json`))).toBe("600");
+    expect(octalMode(join(spoolDir, `${seededB.id}.json`))).toBe("400");
+    expect(spool.get(seededA.id).state).toBe("pending");
+    expect(spool.get(seededB.id).state).toBe("pending");
+  });
+
+  it("a read-only spool consumer stays read-only: no creation, no chmod, no repair", () => {
+    const dir = makeTmpDir();
+    const absent = join(dir, "never-created");
+    // Constructing the read-only observer must not create the directory.
+    createSpool({
+      dir: absent,
+      maxEnvelopes: 10,
+      maxBytes: 1024 * 1024,
+      create: false,
+    });
+    expect(existsSync(absent)).toBe(false);
+
+    // An existing owned-but-unsafe spool is observed, never repaired.
+    const spoolDir = join(dir, "spool");
+    realFs.mkdirSync(spoolDir, { recursive: true });
+    realFs.chmodSync(spoolDir, 0o755);
+    const recordPath = join(spoolDir, "legacy-record.json");
+    realFs.writeFileSync(recordPath, '{"state":"retained","id":"legacy-record"}\n');
+    realFs.chmodSync(recordPath, 0o644);
+    const bytesBefore = realFs.readFileSync(recordPath);
+
+    const observer = createSpool({
+      dir: spoolDir,
+      maxEnvelopes: 10,
+      maxBytes: 1024 * 1024,
+      create: false,
+    });
+    expect(observer.list()).toHaveLength(1);
+    expect(octalMode(spoolDir)).toBe("755");
+    expect(octalMode(recordPath)).toBe("644");
+    expect(realFs.readFileSync(recordPath).equals(bytesBefore)).toBe(true);
+  });
+
+  it("a denied permission-enforcement operation fails closed before any acceptance (LABELED FAULT INJECTION — mocked EACCES, not a real-kernel proof)", () => {
+    const dir = makeTmpDir();
+    const spoolDir = join(dir, "spool");
+    realFs.mkdirSync(spoolDir, { recursive: true });
+    realFs.chmodSync(spoolDir, 0o777); // owned but unsafe — tightening is REQUIRED
+    chmodDeny.add(spoolDir);
+    let refused = null;
+    try {
+      createSpool({ dir: spoolDir, maxEnvelopes: 10, maxBytes: 1024 * 1024 });
+      throw new Error("expected the denied enforcement to refuse construction");
+    } catch (error) {
+      refused = error;
+    }
+    expect(refused).toBeInstanceOf(SpoolError);
+    expect((refused as InstanceType<typeof SpoolError>).code).toBe("permission_enforcement_failed");
+    // Fail closed BEFORE any acceptance/mutation: the unsafe directory was
+    // NOT silently accepted, and no record file (and therefore no successful
+    // acceptance receipt) was produced.
+    expect(octalMode(spoolDir)).toBe("777");
+    expect(spoolStats(spoolDir).count).toBe(0);
+    expect(spoolStats(spoolDir).temps).toBe(0);
+    chmodDeny.delete(spoolDir);
+
+    // The same refusal guards the fence marker path.
+    const fenceDir = join(dir, "state");
+    realFs.mkdirSync(fenceDir, { recursive: true });
+    realFs.chmodSync(fenceDir, 0o777);
+    chmodDeny.add(fenceDir);
+    try {
+      writeFence(join(fenceDir, "fence.active"), "denied-enforcement");
+      throw new Error("expected the denied fence enforcement to refuse");
+    } catch (error) {
+      expect(error).toBeInstanceOf(SpoolError);
+      expect((error as InstanceType<typeof SpoolError>).code).toBe("permission_enforcement_failed");
+    }
+    expect(existsSync(join(fenceDir, "fence.active"))).toBe(false);
+    chmodDeny.delete(fenceDir);
+  });
+
+  it("refuses a symlinked relay directory instead of following it outside the owned tree", () => {
+    const dir = makeTmpDir();
+    const outside = join(dir, "outside");
+    realFs.mkdirSync(outside, { recursive: true });
+    const link = join(dir, "spool");
+    realFs.symlinkSync(outside, link);
+    try {
+      createSpool({ dir: link, maxEnvelopes: 10, maxBytes: 1024 * 1024 });
+      throw new Error("expected the symlinked directory to be refused");
+    } catch (error) {
+      expect(error).toBeInstanceOf(SpoolError);
+      expect((error as InstanceType<typeof SpoolError>).code).toBe("spool_symlink_refused");
+    }
+    // The outside directory was not touched as a spool: no record files.
+    expect(realFs.readdirSync(outside)).toEqual([]);
   });
 });

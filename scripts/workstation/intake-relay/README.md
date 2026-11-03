@@ -51,7 +51,16 @@ Default mode is **`retain-only`**: submit still authenticates (SSH boundary AND
 writer-IPC authentication — both apply in every mode), scope-checks, and durably
 retains with the honest receipt `retained (delivery pending: transport not
 configured)`. The deliverer makes **zero network calls** and issues **zero
-wake** in this mode.
+wake** in this mode. This is the documented bootstrap flow: retain first,
+enable delivery after owner review. When `deliver` mode is later configured,
+the deliver-mode startup reconciliation **promotes every durably retained
+envelope back to `pending`** (receipt `promoted_from_retained`) through the
+same durable bounded transition — accepted work is delivered automatically
+and exactly once, without another submission or an operator resume. A
+retain-only restart stays retain-only (no promotion, zero POST, zero wake).
+A promotion the spool byte bound refuses is surfaced truthfully at startup
+(`promotionRefused`) with the accepted record preserved as-is — never lost,
+never delivered from the inhibited state.
 
 Delivery/wake activate only in `deliver` mode: the PC-initiated reverse forward
 (`deploy/pc-reverse-forward.example.service`, D1b) exposes PC-local API as a
@@ -64,6 +73,17 @@ in this design; this task grants no trust and enrolls no credential.
 - The writer is reachable **only** through the Unix domain socket: file `0600`
   inside a service-user-owned `0750` directory — kernel-enforced reachability.
   The deliverer opens **no TCP listener at all**.
+- **The private filesystem boundary is enforced in source** (R8), independent
+  of the deployment umask or any systemd `UMask` (which stays defense-in-depth,
+  `UMask=0077` in the example unit): spool and state directories are created
+  and kept **no broader than `0750`**, and every payload-bearing durable file
+  (record temps, envelope records, the fence marker) is created **`0600`**.
+  An already-stricter safe mode is never widened; only the relay's own named
+  paths are touched (never a recursive chmod of foreign state); a symlinked
+  relay directory is refused rather than followed; a read-only `--status`
+  invocation creates, chmods, and repairs nothing; and a denied
+  permission-enforcement operation fails closed BEFORE any acceptance — a
+  native permission failure can never produce a successful acceptance receipt.
 - **Every** request must present the per-instance writer credential
   (high-entropy, owner-installed `0600` file outside the repository; path is a
   required config field). Comparison is timing-safe. There is **no**
@@ -141,6 +161,10 @@ pending ──(deliver: 201/200)──▶ admitted ──(pickup evidence)──
    ├─(fence present)──────────▶ hold_operator_fence (auto-resumes after unfence)
    ├─(poll/retry budget out)──▶ hold_handover_unconfirmed (operator hold)
    └─(retain-only receipt)──▶ retained (delivery pending: transport not configured)
+
+retained ──(deliver mode configured: startup promotion, R8)──▶ pending
+   (same durable bounded transition, one `promoted_from_retained` receipt;
+    a byte-bound refusal preserves the record and is surfaced truthfully)
 ```
 
 `network / timeout / 5xx / 429` ⇒ bounded exponential backoff retry of the

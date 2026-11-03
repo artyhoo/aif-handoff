@@ -26,7 +26,12 @@ import { connect, createServer } from "node:net";
 import { dirname } from "node:path";
 
 import { credentialsMatch, revalidateSealedEnvelope } from "./envelope.mjs";
-import { SpoolError, writeFileDurable } from "./spool.mjs";
+import {
+  enforceOwnedPrivateDir,
+  PRIVATE_DIR_MODE,
+  SpoolError,
+  writeFileDurable,
+} from "./spool.mjs";
 import { createWakeEngine } from "./wake.mjs";
 
 export const STARTUP_REFUSED_SOCKET_HELD = "startup_refused_socket_held";
@@ -49,7 +54,12 @@ export function writeFence(fencePath, reason, nowIso) {
     reason: String(reason ?? "unspecified"),
     at: nowIso ?? new Date().toISOString(),
   };
-  mkdirSync(dirname(fencePath), { recursive: true });
+  // Private-filesystem boundary (R8 — finding f83f7699ae43): the fence marker
+  // carries operator intent text, so it is written through the same 0600
+  // durable path as spool records, into a directory no broader than 0750 —
+  // enforced explicitly, independently of the deployment umask.
+  mkdirSync(dirname(fencePath), { recursive: true, mode: PRIVATE_DIR_MODE });
+  enforceOwnedPrivateDir(dirname(fencePath));
   writeFileDurable(fencePath, `${JSON.stringify(marker, null, 2)}\n`);
   return marker;
 }
@@ -138,13 +148,19 @@ export function classifySocketPath(socketPath, { timeoutMs = 1500 } = {}) {
  */
 export async function bindWriterSocket({ server, socketPath, log = () => {} }) {
   const dir = dirname(socketPath);
-  mkdirSync(dir, { recursive: true, mode: 0o750 });
+  mkdirSync(dir, { recursive: true, mode: PRIVATE_DIR_MODE });
   // mkdir mode is umask-masked; enforce the kernel reachability boundary
-  // explicitly (§9.2: service-user-owned 0750 dir, 0600 socket).
+  // explicitly (§9.2: service-user-owned 0750 dir, 0600 socket). The same
+  // tighten-only helper as the spool directories (R8): an already-stricter
+  // safe mode is never widened, a symlink is refused, and an existing
+  // broader-than-0750 state is tightened before the bind.
   try {
-    chmodSync(dir, 0o750);
+    enforceOwnedPrivateDir(dir);
   } catch (error) {
-    log({ dir, error: String(error?.message ?? error) }, "socket directory chmod failed");
+    log(
+      { dir, code: error.code, error: String(error?.message ?? error) },
+      "socket directory enforcement failed",
+    );
   }
 
   try {
@@ -996,18 +1012,27 @@ export function createDeliverer({
     // in-flight admissions back to pending (idempotent by binding), and
     // quarantine unparseable records without blocking startup. Without this
     // a crash between commit and response recording could leave an `admitted`
-    // envelope dormant forever.
-    const scan = spool.restartScan();
-    // `boundRefused` is surfaced like every other reconciliation outcome (R5):
-    // a crash-reconciliation re-pend refused by the storage bounds is an
+    // envelope dormant forever. In deliver mode the scan also promotes
+    // previously accepted retain-only envelopes to `pending` (R8 — finding
+    // 230ed4d58111): the documented retain-first bootstrap ("retain while
+    // fail-closed, enable delivery after owner review") must deliver the
+    // already-accepted work automatically and exactly once — never strand it.
+    // A retain-only restart passes promoteRetained:false and stays
+    // retain-only: zero promotion, zero POST, zero wake.
+    const scan = spool.restartScan({ promoteRetained: config.mode === "deliver" });
+    // Refused reconciliations are surfaced like every other outcome (R5/R8):
+    // a re-pend or promotion refused by the storage bounds is an
     // operator-visible event (docs/workstation-intake.md runbook), not a
-    // silent pass — the on-disk state is preserved and the handover watch or
-    // an operator resume still owns the record.
+    // silent pass — the on-disk record is preserved as-is and a later
+    // successful reconciliation (handover watch, operator resume, or the
+    // next startup promotion) still owns it.
     if (
       scan.discardedTemps.length > 0 ||
       scan.rePended.length > 0 ||
       scan.corrupted.length > 0 ||
-      scan.boundRefused.length > 0
+      scan.boundRefused.length > 0 ||
+      scan.promoted.length > 0 ||
+      scan.promotionRefused.length > 0
     ) {
       log(
         {
@@ -1015,6 +1040,8 @@ export function createDeliverer({
           rePended: scan.rePended,
           corrupted: scan.corrupted,
           boundRefused: scan.boundRefused,
+          promotedFromRetained: scan.promoted,
+          promotionRefused: scan.promotionRefused,
         },
         "restart scan reconciled spool state (§9.1)",
       );
