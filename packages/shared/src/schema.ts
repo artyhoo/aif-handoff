@@ -184,6 +184,32 @@ export const tasks = sqliteTable("tasks", {
 export type TaskRow = typeof tasks.$inferSelect;
 export type NewTaskRow = typeof tasks.$inferInsert;
 
+/**
+ * Append-only keyed-intake binding (migration v29, plan p2-wake-on-work §7.1).
+ * One row per canonical dedup key (`principalKind|principalId|projectId|requestId`),
+ * committed atomically with task admission. `payloadDigest` is the server-computed
+ * frozen client-content digest (§7.3). `taskId` deliberately has NO foreign key:
+ * tombstone rows must survive deletion of the original task so a replay of a
+ * deleted original is answered with `intake_tombstone` instead of re-admission.
+ * Append-only for the entire supported replay lifetime — no cleanup in this slice.
+ */
+export const taskIntakeBindings = sqliteTable("task_intake_bindings", {
+  dedupKey: text("dedup_key").primaryKey(),
+  projectId: text("project_id").notNull(),
+  principalKind: text("principal_kind").$type<"participant" | "internal">().notNull(),
+  principalId: text("principal_id").notNull(),
+  requestId: text("request_id").notNull(),
+  payloadDigest: text("payload_digest").notNull(),
+  taskId: text("task_id").notNull(),
+  source: text("source").notNull(),
+  createdAt: text("created_at")
+    .notNull()
+    .default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`),
+});
+
+export type TaskIntakeBindingRow = typeof taskIntakeBindings.$inferSelect;
+export type NewTaskIntakeBindingRow = typeof taskIntakeBindings.$inferInsert;
+
 export const taskComments = sqliteTable("task_comments", {
   id: text("id")
     .primaryKey()

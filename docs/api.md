@@ -47,6 +47,67 @@ Checks whether agent authentication is configured via `ANTHROPIC_API_KEY` and/or
 
 `authSource` values: `api_key`, `claude_profile`, `both`, `none`.
 
+### Agent Status
+
+```
+GET /agent/status
+```
+
+Coordinator heartbeat/observability snapshot plus the canonical AI-workload
+state.
+
+**Response:** `200 OK`
+
+```json
+{
+  "uptime": 3600,
+  "activeTasks": [
+    {
+      "id": "uuid",
+      "title": "Task title",
+      "status": "implementing",
+      "lastHeartbeatAt": "2026-11-01T12:00:00.000Z",
+      "heartbeatLagMs": 42000,
+      "heartbeatStale": false,
+      "updatedAt": "2026-11-01T12:00:30.000Z"
+    }
+  ],
+  "activeTaskCount": 1,
+  "staleTasks": 0,
+  "workload": {
+    "busy": 1,
+    "pendingCount": 2,
+    "timedPendingCount": 1,
+    "earliestScheduledAt": "2026-11-01T18:00:00.000Z"
+  },
+  "intakeCompat": 1,
+  "checkedAt": "2026-11-01T12:01:00.000Z"
+}
+```
+
+**Workload fields** (one live computation over `tasks` rows only —
+binding-agnostic, no intake-binding join; intake-bound and legacy/UI-created
+tasks count identically):
+
+| Field                 | Meaning                                                                                                                                                                                                                      |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `busy`                | AI-owned, unpaused, autonomous-active (`planning`/`improve`/`implementing`/`review`/`verify`) — **including** locked tasks (quiet model waiting is busy)                                                                     |
+| `pendingCount`        | required work the AI subsystem still owes: `backlog` (admitted-not-started, any entry path), autonomous-active without a live lock (coordinator owes a transition), or `plan_ready` with `autoMode` true awaiting auto-start |
+| `timedPendingCount`   | non-terminal, AI-owned, unpaused tasks with a future `scheduledAt` from any entry path — timed obligations                                                                                                                   |
+| `earliestScheduledAt` | earliest future `scheduledAt` among the timed obligations (`null` when none)                                                                                                                                                 |
+
+Human/external gates are excluded from all counts: `paused`,
+`blocked_external`, `plan_ready` with `autoMode` false,
+`manualReviewRequired`, and terminal `done`/`verified`. The predicate
+aggregates over all rows, so an old completion never clears a newer task's
+protection.
+
+**`intakeCompat`** is the keyed-intake contract level. The bridge relay probes
+this field before any keyed delivery; a missing or mismatched level parks all
+keyed delivery as `hold_api_compat` with zero POSTs to `/tasks` (see
+[workstation-intake.md](workstation-intake.md)). The level is bumped on
+breaking changes to the keyed contract.
+
 ### Runtime Settings
 
 ```
@@ -912,7 +973,8 @@ POST /tasks
 | `runtimeProfileId` | string \| null | no | `null` | Task-specific runtime override. When absent, resolution falls back to project default, then app default, then environment fallback |
 | `roadmapAlias` | string | no | `null` | Roadmap alias for grouping (e.g., `v1.0`) |
 | `tags` | string[] | no | `[]` | Tags for filtering/categorization (max 50, each max 100 chars) |
-| `scheduledAt` | string \| null | no | `null` | ISO-8601 UTC timestamp. If set, the coordinator fires the task into planning at that time. Must be in the future; `null` clears it. Accepted on both create and update. |
+| `scheduledAt` | string \| null | no | `null` | ISO-8601 UTC timestamp (any offset accepted, normalized to UTC-Z). If set, the coordinator fires the task into planning at that time. Must be in the future for legacy creates; `null` clears it. Accepted on both create and update. Keyed intake first delivery is the exception — see below. |
+| `intake` | object | no | — | Keyed intake identity: `{ "requestId": "<principal>:<clientRequestId>" }` (3–193 chars, `^[A-Za-z0-9._-]{1,64}:[A-Za-z0-9._-]{1,128}$`). Presence switches the request to the **keyed admission** contract described below. Any other `intake` field (client-supplied digest/principal) is rejected. |
 
 **Attachment object:**
 | Field | Type | Description |
@@ -929,7 +991,89 @@ the data layer appends the new backlog task to the tail of that project's
 backlog by assigning `max(position) + 100` within the project. Auto-queue then
 consumes the smallest backlog position.
 
-**WebSocket event:** `task:created`
+**WebSocket event:** `task:created` (first admission only — a keyed replay emits neither `task:created` nor `agent:wake`)
+
+### Keyed intake admission (`intake` field)
+
+When the body carries a non-empty `intake` object, `POST /tasks` becomes an
+**idempotent, authenticated admission**: the API-verified session principal,
+the project, the namespaced request ID, and a **server-computed** digest of
+the client content are committed with the task in one transaction
+(`task_intake_bindings`, migration v29). The client cannot choose the
+principal or the digest; `source` is server-derived from the verified session.
+
+**Validation order (each step is effect-free on failure):**
+
+1. Verified non-anonymous participant session (participants mode on) — else
+   `422 intake_principal_unavailable` before any write.
+2. Keyed requests with non-empty `attachments` — `422
+intake_attachments_unavailable` before any write (attachments are not
+   available on the keyed path; the legacy attachment flow is unchanged).
+3. Static/structural validation (types, lengths, charsets, `scheduledAt`
+   format + UTC-Z normalization only — **no** time-of-day judgment here).
+4. Frozen digest computed over the client-supplied fields only (absent
+   optionals canonicalize to fixed sentinels — never environment, project
+   config, or route defaults, so a changed environment can never change the
+   digest of identical original bytes). Binding lookup by the dedup key
+   happens **after** the digest and **before** any time/env-dependent
+   validation.
+5. Runtime-profile validity, project existence, and project-config default
+   resolution — all **mutable creation-only** checks — run only on the
+   binding-miss path (a genuine first admission), inside the atomic admission
+   transaction. A first admission still answers `400` (invalid runtime
+   profile selection) / `404 project_not_found` with zero writes; an
+   identical replay of an already-durable request is never vetoed by them.
+
+**Replay semantics (lookup precedes time validation):**
+
+| Outcome   | Condition                                                                                                             | Response                                                                                                                                               |
+| --------- | --------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Replay    | dedup-key hit + identical digest — any elapsed time, any task status (incl. terminal), any changed env/route defaults | `200` with the **original** task + `intake.replayed: true`; no broadcasts, no restart; a `task.intake_replayed` audit event is appended                |
+| Tombstone | the original task was deleted                                                                                         | `410 intake_tombstone` — never re-admitted                                                                                                             |
+| Conflict  | dedup-key hit + different digest (e.g. changed title or `scheduledAt`)                                                | `409 intake_conflict` — no new task, no wake                                                                                                           |
+| Created   | no binding for the key                                                                                                | `201` with the new task + `intake: { replayed: false, requestId, digest }`; broadcasts as usual (`task:created`, plus `agent:wake` for AI-owned tasks) |
+
+Binding resolution precedes **mutable creation-only eligibility**: an assignee
+who became inactive (or missing) _after_ admission never vetoes the
+replay/tombstone/conflict resolution of the identical request — and neither do
+a runtime profile disabled, deleted, or re-scoped _after_ admission, or the
+creation-time project being deleted (the retained task/binding survive it;
+there is no foreign key on `tasks.project_id`). The canonical replay promise
+covers human-owned keyed tasks too. All of these rules still apply to every
+genuine first admission (no binding for the key): `409 invalid_ownership`,
+`400` (invalid runtime profile selection), or `404 project_not_found`, each
+with zero writes. Session authentication, project authorization, and
+structural validation are always required — a revoked or unauthorized caller
+gains no replay access.
+
+**Keyed overdue policy:** because lookup precedes time validation, a first
+keyed delivery whose `scheduledAt` is already in the past is **admitted**
+(stored normalized UTC-Z) and caught up by the existing scheduler
+(`listDueScheduledTasks` + coordinator firing). Only the legacy (no-`intake`)
+path rejects past `scheduledAt` with `400`.
+
+**HOLD classes (caller guidance):** `401`/`403` and keyed `422` responses are
+retained configuration/auth conditions — the caller should HOLD and surface
+them, never blindly retry; network/timeout/5xx are unknown admission outcomes
+— retrying the byte-identical body is safe (a committed admission replays
+as `200`).
+
+**Errors:**
+
+- `400` — structural/validation failure (including legacy past-`scheduledAt`);
+  invalid runtime profile selection on a first admission (zero writes)
+- `401` / `403` — unauthenticated / unauthorized session (pre-write)
+- `404` — `project_not_found` on a first admission (zero writes); never
+  returned for an existing binding's replay/tombstone resolution
+- `409` — `intake_conflict`; `invalid_ownership` when the (binding-miss) first
+  admission fails creation-time ownership validation
+- `410` — `intake_tombstone`
+- `422` — `intake_principal_unavailable` / `intake_attachments_unavailable`
+  (pre-write)
+
+**Audit:** first admission records `task.created` metadata
+`intake: { requestId, digest, source }`; a replay appends a
+`task.intake_replayed` event.
 
 ### Get Task
 

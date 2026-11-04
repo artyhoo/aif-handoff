@@ -1,4 +1,6 @@
 import { Hono, type Context } from "hono";
+import { validator } from "hono/validator";
+import type { z } from "zod";
 import { jsonValidator } from "../middleware/zodValidator.js";
 import { internalBroadcastAuth } from "../middleware/internalBroadcastAuth.js";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
@@ -8,10 +10,14 @@ import {
   getProjectConfig,
   defaultsForMode,
   getEnv,
+  buildIntakeDedupKey,
+  computeIntakePayloadDigest,
+  type PlannerMode,
   type TaskActionContext,
 } from "@aif/shared";
 import {
   createTaskSchema,
+  keyedCreateTaskSchema,
   updateTaskSchema,
   taskEventSchema,
   createTaskCommentSchema,
@@ -57,6 +63,10 @@ import {
   handoffTaskExecution,
   listTaskExecutorHistory,
   findGitHubIssueByTaskId,
+  createTaskWithIntakeBinding,
+  appendAuditEvent,
+  type CreateTaskInsertInput,
+  type IntakeFirstAdmissionRejection,
   type TaskRow,
   type TaskOwnershipFilters,
 } from "@aif/data";
@@ -356,17 +366,242 @@ tasksRouter.get("/", (c) => {
   return c.json(taskList);
 });
 
-// POST /tasks — create
-tasksRouter.post("/", jsonValidator(createTaskSchema), async (c) => {
-  const body = c.req.valid("json");
+/**
+ * Branch-selecting body validator for POST /tasks (§7.5): a body carrying a
+ * non-empty `intake` block is parsed by the structural keyed schema (no
+ * env-default injection, no past-`scheduledAt` judgment); every other body is
+ * parsed by the unchanged legacy schema, keeping the legacy creation contract
+ * byte-identical. Failure responses mirror @hono/zod-validator's default
+ * (`{ success: false, error }` with 400).
+ */
+type PostTaskParsedBody =
+  | z.infer<typeof createTaskSchema>
+  | (z.infer<typeof keyedCreateTaskSchema> & { intake: { requestId: string } });
+
+function postTaskBodyValidator() {
+  return validator("json", async (value, c): Promise<PostTaskParsedBody | Response> => {
+    const raw = value as unknown;
+    const intakeCandidate =
+      typeof raw === "object" && raw !== null ? (raw as { intake?: unknown }).intake : undefined;
+    const wantsIntake = intakeCandidate !== null && intakeCandidate !== undefined;
+    const parsed = wantsIntake
+      ? keyedCreateTaskSchema.safeParse(raw)
+      : createTaskSchema.safeParse(raw);
+    if (!parsed.success) {
+      return c.json({ success: false, error: parsed.error }, 400);
+    }
+    return parsed.data as PostTaskParsedBody;
+  });
+}
+
+// POST /tasks — create (legacy) or authenticated keyed intake admission (§7.5)
+tasksRouter.post("/", postTaskBodyValidator(), async (c) => {
+  const parsedBody = c.req.valid("json");
+  const intake = "intake" in parsedBody ? parsedBody.intake : undefined;
+
+  if (!intake) {
+    // Legacy path — re-validate the raw body with the unchanged legacy schema
+    // (env-derived defaults + future-only scheduledAt rule), then run the
+    // byte-identical legacy creation flow below.
+    const legacyParsed = createTaskSchema.safeParse(await c.req.json());
+    if (!legacyParsed.success) {
+      return c.json({ success: false, error: legacyParsed.error }, 400);
+    }
+    const body = legacyParsed.data;
+    const actionContext = requestActionContext(c);
+    const actor = actionContext.actor;
+    if (
+      actionContext.participantsModeEnabled &&
+      actionContext.participantRole === "member" &&
+      body.executionOwner === "human" &&
+      (body.assigneeIds.length > 1 ||
+        (body.assigneeIds.length === 1 && body.assigneeIds[0] !== actor.id))
+    ) {
+      return c.json(
+        {
+          error: "Members may create human tasks only unassigned or assigned to themselves",
+          code: "forbidden",
+        },
+        403,
+      );
+    }
+    if (body.executionOwner === "ai" && body.assigneeIds.length > 0) {
+      return c.json(
+        { error: "AI-owned tasks cannot have participant assignees", code: "invalid_ownership" },
+        409,
+      );
+    }
+    for (const participantId of body.assigneeIds) {
+      const participant = findParticipantById(participantId);
+      if (!participant?.active) {
+        return c.json(
+          { error: "One or more assignees are inactive or missing", code: "inactive_assignee" },
+          409,
+        );
+      }
+    }
+    const runtimeValidation = validateProjectScopedRuntimeProfileSelections({
+      projectId: body.projectId,
+      selections: { runtimeProfileId: body.runtimeProfileId },
+    });
+    if (runtimeValidation) {
+      log.warn(
+        { projectId: body.projectId, fieldErrors: runtimeValidation.fieldErrors },
+        "Rejected invalid task runtime selection",
+      );
+      return c.json(runtimeValidation, 400);
+    }
+
+    // Resolve planPath default from project config.yaml (if present)
+    const project = findProjectById(body.projectId);
+    const defaultPlanPath = project
+      ? getProjectConfig(project.rootPath).paths.plan
+      : ".ai-factory/PLAN.md";
+
+    // Parallel-enabled projects enforce full mode and unique planPath
+    if (project?.parallelEnabled) {
+      body.plannerMode = "full";
+    }
+
+    // Fill omitted flag values from mode-driven defaults (mirror of web UI behavior).
+    const modeDefaults = defaultsForMode(body.plannerMode);
+    const resolvedSkipReview = body.skipReview ?? modeDefaults.skipReview;
+    const resolvedPlanDocs = body.planDocs ?? modeDefaults.planDocs;
+    const resolvedPlanTests = body.planTests ?? modeDefaults.planTests;
+    const resolvedRunPlanImprove = body.useSubagents ? false : body.runPlanImprove;
+    const resolvedRunPostVerify = body.useSubagents ? false : body.runPostVerify;
+    if (
+      body.skipReview === undefined ||
+      body.planDocs === undefined ||
+      body.planTests === undefined
+    ) {
+      log.debug(
+        {
+          plannerMode: body.plannerMode,
+          filled: {
+            skipReview: body.skipReview === undefined,
+            planDocs: body.planDocs === undefined,
+            planTests: body.planTests === undefined,
+          },
+        },
+        "Applied mode-driven task flag defaults",
+      );
+    }
+
+    // Pre-create the task to get an ID, then persist attachments to storage
+    const created = createTask({
+      projectId: body.projectId,
+      title: body.title,
+      description: body.description,
+      attachments: [],
+      priority: body.priority,
+      autoMode: body.autoMode,
+      executionOwner: body.executionOwner,
+      assigneeIds: body.assigneeIds,
+      actor,
+      isFix: body.isFix,
+      plannerMode: body.plannerMode,
+      planPath: body.planPath ?? defaultPlanPath,
+      planDocs: resolvedPlanDocs,
+      planTests: resolvedPlanTests,
+      skipReview: resolvedSkipReview,
+      useSubagents: body.useSubagents,
+      runPlanImprove: resolvedRunPlanImprove,
+      runPostVerify: resolvedRunPostVerify,
+      autoQa: body.autoQa,
+      maxReviewIterations: body.maxReviewIterations,
+      paused: body.paused,
+      runtimeProfileId: body.runtimeProfileId,
+      modelOverride: body.modelOverride,
+      runtimeOptions: body.runtimeOptions,
+      roadmapAlias: body.roadmapAlias,
+      tags: body.tags,
+      scheduledAt: body.scheduledAt ?? null,
+    });
+    if (!created) {
+      return c.json({ error: "Failed to create task ownership", code: "invalid_ownership" }, 409);
+    }
+
+    // Persist attachments to project files and update the task with path-based metadata
+    if (body.attachments.length > 0) {
+      if (project) {
+        const persisted = await persistAttachments(body.attachments, {
+          projectRoot: project.rootPath,
+          taskId: created.id,
+        });
+        updateTask(created.id, { attachments: persisted });
+      }
+    }
+
+    const final = findTaskById(created.id) ?? created;
+    log.debug(
+      {
+        taskId: final.id,
+        title: body.title,
+        roadmapAlias: body.roadmapAlias,
+        tagCount: body.tags?.length,
+        attachmentCount: body.attachments.length,
+      },
+      "Task created",
+    );
+
+    broadcast({
+      type: "task:created",
+      payload: toTaskBroadcastPayload(final, actor),
+    });
+    // Wake coordinator when a new task is created (may need immediate processing)
+    if (final.executionOwner === "ai") {
+      broadcast({ type: "agent:wake", payload: { id: final.id } });
+    }
+    return c.json(toTaskRouteResponse(final, undefined, undefined, actionContext), 201);
+  }
+
+  // ---- Keyed intake branch (§7.5) — order matters; pre-lookup checks are effect-free.
+
   const actionContext = requestActionContext(c);
   const actor = actionContext.actor;
+
+  // Step 1 — principal₂ must come from the verified session (participants mode
+  // on, non-anonymous). HOLD class: config/auth condition, never trusted from
+  // the body; 422 pre-write, no broadcasts, no wake.
+  if (!actionContext.participantsModeEnabled || actor.kind !== "participant" || !actor.id) {
+    log.warn(
+      { participantsModeEnabled: actionContext.participantsModeEnabled, actorKind: actor.kind },
+      "Keyed intake rejected: no verified principal",
+    );
+    return c.json(
+      {
+        error: "Keyed intake requires an authenticated participant session",
+        code: "intake_principal_unavailable",
+      },
+      422,
+    );
+  }
+
+  // Step 2 — attachments are unavailable on the keyed path (round-1 R2):
+  // rejected BEFORE any acceptance, retention, or wake.
+  if (parsedBody.attachments.length > 0) {
+    return c.json(
+      {
+        error: "Keyed intake does not support attachments",
+        code: "intake_attachments_unavailable",
+      },
+      422,
+    );
+  }
+
+  // Step 4 (route-level checks mirrored from the legacy flow) — authorization
+  // and ownership rules. The member self-assignment rule is mirrored from the
+  // legacy branch verbatim: the keyed path must not become a trust bypass for
+  // a member-role principal to create human-owned tasks assigned to someone
+  // else (independent-review finding). 403 = auth/config condition → the
+  // relay classifies it hold_auth_config (no retry, no wake).
   if (
     actionContext.participantsModeEnabled &&
     actionContext.participantRole === "member" &&
-    body.executionOwner === "human" &&
-    (body.assigneeIds.length > 1 ||
-      (body.assigneeIds.length === 1 && body.assigneeIds[0] !== actor.id))
+    parsedBody.executionOwner === "human" &&
+    (parsedBody.assigneeIds.length > 1 ||
+      (parsedBody.assigneeIds.length === 1 && parsedBody.assigneeIds[0] !== actor.id))
   ) {
     return c.json(
       {
@@ -376,135 +611,231 @@ tasksRouter.post("/", jsonValidator(createTaskSchema), async (c) => {
       403,
     );
   }
-  if (body.executionOwner === "ai" && body.assigneeIds.length > 0) {
+  // Deterministic on the frozen client content (both fields are inside the
+  // digest), so it can never diverge between creation and an identical replay.
+  if (parsedBody.executionOwner === "ai" && parsedBody.assigneeIds.length > 0) {
     return c.json(
       { error: "AI-owned tasks cannot have participant assignees", code: "invalid_ownership" },
       409,
     );
   }
-  for (const participantId of body.assigneeIds) {
-    const participant = findParticipantById(participantId);
-    if (!participant?.active) {
-      return c.json(
-        { error: "One or more assignees are inactive or missing", code: "inactive_assignee" },
-        409,
-      );
-    }
-  }
-  const runtimeValidation = validateProjectScopedRuntimeProfileSelections({
-    projectId: body.projectId,
-    selections: { runtimeProfileId: body.runtimeProfileId },
+  // NOTE (R3): assignee LIVENESS is deliberately not checked here. It is
+  // mutable creation-only eligibility — checking it before the binding lookup
+  // would let an assignee deactivated AFTER admission veto the identical
+  // replay (and its conflict/tombstone resolution) with 409 instead of
+  // resolving the original task, breaking the canonical-replay promise for
+  // human-owned keyed tasks. `createTaskWithIntakeBinding` enforces the same
+  // validation on the genuine first-admission path only (its
+  // `undefined` → 409 invalid_ownership below, zero writes). The member rule
+  // above stays pre-lookup: it is authorization, keyed on the verified role.
+
+  // NOTE (R7, extending R3): runtime-profile validity, project existence, and
+  // the project-config default resolution below are MUTABLE CREATION-ONLY
+  // eligibility and configuration IO. None of them runs before the binding
+  // lookup: checking any of them pre-lookup lets an admin action AFTER
+  // admission (profile disable/delete/re-scope via PUT/DELETE
+  // /runtime-profiles/:id, or DELETE /projects/:id) veto the identical replay
+  // of an already-durable request with 400/404 instead of resolving the
+  // original task (200) or its retained tombstone (410) — a retained envelope
+  // the relay then parks as hold_auth_config, permanently undeliverable.
+  // `prepareFirstAdmission` therefore defers all of it to the binding-miss
+  // point INSIDE `createTaskWithIntakeBinding`'s atomic IMMEDIATE admission
+  // transaction — the existing seam, never a racy second lookup. Assignee
+  // liveness stays deferred the same way inside `prepareTaskCreation` (R3
+  // NOTE above). The member rule above stays pre-lookup: it is authorization,
+  // keyed on the verified role, not creation-only eligibility.
+
+  // Step 4 — FREEZE the client-content digest BEFORE any route default is
+  // applied (M2): project-config `planPath`, `parallelEnabled → plannerMode`,
+  // and mode-driven flags must never enter the digest of identical bytes.
+  const digest = computeIntakePayloadDigest(parsedBody);
+  const dedupKey = buildIntakeDedupKey({
+    principalKind: "participant",
+    principalId: actor.id,
+    projectId: parsedBody.projectId,
+    requestId: intake.requestId,
   });
-  if (runtimeValidation) {
-    log.warn(
-      { projectId: body.projectId, fieldErrors: runtimeValidation.fieldErrors },
-      "Rejected invalid task runtime selection",
-    );
-    return c.json(runtimeValidation, 400);
-  }
 
-  // Resolve planPath default from project config.yaml (if present)
-  const project = findProjectById(body.projectId);
-  const defaultPlanPath = project
-    ? getProjectConfig(project.rootPath).paths.plan
-    : ".ai-factory/PLAN.md";
-
-  // Parallel-enabled projects enforce full mode and unique planPath
-  if (project?.parallelEnabled) {
-    body.plannerMode = "full";
-  }
-
-  // Fill omitted flag values from mode-driven defaults (mirror of web UI behavior).
-  const modeDefaults = defaultsForMode(body.plannerMode);
-  const resolvedSkipReview = body.skipReview ?? modeDefaults.skipReview;
-  const resolvedPlanDocs = body.planDocs ?? modeDefaults.planDocs;
-  const resolvedPlanTests = body.planTests ?? modeDefaults.planTests;
-  const resolvedRunPlanImprove = body.useSubagents ? false : body.runPlanImprove;
-  const resolvedRunPostVerify = body.useSubagents ? false : body.runPostVerify;
-  if (
-    body.skipReview === undefined ||
-    body.planDocs === undefined ||
-    body.planTests === undefined
-  ) {
-    log.debug(
-      {
-        plannerMode: body.plannerMode,
-        filled: {
-          skipReview: body.skipReview === undefined,
-          planDocs: body.planDocs === undefined,
-          planTests: body.planTests === undefined,
-        },
-      },
-      "Applied mode-driven task flag defaults",
-    );
-  }
-
-  // Pre-create the task to get an ID, then persist attachments to storage
-  const created = createTask({
-    projectId: body.projectId,
-    title: body.title,
-    description: body.description,
+  // The raw client selections — no route defaults. When the binding misses,
+  // `prepareFirstAdmission` resolves them into the creation input; the raw
+  // form is only used verbatim when no hook is configured.
+  const rawSelections: CreateTaskInsertInput = {
+    projectId: parsedBody.projectId,
+    title: parsedBody.title,
+    description: parsedBody.description,
     attachments: [],
-    priority: body.priority,
-    autoMode: body.autoMode,
-    executionOwner: body.executionOwner,
-    assigneeIds: body.assigneeIds,
+    priority: parsedBody.priority,
+    autoMode: parsedBody.autoMode,
+    executionOwner: parsedBody.executionOwner,
+    assigneeIds: parsedBody.assigneeIds,
     actor,
-    isFix: body.isFix,
-    plannerMode: body.plannerMode,
-    planPath: body.planPath ?? defaultPlanPath,
-    planDocs: resolvedPlanDocs,
-    planTests: resolvedPlanTests,
-    skipReview: resolvedSkipReview,
-    useSubagents: body.useSubagents,
-    runPlanImprove: resolvedRunPlanImprove,
-    runPostVerify: resolvedRunPostVerify,
-    autoQa: body.autoQa,
-    maxReviewIterations: body.maxReviewIterations,
-    paused: body.paused,
-    runtimeProfileId: body.runtimeProfileId,
-    modelOverride: body.modelOverride,
-    runtimeOptions: body.runtimeOptions,
-    roadmapAlias: body.roadmapAlias,
-    tags: body.tags,
-    scheduledAt: body.scheduledAt ?? null,
-  });
-  if (!created) {
+    isFix: parsedBody.isFix,
+    plannerMode: parsedBody.plannerMode,
+    planPath: parsedBody.planPath,
+    planDocs: parsedBody.planDocs,
+    planTests: parsedBody.planTests,
+    skipReview: parsedBody.skipReview,
+    useSubagents: parsedBody.useSubagents,
+    runPlanImprove: parsedBody.runPlanImprove,
+    runPostVerify: parsedBody.runPostVerify,
+    autoQa: parsedBody.autoQa,
+    maxReviewIterations: parsedBody.maxReviewIterations,
+    paused: parsedBody.paused,
+    runtimeProfileId: parsedBody.runtimeProfileId,
+    modelOverride: parsedBody.modelOverride,
+    runtimeOptions: parsedBody.runtimeOptions,
+    roadmapAlias: parsedBody.roadmapAlias,
+    tags: parsedBody.tags,
+    scheduledAt: parsedBody.scheduledAt ?? null,
+  };
+
+  const prepareFirstAdmission = (
+    rawInput: CreateTaskInsertInput,
+  ):
+    | { ok: true; input: CreateTaskInsertInput }
+    | { ok: false; rejection: IntakeFirstAdmissionRejection } => {
+    const runtimeValidation = validateProjectScopedRuntimeProfileSelections({
+      projectId: rawInput.projectId,
+      selections: { runtimeProfileId: rawInput.runtimeProfileId },
+    });
+    if (runtimeValidation) {
+      log.warn(
+        { projectId: rawInput.projectId, fieldErrors: runtimeValidation.fieldErrors },
+        "Rejected invalid keyed task runtime selection",
+      );
+      return { ok: false, rejection: { status: 400, body: runtimeValidation } };
+    }
+    const project = findProjectById(rawInput.projectId);
+    if (!project) {
+      return {
+        ok: false,
+        rejection: {
+          status: 404,
+          body: { error: "Project not found", code: "project_not_found" },
+        },
+      };
+    }
+
+    // Creation-time route default resolution (post-digest; creation only).
+    // `parsedBody.plannerMode` is the schema-defaulted enum value — the same
+    // runtime value as `rawInput.plannerMode`, just not widened to `string`.
+    const defaultPlanPath = getProjectConfig(project.rootPath).paths.plan;
+    const plannerMode: PlannerMode = project.parallelEnabled ? "full" : parsedBody.plannerMode;
+    const modeDefaults = defaultsForMode(plannerMode);
+    const useSubagents = rawInput.useSubagents ?? getEnv().AGENT_USE_SUBAGENTS;
+    return {
+      ok: true,
+      input: {
+        ...rawInput,
+        plannerMode,
+        planPath: rawInput.planPath ?? defaultPlanPath,
+        planDocs: rawInput.planDocs ?? modeDefaults.planDocs,
+        planTests: rawInput.planTests ?? modeDefaults.planTests,
+        skipReview: rawInput.skipReview ?? modeDefaults.skipReview,
+        useSubagents,
+        runPlanImprove: useSubagents === true ? false : (rawInput.runPlanImprove ?? false),
+        runPostVerify: useSubagents === true ? false : (rawInput.runPostVerify ?? false),
+        maxReviewIterations: rawInput.maxReviewIterations ?? getEnv().AGENT_MAX_REVIEW_ITERATIONS,
+      },
+    };
+  };
+
+  const result = createTaskWithIntakeBinding(
+    rawSelections,
+    {
+      dedupKey,
+      projectId: parsedBody.projectId,
+      principalKind: "participant",
+      principalId: actor.id,
+      requestId: intake.requestId,
+      payloadDigest: digest,
+      // Server-derived admission channel — never client-claimed (§7.1).
+      source: "api:participant",
+    },
+    { prepareFirstAdmission },
+  );
+
+  if (!result) {
     return c.json({ error: "Failed to create task ownership", code: "invalid_ownership" }, 409);
   }
 
-  // Persist attachments to project files and update the task with path-based metadata
-  if (body.attachments.length > 0) {
-    if (project) {
-      const persisted = await persistAttachments(body.attachments, {
-        projectRoot: project.rootPath,
-        taskId: created.id,
-      });
-      updateTask(created.id, { attachments: persisted });
-    }
+  if (result.outcome === "rejected_first_admission") {
+    // First admission refused by a mutable creation-only eligibility check
+    // (invalid profile / missing project) — zero writes, exactly as when the
+    // check ran pre-lookup.
+    return c.json(result.rejection.body, result.rejection.status as ContentfulStatusCode);
   }
 
-  const final = findTaskById(created.id) ?? created;
-  log.debug(
-    {
-      taskId: final.id,
-      title: body.title,
-      roadmapAlias: body.roadmapAlias,
-      tagCount: body.tags?.length,
-      attachmentCount: body.attachments.length,
-    },
-    "Task created",
-  );
+  if (result.outcome === "conflict") {
+    log.warn(
+      { dedupKey, taskId: result.binding.taskId, digest },
+      "Keyed intake conflict: digest mismatch for known request id",
+    );
+    return c.json(
+      {
+        error: "Keyed intake payload differs from the original request for this request ID",
+        code: "intake_conflict",
+      },
+      409,
+    );
+  }
 
+  if (result.outcome === "replayed") {
+    // No broadcasts, no restart — replay resolves the canonical task at any
+    // status, or the tombstone of a deleted original (never re-admits).
+    if (!result.task) {
+      log.info({ dedupKey, taskId: result.binding.taskId }, "Keyed intake replay hit tombstone");
+      return c.json(
+        { error: "The original task for this request ID was deleted", code: "intake_tombstone" },
+        410,
+      );
+    }
+    appendAuditEvent({
+      action: "task.intake_replayed",
+      entityType: "task",
+      entityId: result.task.id,
+      taskId: result.task.id,
+      taskTitleSnapshot: result.task.title,
+      executionOwnerSnapshot: result.task.executionOwner,
+      statusSnapshot: result.task.status,
+      actor,
+      metadata: { intake: { requestId: intake.requestId, digest, replayed: true } },
+      createdAt: new Date().toISOString(),
+    });
+    log.info(
+      { taskId: result.task.id, dedupKey, status: result.task.status },
+      "Keyed intake replayed to original task",
+    );
+    return c.json(
+      {
+        ...toTaskRouteResponse(result.task, undefined, undefined, actionContext),
+        intake: { replayed: true },
+      },
+      200,
+    );
+  }
+
+  // Created — legacy-parity broadcasts (task:created always, agent:wake when AI-owned).
+  const createdTask = result.task;
+  const final = findTaskById(createdTask.id) ?? createdTask;
+  log.debug(
+    { taskId: final.id, title: parsedBody.title, dedupKey, digest },
+    "Keyed intake task created",
+  );
   broadcast({
     type: "task:created",
     payload: toTaskBroadcastPayload(final, actor),
   });
-  // Wake coordinator when a new task is created (may need immediate processing)
   if (final.executionOwner === "ai") {
     broadcast({ type: "agent:wake", payload: { id: final.id } });
   }
-  return c.json(toTaskRouteResponse(final, undefined, undefined, actionContext), 201);
+  return c.json(
+    {
+      ...toTaskRouteResponse(final, undefined, undefined, actionContext),
+      intake: { replayed: false, requestId: intake.requestId, digest },
+    },
+    201,
+  );
 });
 
 // POST /tasks/:id/handoff — atomically change execution owner and assignments

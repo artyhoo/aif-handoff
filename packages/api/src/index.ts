@@ -1,8 +1,9 @@
 import { Hono } from "hono";
 import { getEnv, logger } from "@aif/shared";
-import { listProjects, listStaleInProgressTasks, resetStaleQaRuns } from "@aif/data";
+import { listProjects, resetStaleQaRuns } from "@aif/data";
 import { projectsRouter } from "./routes/projects.js";
 import { tasksRouter } from "./routes/tasks.js";
+import { agentStatusRouter } from "./routes/agentStatus.js";
 import { chatRouter } from "./routes/chat.js";
 import { buildSettingsOverview, settingsRoutes } from "./routes/settings.js";
 import { runtimeProfilesRouter } from "./routes/runtimeProfiles.js";
@@ -46,33 +47,11 @@ app.get("/health", (c) => {
   });
 });
 
-// Agent status: running tasks, heartbeat lag, uptime
-app.get("/agent/status", (c) => {
-  const now = Date.now();
-  const activeTasks = listStaleInProgressTasks().map((t) => {
-    const heartbeatAt = t.lastHeartbeatAt ? new Date(t.lastHeartbeatAt).getTime() : null;
-    const updatedAt = t.updatedAt ? new Date(t.updatedAt).getTime() : now;
-    const lagMs = heartbeatAt ? now - heartbeatAt : now - updatedAt;
-
-    return {
-      id: t.id,
-      title: t.title,
-      status: t.status,
-      lastHeartbeatAt: t.lastHeartbeatAt,
-      heartbeatLagMs: lagMs,
-      heartbeatStale: lagMs > 5 * 60 * 1000, // > 5 min without heartbeat
-      updatedAt: t.updatedAt,
-    };
-  });
-
-  return c.json({
-    uptime: Math.floor((Date.now() - startTime) / 1000),
-    activeTasks,
-    activeTaskCount: activeTasks.length,
-    staleTasks: activeTasks.filter((t) => t.heartbeatStale).length,
-    checkedAt: new Date().toISOString(),
-  });
-});
+// Agent status: running tasks, heartbeat lag, uptime, workload, intakeCompat
+// (§8.2/§9.3) — the real router, mounted behind the same global middleware
+// chain (participantAuth gates it whenever participants mode is enabled; the
+// relay's compat probe presents its service session).
+app.route("/agent", agentStatusRouter);
 
 // Settings (expose env defaults to frontend)
 app.get("/settings", async (c) => {
